@@ -1,0 +1,94 @@
+{
+  "round": "0006",
+  "parent_commit": "247ccf21b6f75533c5d552319b2702a72cd95ac2",
+  "models": {
+    "research": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "review": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "implementation": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    }
+  },
+  "status": "accepted",
+  "research": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Projection-major scalar speculative verification",
+      "idea": "Draft short continuations from the current request, then verify them by processing each layer and projection across the drafted positions before advancing. Keep every numerical operation single-token, including attention and vocabulary projection. This shortens weight reuse distance while preserving reference arithmetic shapes.",
+      "cost_removed": "Targets repeated main-memory fetches of transformer weights through temporal locality. The body contains 212,336,640 bytes of projection weights. If each projection remains cached across five verification positions, a fully accepted block could avoid 849,346,560 bytes of repeated body-weight fetches. This is a conditional traffic estimate: arithmetic, scalar projection calls, and full vocabulary scans remain; rejected positions add work.",
+      "source_evidence": "candidate/inference.py:26 completes the entire model before processing the next token. Installed mlx-lm 0.32.0 llama.py:82,121,193 executes seven projections per layer. Direct inspection of the pinned safetensors header confirms 210 BF16 projection matrices totaling 212,336,640 bytes, individually 221,184\u20131,769,472 bytes. The separate tied head occupies 56,623,104 bytes. KVCache supports offset trimming, and MLX exposes explicit execution dependencies. [LLMA](https://arxiv.org/abs/2304.04487) supports request-local copying and verification; [LLM-42](https://arxiv.org/html/2601.17768v2) motivates preserving reduction shapes and consistent retained KV. Neither establishes this schedule\u2019s performance.",
+      "generalization": "Loop interchange and temporal blocking apply across inference backends without custom kernels or compiler transformations. Benefits require a projection or model shard to fit a faster memory tier while the complete model does not. Frontier-scale tensor-parallel or offloaded execution can exploit the same scheduling principle; larger unsharded projections would require additional blocking. This experiment does not establish gains in that regime.",
+      "risk": "Low draft acceptance, ineffective cache reuse, dependency overhead, and extra KV-buffer copies may outweigh savings. Exactness requires preserving each primitive\u2019s inputs, shapes, layouts, dtypes, causal prefix, and rounding boundaries. A lazy graph must explicitly enforce the intended projection order; constructing Python loops alone may not do so.",
+      "history_relation": "Round 0001 failed block verification without a numerical diagnosis. This changes its verifier to unchanged scalar operations throughout, addressing a plausible failure mode without claiming to diagnose it. Round 0003 left head batching disabled and does not resolve this schedule. Round 0002 tested screening; round 0005 tested sibling packing. This experiment retains original matrices and targets temporal reuse. Preserve round 0004\u2019s pipeline for scalar fallback."
+    },
+    "plan": "1. Implement only inside candidate/. Preserve original prefill and first-token selection. Return fresh request state containing ordinary KV caches, prompt history, and an incremental n-gram index. Keep shared model parameters and module bindings unchanged. Perform all generated-token work during decode.\n\n2. Reuse the fixed copying policy: longest suffix up to three tokens, most recent occurrence with an observed continuation, and at most four draft tokens. Index only prompt tokens and committed outputs. At a verification boundary, maintain history H with pending token H[-1] absent from KV. With common offset C, minimum cache capacity Q, and R remaining output slots, cap draft length k by min(4, R-1, available continuation, Q-C-1). Use scalar decoding when k<1; this prevents speculative allocation growth from changing retained cache layouts.\n\n3. Verify [pending,d1,...,dk] using separate native singleton tensors. For each layer, compute scalar input normalizations; run q_proj for every position, then k_proj, then v_proj. Process RoPE, cache insertion, and attention sequentially by position, exposing exactly C+i+1 KV entries to position i. Group subsequent scalar o_proj calls, preserve residual addition and normalization, then group gate_proj, up_proj, and down_proj calls around the original scalar swiglu. Preserve original full matrix shapes and activation layouts. Finish with separate original final-normalization, full-head, and argmax calls.\n\n4. Enforce projection-group ordering with explicit execution dependencies, such as mx.depends, and asynchronous submission. Avoid host synchronization at each projection. Do not rely on compiler fusion or incidental lazy traversal. Materialize the prediction IDs together after verification; include every operation and transfer in decode timing.\n\n5. Accept the longest draft prefix matching predictions, emit its corrective or bonus token, and trim k-a positions for a accepted drafts, leaving offset C+1+a. Discard rejected state and index only committed tokens. Preserve fixed-length generation and budgets below two. During scalar fallback, retain the existing two-pending-output pipeline; use drained IDs for lookup. Before entering verification, drain outstanding outputs and repeat lookup from the latest committed history to restore the pending-token invariant.\n\n6. On independent inputs, compare intermediate activations, logits, retained KV prefixes, and subsequent scalar continuations against reference execution. Exercise all acceptance lengths, pipeline transitions, capacity boundaries, ties, small budgets, and request isolation. Confirm that the intended projection ordering actively executes. Freeze policy before authoritative evaluation. Have the orchestrator run exact-token evaluation and both throughput confirmations against the accepted round-0004 baseline; record acceptance and active-path status without benchmark-based tuning.",
+    "reason": "This offers substantial potential weight-traffic reduction while retaining scalar reference operations throughout. The schedule is untested, and its cache reuse, speculation overhead, and incremental throughput are genuine experimental questions."
+  },
+  "review": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Projection-major scalar speculative verification",
+      "idea": "Copy short continuations from the current request and verify them by executing each projection across separate singleton positions before advancing to the next projection. Preserve the original scalar numerical operations throughout, including sequential causal attention and separate vocabulary heads. Commit the matching draft prefix and the corrective or bonus token.",
+      "cost_removed": "Targets repeated transformer-weight reads through shorter reuse distance. The 210 body projection matrices total 212,336,640 bytes. If each matrix remains cached across five positions, a fully accepted block could avoid 849,346,560 bytes of repeated body-weight reads. This is a conditional traffic estimate, not measured savings. Scalar projection calls, arithmetic, attention, and full vocabulary scans remain; a block with k drafts and a accepted drafts performs k-a unnecessary positions.",
+      "source_evidence": "Verified candidate/inference.py:26 completes a full scalar model call per step and preserves round 0004's delayed host reads. harness/bench.py:20 synchronizes around timed decode and shares the model between implementations. Installed mlx-lm 0.32.0 llama.py exposes the seven separate projections, original SwiGLU, singleton attention, and tied head. Direct inspection of the pinned safetensors header confirms 210 BF16 projection matrices totaling 212,336,640 bytes, individually 221,184\u20131,769,472 bytes, plus a 56,623,104-byte tied head. KVCache grows in 256-position increments and trim changes only its offset. Installed MLX exposes value-preserving graph dependencies; the [dependency construction source](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/ops.cpp) confirms explicit graph edges. [LLMA](https://arxiv.org/abs/2304.04487) supports copying and verification. [LLM-42](https://arxiv.org/html/2601.17768v2) motivates consistent reduction schedules and retained KV; its deterministic verifier does not establish parity with this scalar reference.",
+      "generalization": "Loop interchange and temporal locality are portable scheduling mechanisms. Benefits require individual projections or existing model shards, together with intervening working data, to fit a faster memory tier while the full model does not. The principle could apply to tensor-parallel or offloaded frontier models, but this experiment neither implements those regimes nor establishes their gains. Larger unsharded projections may require additional blocking outside this round.",
+      "risk": "Low acceptance, ineffective cache reuse, dependency overhead, pipeline drains, and additional cache copies may erase the savings. Identical tensor shapes alone do not establish exactness: native layouts, causal prefixes, positions, primitive selection, and rounding boundaries must also match. Dependencies attached only after a projection do not enforce its execution order. Lazy cache updates must not expose future entries or overwrite data still needed by earlier attention calls.",
+      "history_relation": "Round 0001 failed exact evaluation without a numerical diagnosis. Keeping every verifier operation scalar addresses a plausible failure mode without claiming to diagnose that failure. Round 0003's implementation disabled its optimized path, so its 1.000x result does not test this schedule. Rounds 0002 and 0005 tested screening and sibling packing, respectively. Retain round 0004's accepted pipeline for scalar fallback."
+    },
+    "plan": "1. Implement only inside candidate/. Preserve public interfaces, original prefill computation, and first-token selection. Return fresh request state containing ordinary KV caches, copied prompt history, and an incremental n-gram index. Keep shared weights, module bindings, and global execution settings unchanged. Prefill may index prompt tokens, but appending the generated first token, generated-token-dependent lookup, and every subsequent forward operation belong inside decode.\n\n2. Fix maximum suffix length at three and maximum draft length at four. When appending committed token H[j], index H[j-n:j] -> j for each eligible n. This records the most recent occurrence with an observed continuation without hiding it behind a terminal self-match. Search suffix lengths longest first; copy only observed H[j:j+k], allowing overlap without extrapolation. At a verification boundary, require an empty scalar-output queue, history H containing all committed tokens, and every cache representing H[:-1] at common offset C. With R output slots remaining and Q the minimum allocated key/value capacity, set k=min(4,R-1,len(H)-j,Q-C-1). Use scalar fallback if no match exists or k<1. Restrict verification to the supported dense Llama path with ordinary full-attention KVCache objects. Scalar steps perform capacity growth using the original model.\n\n3. Preserve the existing two-output asynchronous pipeline during scalar fallback. Track scheduled outputs, including unread outputs, so no model call exceeds the requested budget. Append IDs to history exactly once as they are read. A match detected from drained IDs may trigger a transition: stop submitting scalar steps, drain all outstanding outputs in order, then recompute lookup, remaining budget, and capacity from the updated history. Never use the stale match to verify against an advanced cache. The H[:-1] cache invariant applies at drained boundaries, not while outputs remain unread.\n\n4. Verify [pending,d1,...,dk] using separate native singleton token tensors with the reference token dtype and shape (1,1). For each layer, compute separate input normalizations; execute all q_proj calls, then all k_proj calls, then all v_proj calls. Process each position's original reshapes, RoPE, singleton cache insertion, and attention sequentially. Position i uses RoPE offset C+i and exactly C+i+1 KV entries. Preserve the reference singleton mask, which is None for this full-attention configuration, attention scale, and native attention helper. Then group scalar o_proj calls, preserve residual additions and post-attention normalization, group gate_proj and up_proj calls, invoke the original scalar SwiGLU, and group down_proj calls before the final residual addition. Advance layers only after completing the preceding layer's positions. Finish with separate original final-normalization, full-head, and mx.argmax(logits[:, -1, :], axis=-1) calls. Preserve shapes, layouts, dtypes, and rounding boundaries; do not stack activations into batched numerical operations or introduce new compilation wrappers.\n\n5. Enforce phase ordering through dependencies on the inputs consumed by the next operation. For example, gate the next projection's input with mx.depends(input, all_previous_phase_outputs) before calling the projection. Wrapping an already-created projection result is insufficient. For attention, make the next cache insertion depend on completion of the preceding attention read, and retain each call's correctly bounded KV view. Use the ordinary cache update semantics rather than constructing attention views from the final speculative cache. Release unnecessary Python references to old cache versions. Submit asynchronously without per-projection host synchronization; materialize prediction IDs together only after verification. Preserve each native singleton prediction tensor for use as the next pending token. Inspect graph dependencies and, where available, an independent runtime trace to confirm the intended schedule executes.\n\n6. Let p0,...,pk be the scalar predictions and a the longest prefix satisfying di=p(i-1). Emit d1,...,da followed by pa. Trim k-a positions in place, leaving every cache at C+1+a with pa pending and absent from KV. Retain allocation, exclude stale rejected entries through the offset, and overwrite them on subsequent updates. Discard rejected predictions and activations; index only committed outputs. Preserve empty output for budgets below one, no decode forward for a one-token budget, fixed-length generation after EOS, and no processing of the final pending token. Charge all lookup, scheduling, transfers, cache copies, synchronization, and rollback to decode.\n\n7. Establish numerical equivalence on independent inputs before authoritative evaluation. Compare the verifier with original singleton model calls teacher-forced on the same proposed input sequence, including rejected positions. Compare intermediate activations, full logits, and retained KV prefixes bitwise, together with offsets, allocation shapes, and native layout construction. This separates schedule equivalence from draft acceptance. Also compare greedy continuations after rollback and after returning to scalar decoding. Investigate any discrepancy at its first differing operation; matching current token IDs does not validate divergent retained KV.\n\n8. Exercise every draft and acceptance length, immediate rejection, full acceptance, overlapping lookup spans, no-match fallback, pipeline transitions, ties, small budgets, request isolation, and positions around cache-capacity boundaries. Confirm scalar growth resumes correctly and speculative execution never changes allocation capacity. Record request-local verification counts, accepted lengths, rejected positions, and scalar-step counts without hot-path logging. The optimized path must actually run on supported independent target-model cases; a disabled path is not evidence about the mechanism. Runtime limitations remain implementation limitations.\n\n9. Freeze policy before authoritative evaluation. Have the orchestrator run the unchanged exact-token evaluation, including the complete benchmark workload, then both throughput confirmations against the current accepted round-0004 candidate. Require at least 1.03x incremental gain in both confirmations. Record correctness, active-path status, acceptance, and measured throughput separately, without tuning from benchmark prompts or results.",
+    "reason": "No fundamental flaw was found. Projection loop interchange is sound when each position retains the original scalar operations and attention observes its original causal prefix. The review makes execution dependencies, cache lifetimes, pipeline transitions, and numerical validation explicit. Cache reuse and net throughput remain experimental questions for evaluation and benchmarking."
+  },
+  "implementation": {
+    "outcome": "implemented",
+    "summary": "Implemented projection-major singleton verification in candidate/inference.py, with request-local n-gram drafting, capacity limits, rollback, counters, and preserved asynchronous scalar fallback. Surrogate numerical, scheduling, and boundary checks passed. Native MLX equivalence and runtime tracing remain unverified because no Metal device is available; authoritative evaluation and benchmarking remain with the orchestrator."
+  },
+  "eval": {
+    "correct": true,
+    "cases": [
+      {
+        "prompt": "Explain why the sky is blue.",
+        "correct": true
+      },
+      {
+        "prompt": "Write a short Python function that reverses a list.",
+        "correct": true
+      },
+      {
+        "prompt": "What are the main causes of inflation?",
+        "correct": true
+      },
+      {
+        "prompt": "Describe how photosynthesis works.",
+        "correct": true
+      },
+      {
+        "prompt": "Continue this story: The door opened and nobody was there.",
+        "correct": true
+      },
+      {
+        "prompt": "<benchmark>",
+        "correct": true
+      }
+    ]
+  },
+  "confirmations": [
+    {
+      "baseline_relative_decode_speed": 1.3549312879510431,
+      "candidate_relative_decode_speed": 1.6254942752437649,
+      "gain": 1.199687607555268
+    },
+    {
+      "baseline_relative_decode_speed": 1.3492131248550396,
+      "candidate_relative_decode_speed": 1.6122718949636003,
+      "gain": 1.194971991646482
+    }
+  ],
+  "confirmed_gain": 1.194971991646482,
+  "reason": "decode gain confirmed twice at >= 1.03x"
+}
