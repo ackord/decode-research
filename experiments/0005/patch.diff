@@ -1,0 +1,121 @@
+diff --git a/candidate/inference.py b/candidate/inference.py
+index 269bf8e..f7f7761 100644
+--- a/candidate/inference.py
++++ b/candidate/inference.py
+@@ -1,8 +1,98 @@
++from dataclasses import dataclass
++
+ import mlx.core as mx
++import mlx.nn as nn
++from mlx_lm.models.activations import swiglu
++from mlx_lm.models.base import create_attention_mask, scaled_dot_product_attention
+ from mlx_lm.models.cache import make_prompt_cache
++from mlx_lm.models.llama import Model
++
++
++@dataclass
++class RequestState:
++    cache: list
++    packed: list
++
++
++def _pack_projections(model):
++    args = model.args
++    if (
++        type(model) is not Model
++        or args.attention_bias
++        or args.mlp_bias
++        or not args.tie_word_embeddings
++        or any(kind != "full_attention" for kind in args.layer_types)
++        or len(model.layers) != args.num_hidden_layers
++    ):
++        raise ValueError("Packed decode requires dense, bias-free, tied-head Llama")
++
++    packed = []
++    for layer in model.layers:
++        attn, mlp = layer.self_attn, layer.mlp
++        projections = (attn.q_proj, attn.k_proj, attn.v_proj,
++                       mlp.gate_proj, mlp.up_proj, attn.o_proj, mlp.down_proj)
++        shapes = (
++            (attn.n_heads * attn.head_dim, args.hidden_size),
++            (attn.n_kv_heads * attn.head_dim, args.hidden_size),
++            (attn.n_kv_heads * attn.head_dim, args.hidden_size),
++            (args.intermediate_size, args.hidden_size),
++            (args.intermediate_size, args.hidden_size),
++            (args.hidden_size, attn.n_heads * attn.head_dim),
++            (args.hidden_size, args.intermediate_size),
++        )
++        for projection, shape in zip(projections, shapes):
++            if (type(projection) is not nn.Linear or "bias" in projection
++                    or projection.weight.dtype != mx.bfloat16
++                    or projection.weight.shape != shape):
++                raise ValueError("Unexpected projection type, dtype, bias, or shape")
++
++        q, k, v, gate, up = (p.weight for p in projections[:5])
++        packed.append((mx.concatenate((q, k, v), axis=0),
++                       mx.concatenate((gate, up), axis=0),
++                       q.shape[0], k.shape[0], gate.shape[0]))
++
++    # Materialize weight-only copies during prefill, without a decode warmup.
++    mx.eval([weight for entry in packed for weight in entry[:2]])
++    return packed
++
++
++def _scalar_forward(model, inputs, state):
++    if inputs.shape != (1, 1):
++        raise ValueError("Packed forward requires one scalar decode token")
++
++    backbone = model.model
++    h = backbone.embed_tokens(inputs)
++    mask = create_attention_mask(h, state.cache[backbone.fa_idx])
++    for layer, cache, packed in zip(backbone.layers, state.cache, state.packed):
++        qkv_weight, gate_up_weight, q_width, k_width, gate_width = packed
++        attn = layer.self_attn
++        x = layer.input_layernorm(h)
++        qkv = x @ qkv_weight.T
++        queries = qkv[..., :q_width]
++        keys = qkv[..., q_width:q_width + k_width]
++        values = qkv[..., q_width + k_width:]
++        # With B=L=1 each slice spans contiguous output rows; no copy is needed.
++        queries = queries.reshape(1, 1, attn.n_heads, -1).transpose(0, 2, 1, 3)
++        keys = keys.reshape(1, 1, attn.n_kv_heads, -1).transpose(0, 2, 1, 3)
++        values = values.reshape(1, 1, attn.n_kv_heads, -1).transpose(0, 2, 1, 3)
++        queries = attn.rope(queries, offset=cache.offset)
++        keys = attn.rope(keys, offset=cache.offset)
++        keys, values = cache.update_and_fetch(keys, values)
++        output = scaled_dot_product_attention(
++            queries, keys, values, cache=cache, scale=attn.scale, mask=mask
++        )
++        output = output.transpose(0, 2, 1, 3).reshape(1, 1, -1)
++        h = h + attn.o_proj(output)
++        x = layer.post_attention_layernorm(h)
++        gate_up = x @ gate_up_weight.T
++        gate, up = gate_up[..., :gate_width], gate_up[..., gate_width:]
++        h = h + layer.mlp.down_proj(swiglu(gate, up))
++
++    return backbone.embed_tokens.as_linear(backbone.norm(h))
+ 
+ 
+ def prefill(model, token_ids):
++    packed = _pack_projections(model)
+     tokens = mx.array(token_ids)[None]
+     cache = make_prompt_cache(model)
+ 
+@@ -11,7 +101,7 @@ def prefill(model, token_ids):
+ 
+     mx.eval(token)
+ 
+-    return token, cache
++    return token, RequestState(cache, packed)
+ 
+ 
+ def decode(model, first_token, cache, max_new_tokens):
+@@ -23,7 +113,7 @@ def decode(model, first_token, cache, max_new_tokens):
+     pending = []
+ 
+     for _ in range(max_new_tokens - 1):
+-        logits = model(token.reshape(1, 1), cache=cache)
++        logits = _scalar_forward(model, token.reshape(1, 1), cache)
+         token = mx.argmax(logits[:, -1, :], axis=-1)
+ 
+         mx.async_eval(token)

@@ -1,0 +1,94 @@
+{
+  "round": "0002",
+  "parent_commit": "5b5812007f5bebeba8e2faa5e0969e8d1769eec2",
+  "models": {
+    "research": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "review": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "implementation": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    }
+  },
+  "status": "rejected",
+  "research": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Certified vocabulary screening",
+      "idea": "Preserve single-token transformer execution and its KV cache. Use a separate 4-bit approximation of the output matrix to bound every vocabulary logit, then refine 256 possible winners using original weights. Emit a token only when conservative bounds certify the reference BF16 argmax; otherwise run the original full output projection.",
+      "cost_removed": "On certified steps, replaces the 56,623,104-byte BF16 head scan with 17,694,720 bytes of packed 4-bit weights and FP32 group scales<redacted-path> plus bound metadata and refinement. Reading 256 original rows adds 294,912 weight bytes. The nominal reduction before overhead is about 38 MB per step. The coarse projection still performs arithmetic across the vocabulary; savings come primarily from reduced weight traffic. Fallback pays screening overhead plus the original head.",
+      "source_evidence": "candidate<redacted-path> invokes the full model and vocabulary argmax for each additional token. Installed mlx-lm 0.32.0 llama.py:215-219 separates the transformer body from the output projection; Embedding.as_linear executes h @ weight.T. Direct inspection of the pinned checkpoint confirms a tied 49,152-by-576 BF16 matrix, occupying 56,623,104 of 269,030,016 tensor bytes\u2014about 21%. These are storage counts, not measured traffic. Stock quantized_matmul supports packed 4-bit weights with group size 64 and FP32 inputs<redacted-path> Bound-based winner elimination has precedent in [maximum inner-product search](https://arxiv.org/abs/1202.6101) and [certhead](https://github.com/nickharris808/certhead); neither establishes reference-BF16 parity or throughput here.",
+      "generalization": "Applies to fixed decoder models with linear vocabulary heads, without training or request reuse. Reduced head traffic could matter for large vocabularies and MoE models where the head is a meaningful fraction of active weights. Benefits are limited by that fraction in large dense models. The mechanism uses packed representations, bounds, and selective evaluation through standard operations; it requires no custom kernels.",
+      "risk": "Loose bounds, vocabulary selection, synchronization, and frequent fallback may erase savings. The central correctness risk is certifying real-valued dot products instead of the actual reference BF16 logits. Bounds must include quantization residuals, affine arithmetic, FP32 accumulation, final BF16 rounding, and rounding while constructing the bounds. Shortlisted row computations cannot simply be assumed numerically identical to the full projection.",
+      "history_relation": "Round 0001 failed exact-token evaluation on three of five cases; no performance result or numerical mismatch diagnosis was recorded. This experiment preserves the scalar transformer and cache computation and introduces a local certificate with full-head fallback. The earlier failure remains evidence against that tested block-verification implementation, not against every speculative method."
+    },
+    "plan": "1. Implement only inside candidate<redacted-path> Preserve reference prefill and first-token selection. Return fresh request state containing the ordinary KV cache and auxiliary head data. Keep original model weights and methods untouched, including when the benchmark shares one model between implementations.\n\n2. Fix the policy before evaluation: affine 4-bit groups of 64 and a refinement budget of 256 rows. Construct the auxiliary representation from weights alone, with FP32 scales and biases. Precompute outward-rounded residual norms ||w_i-w_hat_i||_2, original row norms, and arithmetic-error metadata. Only weight-derived data may persist across requests; no generated-token work may move into prefill.\n\n3. During each decode step, call model.model once with the original single-token shape and raw cache, obtaining the unchanged normalized hidden state h. Evaluate the packed auxiliary head in FP32. Start each error radius with ||h||_2 ||w_i-w_hat_i||_2. Add conservative floating-point bounds for both auxiliary and reference computations; affine cancellation requires bounding |scale*q|+|bias|, not merely |w_hat|. Use outward rounding throughout and map accumulator intervals through the reference BF16 rounding operation. Document the arithmetic assumptions and fall back for unsupported ranges or nonfinite values. Do not use an empirical margin threshold.\n\n4. Select the 256 largest upper bounds and retain an upper bound covering every excluded row. Gather only those original BF16 rows, convert to FP32, and refine their dot products using explicit multiplication and reduction. Enclose the reference logits by accounting for both the refinement reduction error and reference reduction error before BF16 rounding. Emit j only when its lower bound strictly exceeds every competing upper bound, including excluded rows. On ambiguity or ties, call the original embed_tokens.as_linear(h) and original argmax. Reuse h; never rerun the transformer or advance KV twice.\n\n5. Validate interval containment and emitted IDs against the original full head on independent synthetic BF16 inputs, including cancellation, negative scores, exact ties, BF16 rounding boundaries, and forced fallback. Check complete model trajectories, cache progression, zero<redacted-path> budgets, fixed-length behavior after EOS, and request isolation. Numerical analysis establishes the certificate; differential tests check its implementation.\n\n6. Hand unchanged exact-token evaluation and benchmarking to the orchestrator. Record certification and fallback rates separately from throughput, without tuning to benchmark prompts or results. Keep only a gain meeting the existing 3% threshold in both confirmation runs.",
+    "reason": "This targets a substantial, directly observed weight scan while preserving the transformer computation implicated by the previous experiment's numerical risk. A conservative local certificate and original-head fallback provide a sound correctness mechanism. Whether the reduced traffic outweighs screening overhead is genuinely uncertain and worth benchmarking."
+  },
+  "review": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Certified vocabulary screening",
+      "idea": "Keep the original single-token transformer and KV computation. Scan a separate packed 4-bit approximation of the vocabulary head, refine 256 potentially winning rows using original weights, and emit only when conservative intervals prove the reference BF16 winner. Otherwise compute the original full head from the same hidden state.",
+      "cost_removed": "Verified head storage is 56,623,104 bytes. The auxiliary representation requires 14,155,776 bytes of packed codes plus 3,538,944 bytes of FP32 scales and biases. Refining 256 original rows reads another 294,912 weight bytes. Certified steps therefore avoid approximately 38.6 MB of head payload before bound metadata, intermediate arrays, selection, and synchronization costs. These are storage-based estimates, not measured traffic. Fallback adds screening and refinement costs to the original projection; vocabulary-wide arithmetic remains.",
+      "source_evidence": "candidate<redacted-path> currently matches reference<redacted-path> harness<redacted-path> times decode after prefill and shares one model between implementations. Direct checkpoint inspection confirms a tied 49,152-by-576 BF16 head and 269,030,016 total tensor bytes. Installed mlx-lm 0.32.0 separates model.model from embed_tokens.as_linear; the latter computes x @ weight.T. Installed MLX 0.32.3 supports affine 4-bit groups of 64 with FP32 scales and biases. Its GEMV and packed projection headers expose FP32 accumulation paths, but the packed arithmetic handles scale and bias contributions separately. [Maximum inner-product search](https://arxiv.org/abs/1202.6101) supports bound-based elimination. [certhead's source](https://raw.githubusercontent.com/nickharris808/certhead/main/src/certhead/core.py) uses NumPy FP64 arrays and modeled byte counts; it does not establish this implementation's BF16 parity or throughput.",
+      "generalization": "The portable mechanism is compressed head scanning followed by bounded selective evaluation. It requires no training, target modification, custom kernels, or request reuse. It could matter for large vocabularies and models whose output head constitutes a meaningful share of active weights, including some MoE configurations. Larger hidden dimensions may weaken screening, and large dense models may have too little head cost for substantial end-to-end gains.",
+      "risk": "Loose bounds, BF16 ties, selection overhead, and fallback may eliminate the speedup. Correctness requires enclosing the actual reference logits, including arithmetic and final rounding. A real-valued argmax certificate or an allegedly exact shortlisted matmul is insufficient. Fallback protects ambiguous cases only when the preceding certificate is sound.",
+      "history_relation": "Round 0001 failed three of five exact-token cases; its cause was not diagnosed and no throughput result was recorded. This proposal preserves scalar transformer execution and cache progression, but should not be described as a demonstrated repair of that failure. Vocabulary screening remains untested."
+    },
+    "plan": "1. Implement only inside candidate<redacted-path> Preserve public interfaces, original prefill computation, and first-token argmax. Return fresh request state containing the ordinary KV cache and a reference to immutable auxiliary head data. Keep original model weights, modules, and methods untouched because benchmarking shares the model with reference inference. Only weight-derived auxiliary data may persist across requests; associate it with the correct model and weight object.\n\n2. Freeze affine 4-bit quantization, group size 64, and refinement budget 256 before evaluation. Quantize a separate FP32 conversion of the original BF16 weights so scales and biases remain FP32. Define the mathematical reconstruction from the actual stored codes and parameters: w_hat[i,k] = s[i,g] * q[i,k] + b[i,g]. Construct outward bounds R_i >= ||w_i-w_hat_i||_2, S_i >= ||w_i||_2, and A_i >= || |s_i*q_i|+|b_i| ||_2. Include reconstruction, norm, and metadata-storage rounding. Ordinary FP64 calculation followed by one upward rounding is not automatically an enclosure. Discard full-size temporary reconstructions after preparation.\n\n3. Before enabling certification, document and implement error bounds for the actual stock operations. With H >= ||h||_2, coarse output c_i needs a radius at least H*R_i + E_aux_i + E_ref_i. Under ordinary FP32 multiplication and accumulation without exceptional ranges, a conservative reference-dot bound is gamma_(2d)*H*S_i, where gamma_n = n*u/(1-n*u), u=2^-24, and d=576. Derive the auxiliary coefficient from its affine expression and reductions using A_i; bounding only ||w_hat_i|| misses cancellation between scale and bias terms. Cover reduction ordering, fused or separate arithmetic, and packed power-of-two rescaling. Handle underflow and flush-to-zero with justified absolute allowances or proved range guards; reject overflow, nonfinite values, and unsupported arithmetic contracts. Do not infer precision from output dtype or replace analysis with an empirical margin constant.\n\n4. For each additional token, call model.model once with the original (1,1) token shape and raw cache. Preserve the resulting native hidden state and its shape for possible fallback. Use a separate FP32 conversion for the packed projection. Compute H, radii, and interval endpoints with conservative rounding, including errors in their construction. Map the outward accumulator endpoints through the reference BF16 conversion; its monotonicity then gives lower and upper bounds on the actual BF16 logits. Comparisons may use lossless FP32 conversions of those BF16 bounds. All hidden-state-dependent work begins inside decode.\n\n5. Select the 256 largest upper bounds. Retain a bound covering every excluded row, using the maximum excluded upper bound or a valid partition cutoff, including boundary ties. Gather selected rows from the original BF16 matrix before converting them to FP32. Refine with explicit multiplication and reduction. Around each refined dot, include both its own reduction error and the reference projection error, then perform the same BF16 interval mapping. Select the largest refined lower bound and certify only if it strictly exceeds every other shortlisted upper bound and the excluded-row bound. Do not assume gathered-row computation is numerically identical to the full projection.\n\n6. On ambiguity, ties, invalid bounds, or unsupported ranges, call the original embed_tokens.as_linear(h) and original argmax with the retained native h. Never rerun the transformer or advance KV twice. Make fallback genuinely conditional after evaluating the certificate; an array selection that evaluates both projections removes the intended saving. Do not materialize a full FP32 or dequantized head during decode. Preserve empty output for budgets below one, no decode model call for a one-token budget, fixed-length continuation after EOS, and the final pending-token convention. Include selection, transfers, branching, synchronization, and fallback in decode timing.\n\n7. Validate coarse and refined interval containment against the original full head on independent synthetic BF16 inputs, checking every vocabulary row where applicable. Exercise cancellation, negative logits, zero vectors, exact ties, distinct real scores that round to the same BF16 value, rounding midpoints, extreme ranges, and shortlist cutoff ties. Require tests that actually exercise certification and forced fallback. Check complete target trajectories, transitions between certified and fallback steps, cache progression, and alternating reference<redacted-path> requests on a shared model. Differential agreement checks implementation; it does not establish the numerical bound. Freeze the policy independently of benchmark prompts and results.\n\n8. Hand authoritative validation to the orchestrator: unchanged exact-token evaluation, including the benchmark workload, followed by unchanged benchmarking against the current best. Retain only a gain of at least 1.03 in both confirmation runs. Record certification and fallback counts separately from throughput without retaining request computation or tuning from benchmark results. An unavailable runtime or an unestablished arithmetic contract is an implementation limitation, not a measured failure of screening.",
+    "reason": "No fundamental flaw was found. The mechanism can remove a substantial head scan while preserving transformer execution. The review makes the numerical certificate and conditional fallback requirements explicit; exact evaluation and benchmarking should determine whether the implementation is correct and worthwhile."
+  },
+  "implementation": {
+    "outcome": "implemented",
+    "summary": "Implemented packed 4-bit screening, 256-row refinement, conservative BF16 certification, and conditional full-head fallback in candidate<redacted-path> Preserved transformer<redacted-path> progression and added request-local counters. Three metadata tests pass; MLX runtime tests could not run because no Metal device is available. Authoritative evaluation and benchmarking remain with the orchestrator."
+  },
+  "eval": {
+    "correct": true,
+    "cases": [
+      {
+        "prompt": "Explain why the sky is blue.",
+        "correct": true
+      },
+      {
+        "prompt": "Write a short Python function that reverses a list.",
+        "correct": true
+      },
+      {
+        "prompt": "What are the main causes of inflation?",
+        "correct": true
+      },
+      {
+        "prompt": "Describe how photosynthesis works.",
+        "correct": true
+      },
+      {
+        "prompt": "Continue this story: The door opened and nobody was there.",
+        "correct": true
+      },
+      {
+        "prompt": "<benchmark>",
+        "correct": true
+      }
+    ]
+  },
+  "confirmations": [
+    {
+      "baseline_relative_decode_speed": 0.9999561676535764,
+      "candidate_relative_decode_speed": 0.7706377208660713,
+      "gain": 0.7706715012062909
+    },
+    {
+      "baseline_relative_decode_speed": 1.0001562409010925,
+      "candidate_relative_decode_speed": 0.7809618215817598,
+      "gain": 0.7808398224642891
+    }
+  ],
+  "confirmed_gain": 0.7706715012062909,
+  "reason": "decode gain was not >= 1.03x twice"
+}

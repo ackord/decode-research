@@ -1,0 +1,94 @@
+{
+  "round": "0005",
+  "parent_commit": "5ba969807a50bd4f5eb3b8b92227d043e88a3a52",
+  "models": {
+    "research": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "review": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "implementation": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    }
+  },
+  "status": "rejected",
+  "research": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Pack sibling projections for scalar decode",
+      "idea": "Pack each layer\u2019s unchanged Q/K/V weight rows into one matrix and its gate/up rows into another. Evaluate each packed matrix once per token, then split the outputs. Retain scalar autoregression and the accepted asynchronous pipeline.",
+      "cost_removed": "Reduces transformer matrix-multiplication invocations from 210 to 120 per token, removing 90 dispatches and their graph-construction overhead. Including the vocabulary head, calls fall from 211 to 121. Arithmetic and weight bytes scanned remain essentially unchanged; the saving is repeated operator setup and dispatch.",
+      "source_evidence": "candidate/inference.py:26 still calls the complete model for every decode step. Installed mlx-lm 0.32.0 llama.py:82 separately projects the same normalized input through Q, K, and V; line 121 separately projects another shared input through gate and up. The pinned checkpoint has 30 layers with BF16 Q/K/V shapes (576,576), (192,576), (192,576), and gate/up shapes (1536,576). Packing produces (960,576) and (3072,576). The inspected [MLX dispatch source](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/matmul.cpp) selects the same scalar GEMV configuration for these original and packed shapes, supporting preservation of each row\u2019s reduction sequence. [vLLM\u2019s Llama implementation](https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/model_executor/models/llama.py) independently uses packed QKV and gate/up projections.",
+      "generalization": "Combining independent linear projections sharing an input is portable across tensor libraries and accelerators and requires ordinary concatenation, matrix multiplication, and slicing. It applies to large decoder models, including tensor-parallel shards where dispatch overhead remains exposed. Benefits diminish when weight bandwidth dominates, and serving engines that already pack these projections gain nothing further.",
+      "risk": "Changed output shapes or layouts can select different floating-point reductions, so exact projection and retained-KV parity must be checked. Separate packed copies add 139,345,920 bytes for this checkpoint. Allocation pressure, slicing overhead, and the existing pipeline may erase the scheduling savings.",
+      "history_relation": "This within-token packing has not been tested. Round 0004 establishes that exposed scheduling overhead mattered, but does not establish an additional gain here. Round 0001\u2019s exact failure cautions against assuming shape changes preserve arithmetic. Round 0002 measured a different head-screening mechanism; round 0003 left batching disabled and therefore did not measure active head batching."
+    },
+    "plan": "1. Implement only inside candidate/. During prefill, construct and materialize separate packed matrices by concatenating original BF16 rows in Q/K/V and gate/up order. Preserve the original prefill forward, first-token argmax, model objects, and weights. Return fresh request state containing the ordinary KV cache and packed matrices; perform no future-token computation.\n\n2. Add a scalar decode forward that follows the installed Llama implementation. Replace only the three Q/K/V projections with one packed projection split into widths 576/192/192, and the gate/up pair with one projection split into widths 1536/1536. Preserve input normalization, RoPE calls and offsets, cache updates, attention, output projection, residual additions, existing SwiGLU, down projection, final normalization, and vocabulary head in their original order and dtypes. Introduce no custom kernels or compiler changes.\n\n3. Retain the current two-token asynchronous queue and device-resident token dependencies. Execute exactly max_new_tokens-1 scalar forwards for positive budgets, preserve fixed-length generation after EOS, and drain before returning. Keep all generated-token work inside decode and all request state isolated.\n\n4. Validate packed projections bitwise against the original projections on independent synthetic inputs and target trajectories. Check split layouts, normalized hidden states, every retained KV prefix, cache offsets, capacity crossings, and subsequent reference continuation. Include budgets 0, 1, 2, and longer requests. Treat numerical differences as correctness issues; token agreement alone must not conceal divergent retained state.\n\n5. Hand authoritative exact-token evaluation and both performance confirmations against the current best to the orchestrator. Freeze the packing scheme before evaluation and retain only the required clear improvement.",
+    "reason": "This is a simple, sound experiment removing 90 repeated projection dispatches per token while preserving the model\u2019s mathematical computation. Source inspection supports numerical parity for the affected shapes; actual exactness and incremental throughput remain for evaluation and benchmarking."
+  },
+  "review": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Pack sibling projections for scalar decode",
+      "idea": "Concatenate each layer\u2019s unchanged BF16 Q/K/V weight rows and, separately, its gate/up rows. During scalar decode, evaluate each packed projection once and split its outputs. Preserve the accepted asynchronous pipeline and all remaining model operations.",
+      "cost_removed": "Reduces dense linear-projection calls from 210 to 120 per generated-token forward, or 211 to 121 including the vocabulary head. This removes 90 operator submissions and associated setup. These counts exclude attention operations; slicing and possible layout copies mean the net device-dispatch reduction requires measurement. Arithmetic and weight bytes scanned remain essentially unchanged.",
+      "source_evidence": "Verified candidate/inference.py:26, installed mlx-lm 0.32.0 llama.py:82 and :121, and the pinned checkpoint\u2019s configuration and safetensors header. All 30 layers have bias-free BF16 Q/K/V shapes (576,576)/(192,576)/(192,576) and gate/up shapes (1536,576)/(1536,576). The vocabulary head uses tied embeddings. Inspection of [MLX 0.32.3 dispatch](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/matmul.cpp) and its [GEMV implementation](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/kernels/gemv.h) supports identical per-row scalar reductions for the original and packed widths; this is source evidence, not completed numerical validation. [vLLM\u2019s Llama implementation](https://raw.githubusercontent.com/vllm-project/vllm/main/vllm/model_executor/models/llama.py) independently packs both projection groups.",
+      "generalization": "Combining independent projections sharing an input is a portable reduction in operator submissions, expressible with ordinary concatenation, matrix multiplication, and slicing. It can help larger models and tensor-parallel shards when invocation overhead remains exposed. It offers little benefit when weight bandwidth dominates and no additional packing benefit in engines already using this arrangement. No gain is attributed to compiler changes or specialized kernels.",
+      "risk": "Mathematical equivalence alone does not establish floating-point parity. Packed output shapes and split layouts can affect projection reductions or downstream execution. Separate packed copies add 139,345,920 bytes for this checkpoint; allocation pressure, layout handling, and overlap already achieved by the pipeline may erase the savings.",
+      "history_relation": "This packing mechanism remains untested. Round 0004 established a scheduling benefit but does not establish an incremental packing benefit. Round 0001 failed exactness without establishing its cause. Round 0002 tested vocabulary screening. Round 0003 left head batching disabled, so its timing did not resolve active head batching or this proposal."
+    },
+    "plan": "1. Implement only inside candidate/. Keep the target model, parameters, module bindings, and library classes unchanged: harness.bench alternates reference and candidate on the same model instance. Validate the expected dense, bias-free configuration from model metadata and derive split widths from weights.\n\n2. During prefill, construct and materialize separate BF16 matrices in Q/K/V and gate/up row order, with expected shapes (960,576) and (3072,576). Perform the original prompt forward and first-token argmax unchanged. Return the first token and a fresh request-state wrapper containing the ordinary KV cache and packed matrices. Packing depends only on weights; execute no generated-token forward, verification, or decode warmup during prefill. Do not retain request-specific state across requests.\n\n3. Add a scalar forward for inputs shaped (1,1). Mirror the installed Llama forward, replacing only the sibling projections. Preserve embedding lookup, attention-mask creation, both layer normalizations, Q/K/V reshaping, original RoPE calls using the pre-update cache offset, cache.update_and_fetch, the existing attention helper and scale, output projection, residual addition order, existing swiglu(gate, up), down projection, final normalization, and embed_tokens.as_linear for the tied vocabulary head. Preserve dtypes and rounding boundaries. Inspect split layouts; any necessary ordinary layout copies belong inside decode. Add no custom kernels, compilation changes, or backend-specific shape tuning.\n\n4. Retain the current two-token pending queue, device-resident token dependencies, async submissions, and ordered draining. For a positive budget N, emit the supplied first token and execute exactly N-1 scalar forwards. For nonpositive budgets, return an empty list without forwarding. Preserve fixed-length generation after EOS. At completion, each cache offset must equal prompt length plus max(N-1,0); the final emitted token has not yet been inserted into KV.\n\n5. Outside the measured path, compare packed and original projections bitwise on independent synthetic scalar inputs and normalized activations from non-benchmark target trajectories. Compare downstream activations, final logits, and every layer\u2019s valid KV prefix and offset. Exercise the actual asynchronous decode path as well as isolated forwards, budgets 0, 1, 2 and longer, cache growth around 256-token boundaries, independent requests, and reference continuation from the resulting cache. Use independent caches and immutable snapshots for comparisons. Repair numerical or layout discrepancies; limited token agreement must not conceal unexplained state divergence.\n\n6. Freeze the packing scheme before authoritative evaluation. Ensure candidate/inference.py actively exercises both packed projections in every layer. If the implementation environment cannot run MLX, report validation as pending and hand off the active implementation; an unavailable device or a disabled packing path is not an experimental result.\n\n7. The orchestrator performs exact-token evaluation and both throughput confirmations against the accepted round-0004 baseline, using the existing synchronized harness and acceptance rule. Retain only an incremental gain of at least 1.03x in both confirmations, and record correctness, active-path status, performance, and material limitations.",
+    "reason": "No fundamental flaw was found. The proposal removes substantial repeated operator setup through a portable transformation. The review clarifies the call-count claim, shared-model isolation, tied vocabulary head, timing boundary, and numerical validation. Exactness and incremental throughput remain for evaluation and benchmarking."
+  },
+  "implementation": {
+    "outcome": "implemented",
+    "summary": "Implemented packed Q/K/V and gate/up projections in candidate/inference.py, with fresh request state and the existing asynchronous queue preserved. Shared model parameters and bindings remain unchanged. Syntax, diff checks, and mocked decode control-flow checks passed. Numerical parity, KV-state comparisons, and model execution remain pending because MLX cannot initialize a Metal device here; authoritative evaluation and benchmarking are left to the orchestrator."
+  },
+  "eval": {
+    "correct": true,
+    "cases": [
+      {
+        "prompt": "Explain why the sky is blue.",
+        "correct": true
+      },
+      {
+        "prompt": "Write a short Python function that reverses a list.",
+        "correct": true
+      },
+      {
+        "prompt": "What are the main causes of inflation?",
+        "correct": true
+      },
+      {
+        "prompt": "Describe how photosynthesis works.",
+        "correct": true
+      },
+      {
+        "prompt": "Continue this story: The door opened and nobody was there.",
+        "correct": true
+      },
+      {
+        "prompt": "<benchmark>",
+        "correct": true
+      }
+    ]
+  },
+  "confirmations": [
+    {
+      "baseline_relative_decode_speed": 1.3202592192997562,
+      "candidate_relative_decode_speed": 1.3390798624898301,
+      "gain": 1.014255263598959
+    },
+    {
+      "baseline_relative_decode_speed": 1.2044937421267226,
+      "candidate_relative_decode_speed": 1.1759010732469921,
+      "gain": 0.9762616708748976
+    }
+  ],
+  "confirmed_gain": 0.9762616708748976,
+  "reason": "decode gain was not >= 1.03x twice"
+}

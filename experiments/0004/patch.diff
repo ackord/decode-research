@@ -1,0 +1,25 @@
+diff --git a/candidate/inference.py b/candidate/inference.py
+index 9a1b483..269bf8e 100644
+--- a/candidate/inference.py
++++ b/candidate/inference.py
+@@ -20,12 +20,19 @@ def decode(model, first_token, cache, max_new_tokens):
+ 
+     token = first_token
+     output = [token.item()]
++    pending = []
+ 
+     for _ in range(max_new_tokens - 1):
+         logits = model(token.reshape(1, 1), cache=cache)
+         token = mx.argmax(logits[:, -1, :], axis=-1)
+ 
+-        mx.eval(token)
++        mx.async_eval(token)
++        pending.append(token)
++        # Submit the successor before reading the preceding token on the host.
++        if len(pending) == 2:
++            output.append(pending.pop(0).item())
++
++    for token in pending:
+         output.append(token.item())
+ 
+     return output

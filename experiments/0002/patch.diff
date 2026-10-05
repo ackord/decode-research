@@ -1,0 +1,480 @@
+diff --git a/candidate/_bounds.py b/candidate/_bounds.py
+new file mode 100644
+index 0000000..d1f0c0e
+--- /dev/null
++++ b/candidate/_bounds.py
+@@ -0,0 +1,61 @@
++"""Outward weight metadata; no model or request computation is cached here."""
++
++import numpy as np
++
++
++def up(x):
++    return np.nextafter(np.asarray(x, dtype=np.float64), np.inf)
++
++
++def down(x):
++    return np.nextafter(np.asarray(x, dtype=np.float64), -np.inf)
++
++
++def gamma(n, precision=24):
++    # n*u is exact for the dimensions used here; division is rounded outward.
++    nu = n * 2.0 ** -precision
++    return up(nu / (1.0 - nu))
++
++
++def norm_upper(x):
++    """Nonnegative squares, reduction, and square root, each enclosed.
++
++    Any sum ordering has at most d-1 additions along a path. Subnormal
++    FP64 additions are exact; individual underflowing squares are covered
++    by nextafter. This is more than a final upward rounding of a norm.
++    """
++    squares = up(np.asarray(x, dtype=np.float64) ** 2)
++    total = up(np.sum(squares, axis=-1) / down(1.0 - gamma(x.shape[-1], 53)))
++    return up(np.sqrt(total))
++
++
++def supported_range(x):
++    a = np.abs(x)
++    return bool(np.all(np.isfinite(a) & (a <= 2.0**16)
++                       & ((a == 0) | (a >= 2.0**-64))))
++
++
++def float32_upper(x):
++    # Conversion itself may round down; another FP32 successor encloses it.
++    return np.nextafter(np.asarray(x, dtype=np.float32), np.float32(np.inf))
++
++
++def coefficients(weights, codes, scales, biases):
++    """Return R + gamma_aux*A + gamma_ref*S and 2*gamma_ref*S.
++
++    Reconstruction is defined by the stored parameters, not dequantize().
++    Every arithmetic operation used to construct R, S, A is enclosed.
++    """
++    d = weights.shape[-1]
++    w = np.asarray(weights, dtype=np.float64)
++    s = np.repeat(np.asarray(scales, dtype=np.float64), 64, axis=-1)
++    b = np.repeat(np.asarray(biases, dtype=np.float64), 64, axis=-1)
++    sq_lo, sq_hi = down(s * codes), up(s * codes)
++    lo, hi = down(sq_lo + b), up(sq_hi + b)
++    residual = up(np.maximum(np.abs(w - lo), np.abs(w - hi)))
++    magnitude = up(np.maximum(np.abs(sq_lo), np.abs(sq_hi)) + np.abs(b))
++    r, a, s_norm = norm_upper(residual), norm_upper(magnitude), norm_upper(w)
++    ref = up(gamma(2 * d) * s_norm)
++    aux = up(gamma(8 * d + 32) * a)
++    coarse = up(up(r + aux) + ref)
++    return float32_upper(coarse), float32_upper(up(2 * ref))
+diff --git a/candidate/certified_head.py b/candidate/certified_head.py
+new file mode 100644
+index 0000000..9965a83
+--- /dev/null
++++ b/candidate/certified_head.py
+@@ -0,0 +1,174 @@
++"""Packed vocabulary scan with a certificate for the original BF16 head.
++
++Arithmetic contract (stock MLX 0.32.3 Metal, single vector):
++  mlx/backend/metal/matmul.cpp routes M=1 to gemv.h. DefaultAccT is float,
++  products and all partial sums are FP32, then a single BF16 conversion.
++  quantized.cpp routes affine M=1 to quantized.h's qmv (or qmv_quad).
++  Its U is float: sum(h*q)*s + sum(h)*b, with FP32 partial reductions.
++  Four-bit packed masks divide h by powers of two up to 4096. These are
++  exact outside underflow. No low-precision reconstructed weights occur.
++  Stock FP32 multiply/add (separate or fused, including reassociation) and
++  reductions are enclosed using unit roundoff 2^-24. BF16 casts are the
++  same monotone conversion in GEMV and our interval mapping.
++
++The reference and explicit refinement need at most 2d rounding factors
++per term. The affine scan needs fewer than 8d+32 even if all dot, input
++sum, group scale/bias, and final reduction operations are counted serially.
++Apply gamma_(8d+32) to sum |h|*(|s*q|+|b|), NOT to the reconstruction's
++norm: scale/bias cancellation cannot invalidate this bound. Cauchy-Schwarz
++gives H*A. The triangle inequality adds H*R and the reference's H*S error.
++
++FTZ/underflow: each operation can additionally lose at most 2^-126. With
++d<=576, input/parameter magnitudes <=2^16 and nonzero >=2^-64, rescaling
++loss is amplified by at most 4096, a scale by at most 2^16, and fewer than
++8d+32 operations contribute. Even including propagation (1+gamma), their
++total is <2^-80. Use 2^-80 per projection, twice for refinement versus
++reference. These guards also keep every intermediate far below overflow
++(even d*15*2^32 <2^46). Zeros and cancellation remain supported. Unknown
++versions/devices/dtypes and exceptional input ranges fall back. This is
++an arithmetic-adapter restriction, not a hardware-dependent mechanism.
++"""
++
++from dataclasses import dataclass
++from importlib.metadata import version
++import weakref
++
++import mlx.core as mx
++import mlx.nn as nn
++from mlx_lm.models.llama import Model
++import numpy as np
++
++from ._bounds import coefficients, float32_upper, norm_upper, supported_range
++
++
++GROUP_SIZE = 64
++BITS = 4
++REFINE_ROWS = 256
++ABS_ERROR = 2.0**-80
++_STOCK_VERSIONS = (version("mlx") == "0.32.3"
++                   and version("mlx-lm") == "0.32.0")
++
++
++@dataclass(frozen=True)
++class Head:
++    weight: object
++    packed: object
++    scales: object
++    biases: object
++    coarse_error: object
++    refined_error: object
++
++
++# Model is a dict subclass, so use identity plus a weak reference, not hashing.
++# Only immutable weight-derived state survives requests; keep at most one head.
++_prepared = None
++
++
++def arithmetic_supported():
++    return _STOCK_VERSIONS and mx.default_device().type == mx.gpu
++
++
++def prepare(model):
++    global _prepared
++    if (not arithmetic_supported() or type(model) is not Model
++            or not model.args.tie_word_embeddings
++            or type(model.model.embed_tokens) is not nn.Embedding):
++        return None
++    w = model.model.embed_tokens.weight
++    if w.dtype != mx.bfloat16 or w.ndim != 2:
++        return None
++    n, d = w.shape
++    if d > 576 or d % GROUP_SIZE or n <= REFINE_ROWS:
++        return None
++    if _prepared is not None:
++        owner, old_w, head = _prepared
++        if owner() is model and old_w is w:
++            return head
++
++    # Separate FP32 input ensures the saved affine parameters are FP32.
++    q, s, b = mx.quantize(w.astype(mx.float32), group_size=GROUP_SIZE,
++                          bits=BITS, mode="affine")
++    mx.eval(q, s, b)
++    if s.dtype != mx.float32 or b.dtype != mx.float32:
++        return None
++    coarse, refined = [], []
++    for start in range(0, n, 256):
++        stop = min(start + 256, n)
++        original = np.asarray(w[start:stop].astype(mx.float32))
++        scales, biases = np.asarray(s[start:stop]), np.asarray(b[start:stop])
++        if not all(supported_range(x) for x in (original, scales, biases)):
++            return None
++        packed = np.asarray(q[start:stop])
++        shifts = np.arange(8, dtype=np.uint32) * 4
++        codes = ((packed[..., None] >> shifts) & 15).reshape(stop-start, d)
++        c, r = coefficients(original, codes, scales, biases)
++        coarse.append(c)
++        refined.append(r)
++    head = Head(w, q, s, b, mx.array(np.concatenate(coarse)),
++                mx.array(np.concatenate(refined)))
++    mx.eval(head.coarse_error, head.refined_error)
++    _prepared = (weakref.ref(model), w, head)
++    return head
++
++
++def adjacent(x, upward):
++    """One FP32 successor/predecessor using stock integer operations.
++
++    Handles signed zero explicitly. Callers reject nonfinite endpoints.
++    """
++    bits = x.view(mx.uint32)
++    positive_step = mx.where(x >= 0, bits + 1, bits - 1)
++    negative_step = mx.where(x > 0, bits - 1, bits + 1)
++    stepped = positive_step if upward else negative_step
++    zero = 1 if upward else 0x80000001
++    return mx.where(x == 0, mx.array(zero, mx.uint32), stepped).view(mx.float32)
++
++
++def intervals(center, h_norm, coefficient, absolute):
++    # Positive multiplication/addition and signed endpoints each rounded out.
++    # If the positive product flushes, the lost amount is <2^-126; the final
++    # successor at radius >=2^-80 adds >=2^-104, also enclosing that loss.
++    # Nonzero endpoints near this radius cannot themselves be subnormal.
++    radius = adjacent(adjacent(h_norm * coefficient, True) + absolute, True)
++    low = adjacent(center - radius, False)
++    high = adjacent(center + radius, True)
++    return (low.astype(mx.bfloat16).astype(mx.float32),
++            high.astype(mx.bfloat16).astype(mx.float32))
++
++
++def screen(head, native_h):
++    """Return a certified token or None, without evaluating the full head."""
++    if (not arithmetic_supported() or native_h.dtype != mx.bfloat16
++            or native_h.shape != (1, 1, head.weight.shape[1])):
++        return None
++    h = native_h.astype(mx.float32).reshape(1, -1)
++    # Tiny host transfer is timed decode work. It also supplies range guards
++    # and an outward FP64 norm without relying on GPU sqrt accuracy.
++    host_h = np.asarray(h)
++    if not supported_range(host_h):
++        return None
++    h_norm = mx.array(float32_upper(norm_upper(host_h)[0]))
++    center = mx.quantized_matmul(h, head.packed, head.scales, head.biases,
++                                transpose=True, group_size=GROUP_SIZE,
++                                bits=BITS, mode="affine").reshape(-1)
++    low, high = intervals(center, h_norm, head.coarse_error, ABS_ERROR)
++    # kth is the largest excluded bound. Equality at the cutoff is covered,
++    # irrespective of which tied indices argpartition places in the shortlist.
++    cutoff = head.weight.shape[0] - REFINE_ROWS - 1
++    partition = mx.argpartition(high, cutoff)
++    selected = partition[-REFINE_ROWS:]
++    excluded = high[partition[cutoff]]
++    rows = head.weight[selected].astype(mx.float32)  # Gather BEFORE conversion.
++    exact_center = mx.sum(rows * h, axis=-1)
++    refined_low, refined_high = intervals(
++        exact_center, h_norm, head.refined_error[selected], 2 * ABS_ERROR)
++    winner = mx.argmax(refined_low)
++    other = mx.max(mx.where(mx.arange(REFINE_ROWS) == winner,
++                           -float("inf"), refined_high))
++    valid = (mx.all(mx.isfinite(center)) & mx.all(mx.isfinite(low))
++             & mx.all(mx.isfinite(high)) & mx.all(mx.isfinite(refined_low))
++             & mx.all(mx.isfinite(refined_high)))
++    certified = valid & (refined_low[winner] > mx.maximum(other, excluded))
++    token = selected[winner].reshape(1)
++    mx.eval(certified, token)
++    return token if certified.item() else None
+diff --git a/candidate/inference.py b/candidate/inference.py
+index 9a1b483..192c89f 100644
+--- a/candidate/inference.py
++++ b/candidate/inference.py
+@@ -1,5 +1,16 @@
+ import mlx.core as mx
+ from mlx_lm.models.cache import make_prompt_cache
++from dataclasses import dataclass
++
++from .certified_head import prepare, screen
++
++
++@dataclass
++class RequestState:
++    cache: object
++    head: object
++    certified: int = 0
++    fallback: int = 0
+ 
+ 
+ def prefill(model, token_ids):
+@@ -11,7 +22,7 @@ def prefill(model, token_ids):
+ 
+     mx.eval(token)
+ 
+-    return token, cache
++    return token, RequestState(cache, prepare(model))
+ 
+ 
+ def decode(model, first_token, cache, max_new_tokens):
+@@ -22,8 +33,24 @@ def decode(model, first_token, cache, max_new_tokens):
+     output = [token.item()]
+ 
+     for _ in range(max_new_tokens - 1):
+-        logits = model(token.reshape(1, 1), cache=cache)
+-        token = mx.argmax(logits[:, -1, :], axis=-1)
++        if cache.head is None:
++            logits = model(token.reshape(1, 1), cache=cache.cache)
++            token = mx.argmax(logits[:, -1, :], axis=-1)
++            cache.fallback += 1
++        else:
++            h = model.model(token.reshape(1, 1), cache=cache.cache)
++            certified_token = None
++            if model.model.embed_tokens.weight is cache.head.weight:
++                certified_token = screen(cache.head, h)
++            if certified_token is None:
++                # Conditional Python branch: fallback reuses native h and
++                # never executes the transformer or advances the cache twice.
++                logits = model.model.embed_tokens.as_linear(h)
++                token = mx.argmax(logits[:, -1, :], axis=-1)
++                cache.fallback += 1
++            else:
++                token = certified_token
++                cache.certified += 1
+ 
+         mx.eval(token)
+         output.append(token.item())
+diff --git a/candidate/test_certified_head.py b/candidate/test_certified_head.py
+new file mode 100644
+index 0000000..944453f
+--- /dev/null
++++ b/candidate/test_certified_head.py
+@@ -0,0 +1,170 @@
++"""Independent synthetic checks; run with python -m unittest candidate.test_certified_head."""
++
++from decimal import Decimal, localcontext
++import unittest
++from unittest.mock import patch
++
++import numpy as np
++
++from ._bounds import coefficients, norm_upper, supported_range
++
++
++class MetadataTests(unittest.TestCase):
++    def test_norm_encloses_high_precision_sum(self):
++        with localcontext() as context:
++            context.prec = 120
++            for x in (np.zeros(576), np.full(576, 2.0**-64),
++                      np.geomspace(2.0**-64, 2.0**16, 576)):
++                exact = sum(Decimal(float(v)) ** 2 for v in x).sqrt()
++                self.assertGreaterEqual(Decimal(float(norm_upper(x))), exact)
++
++    def test_stored_affine_cancellation_is_enclosed(self):
++        # Reconstruction is near zero although its two affine terms are large.
++        codes = np.full((2, 576), 15, dtype=np.uint32)
++        scales = np.full((2, 9), 128, dtype=np.float32)
++        biases = np.full((2, 9), -1920, dtype=np.float32)
++        weights = np.full((2, 576), 2.0**-20, dtype=np.float32)
++        coarse, refined = coefficients(weights, codes, scales, biases)
++        self.assertTrue(np.all(np.isfinite(coarse)))
++        self.assertTrue(np.all(coarse > 1))  # Cancellation must NOT shrink A.
++        self.assertTrue(np.all(refined > 0))
++
++    def test_range_contract(self):
++        self.assertTrue(supported_range(np.array([0, -2.0**-64, 2.0**16])))
++        for x in (np.nan, np.inf, 2.0**17, 2.0**-65):
++            self.assertFalse(supported_range(np.array([x])))
++
++
++def load_runtime():
++    # Import failure is an execution-environment limitation, not a result.
++    try:
++        import mlx.core as mx
++        from . import certified_head as ch
++        from mlx_lm.models.llama import Model, ModelArgs
++    except ImportError as error:
++        raise unittest.SkipTest(str(error))
++    if not ch.arithmetic_supported():
++        raise unittest.SkipTest("Stock arithmetic adapter unavailable")
++    return mx, ch, Model, ModelArgs
++
++
++class RuntimeTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.mx, cls.ch, cls.Model, cls.ModelArgs = load_runtime()
++
++    def make_model(self, weights):
++        mx = self.mx
++        model = self.Model(self.ModelArgs(
++            model_type="llama", hidden_size=weights.shape[1],
++            intermediate_size=weights.shape[1] * 2, num_hidden_layers=1,
++            num_attention_heads=4, rms_norm_eps=1e-5, vocab_size=len(weights)))
++        model.set_dtype(mx.bfloat16)
++        model.model.embed_tokens.weight = mx.array(weights).astype(mx.bfloat16)
++        return model
++
++    def test_every_row_interval_contains_stock_projection(self):
++        mx, ch = self.mx, self.ch
++        rng = np.random.default_rng(917)
++        weights = rng.normal(0, 0.1, (512, 576)).astype(np.float32)
++        # Identical, zero, and cancellation-heavy rows independent of prompts.
++        weights[0] = 0
++        weights[1] = 1
++        weights[2] = np.tile([1, -1], 288)
++        weights[3] = weights[2]
++        model = self.make_model(weights)
++        head = ch.prepare(model)
++        self.assertIsNotNone(head)
++        inputs = [rng.normal(size=576), np.zeros(576), np.ones(576),
++                  np.tile([1, -1], 288), np.full(576, 2.0**-64),
++                  np.full(576, 2.0**16)]
++        # Sum 1 + 1/256 is a BF16 midpoint; rows above include constant ones.
++        midpoint = np.zeros(576)
++        midpoint[:2] = [1, 1/256]
++        inputs.append(midpoint)
++        for x in inputs:
++            h = mx.array(x.astype(np.float32)).astype(mx.bfloat16).reshape(1, 1, -1)
++            h32 = h.astype(mx.float32).reshape(1, -1)
++            hn = mx.array(ch.float32_upper(norm_upper(np.asarray(h32))[0]))
++            reference = model.model.embed_tokens.as_linear(h).reshape(-1)
++            coarse = mx.quantized_matmul(h32, head.packed, head.scales,
++                                         head.biases, group_size=64, bits=4).reshape(-1)
++            refined = mx.sum(head.weight.astype(mx.float32) * h32, axis=-1)
++            for center, error, absolute in (
++                (coarse, head.coarse_error, ch.ABS_ERROR),
++                (refined, head.refined_error, 2 * ch.ABS_ERROR),
++            ):
++                lower, upper = ch.intervals(center, hn, error, absolute)
++                self.assertTrue((mx.all(lower <= reference)
++                                 & mx.all(reference <= upper)).item())
++
++    def test_certification_ties_negative_scores_and_range_fallback(self):
++        mx, ch = self.mx, self.ch
++        h = mx.ones((1, 1, 64), dtype=mx.bfloat16)
++        for negative in (False, True):
++            weights = np.full((512, 64), -1 if negative else 0, np.float32)
++            weights[0] = -0.5 if negative else 1
++            model = self.make_model(weights)
++            head = ch.prepare(model)
++            self.assertEqual(ch.screen(head, h).item(), 0)
++            # This also puts many equal upper bounds at the shortlist cutoff.
++            self.assertIsNone(ch.screen(head, mx.zeros_like(h)))
++            self.assertIsNone(ch.screen(head, (h * 2.0**17).astype(mx.bfloat16)))
++
++        for last_value in (1, 1.0078125):
++            weights = np.zeros((512, 64), np.float32)
++            weights[:2] = 1
++            weights[1, -1] = last_value
++            model = self.make_model(weights)
++            head = ch.prepare(model)
++            scores = model.model.embed_tokens.as_linear(h).reshape(-1)
++            # Distinct real dots can round to the same BF16 score.
++            self.assertEqual(scores[0].item(), scores[1].item())
++            self.assertIsNone(ch.screen(head, h))
++
++    def test_trajectories_pending_token_and_shared_model(self):
++        from . import inference
++        from reference.inference import generate as reference
++
++        mx, ch = self.mx, self.ch
++        weights = np.zeros((512, 64), np.float32)
++        weights[0] = 1
++        mx.random.seed(493)
++        model = self.make_model(weights)
++        original_weight = model.model.embed_tokens.weight
++        original_values = np.asarray(original_weight.astype(mx.float32)).copy()
++        for budget in (0, 1, 6):
++            expected = reference(model, [0, 0], budget)
++            first, state = inference.prefill(model, [0, 0])
++            calls = []
++            projections = []
++            def alternating(head, h):
++                calls.append(1)
++                return ch.screen(head, h) if len(calls) % 2 else None
++            embedding_type = type(model.model.embed_tokens)
++            original_projection = embedding_type.as_linear
++            def counted_projection(embedding, h):
++                projections.append(1)
++                return original_projection(embedding, h)
++            with (patch.object(inference, "screen", side_effect=alternating),
++                  patch.object(embedding_type, "as_linear", counted_projection)):
++                actual = inference.decode(model, first, state, budget)
++            self.assertEqual(actual, expected)
++            self.assertEqual(len(calls), max(0, budget-1))
++            self.assertEqual(len(projections), state.fallback)
++            self.assertTrue(all(c.offset == 2 + max(0, budget-1)
++                                for c in state.cache))
++            if budget == 6:
++                self.assertEqual((state.certified, state.fallback), (3, 2))
++            self.assertEqual(reference(model, [0, 0], budget), expected)
++        self.assertIs(model.model.embed_tokens.weight, original_weight)
++        np.testing.assert_array_equal(np.asarray(original_weight.astype(mx.float32)),
++                                      original_values)
++        # Auxiliary data must be rebuilt if a weight object is replaced.
++        before = ch.prepare(model)
++        model.model.embed_tokens.weight = original_weight + mx.zeros_like(original_weight)
++        self.assertIsNot(ch.prepare(model), before)
++
++
++if __name__ == "__main__":
++    unittest.main()

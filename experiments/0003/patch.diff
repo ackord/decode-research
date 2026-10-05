@@ -1,0 +1,328 @@
+diff --git a/candidate/certificate.py b/candidate/certificate.py
+new file mode 100644
+index 0000000..647ca6f
+--- /dev/null
++++ b/candidate/certificate.py
+@@ -0,0 +1,141 @@
++"""Exact host interval arithmetic for a *proved* FP32/BF16 head contract.
++
++This does not infer an arithmetic contract from numerical agreement or dtype.
++The caller must establish operation depths, rounding, and conversion behavior.
++"""
++
++from dataclasses import dataclass
++from fractions import Fraction
++from math import isfinite, isqrt
++import struct
++
++
++F32_MIN_NORMAL = Fraction(1, 1 << 126)
++F32_MAX = Fraction((1 << 24) - 1) * (1 << 104)
++
++
++def _sqrt_up(x):
++    # Integer arithmetic gives a rational upper bound; no rounded reduction,
++    # square root, coefficient construction, or interval endpoint is used.
++    scale = 1 << 160
++    root = isqrt(x.numerator * scale * scale // x.denominator)
++    if Fraction(root * root, scale * scale) < x:
++        root += 1
++    return Fraction(root, scale)
++
++
++def _bf16_value(bits):
++    return Fraction(struct.unpack(">f", struct.pack(">I", bits << 16))[0])
++
++
++def _bf16_bits(value):
++    bits = struct.unpack(">I", struct.pack(">f", value))[0]
++    if bits & 0xffff:
++        raise ValueError("Value is not losslessly promoted BF16")
++    return bits >> 16
++
++
++def _cell(value):
++    """Closed superset of the RN-even BF16 conversion preimage."""
++    bits = _bf16_bits(value)
++    magnitude = bits & 0x7fff
++    if magnitude == 0:
++        half_step = Fraction(1, 1 << 134)
++        return -half_step, half_step
++    if magnitude >= 0x7f7f:
++        raise ValueError("Exceptional or overflow-adjacent output")
++    before, after = (bits - 1, bits + 1) if value > 0 else (bits + 1, bits - 1)
++    q = Fraction(value)
++    return (_bf16_value(before) + q) / 2, (q + _bf16_value(after)) / 2
++
++
++def _round_bf16(x):
++    """Exact RN-even conversion of a rational endpoint (finite range only)."""
++    negative = x < 0
++    x = abs(x)
++    lo, hi = 0, 0x7f7f
++    if x > _bf16_value(hi):
++        raise ValueError("Endpoint outside guarded range")
++    while lo < hi:
++        mid = (lo + hi + 1) // 2
++        if _bf16_value(mid) <= x:
++            lo = mid
++        else:
++            hi = mid - 1
++    if lo < 0x7f7f:
++        midpoint = (_bf16_value(lo) + _bf16_value(lo + 1)) / 2
++        if x > midpoint or (x == midpoint and lo & 1):
++            lo += 1
++    value = _bf16_value(lo)
++    return -value if negative else value
++
++
++@dataclass(frozen=True)
++class Arithmetic:
++    """Contract for ordinary RN FP32 dot arithmetic, including possible FTZ.
++
++    Depths must bound all scalar operations along each dependency path. Dot
++    or matrix instructions need their own proof before using this contract.
++    No intermediate narrowing; BF16 inputs are promoted exactly; the final
++    conversion is RN-even with gradual underflow. FTZ of FP32 arithmetic is
++    bounded by one minimum-normal absolute error per operation. Input DAZ is
++    excluded by the range guard. Both depths include multiplication/reduction.
++    """
++
++    scalar_depth: int
++    batch_depths: tuple  # depths for block sizes 2, 3, 4, 5
++
++
++@dataclass(frozen=True)
++class Certificate:
++    arithmetic: Arithmetic
++    dimension: int
++    weight_norm: Fraction
++    weight_inputs_valid: bool
++
++    def radius(self, hidden, rows):
++        if not self.weight_inputs_valid or len(hidden) != self.dimension:
++            return None
++        if not 2 <= rows <= 5:
++            return None
++        if any(not isfinite(x) or (x != 0 and abs(x) < F32_MIN_NORMAL)
++               for x in hidden):
++            return None
++        try:
++            for x in hidden:
++                _bf16_bits(x)
++        except (ValueError, OverflowError):
++            return None
++        h = _sqrt_up(sum((Fraction(x) ** 2 for x in hidden), Fraction()))
++        product = h * self.weight_norm
++        depths = (self.arithmetic.scalar_depth,
++                  self.arithmetic.batch_depths[rows - 2])
++        delta = Fraction()
++        for n in depths:
++            nu = Fraction(n, 1 << 24)
++            if n < 1 or nu >= 1:
++                return None
++            gamma = nu / (1 - nu)
++            absolute = n * F32_MIN_NORMAL / (1 - nu)
++            if (1 + gamma) * product + absolute >= F32_MAX:
++                return None
++            delta += gamma * product + absolute
++        return delta
++
++    def winner(self, hidden, rows, winner, runner_up, valid):
++        if not valid or not isfinite(winner) or not isfinite(runner_up):
++            return False
++        delta = self.radius(hidden, rows)
++        if delta is None:
++            return False
++        try:
++            lower = _round_bf16(_cell(winner)[0] - delta)
++            upper = _round_bf16(_cell(runner_up)[1] + delta)
++            return lower > upper
++        except (ValueError, OverflowError):
++            return False
++
++
++def weight_bound(max_abs, dimension, valid):
++    # ||w_i||_2 <= sqrt(d) max_ij |w_ij|, without an inexact norm reduction.
++    return _sqrt_up(Fraction(dimension)) * Fraction(max_abs) if valid else Fraction()
+diff --git a/candidate/inference.py b/candidate/inference.py
+index 9a1b483..a79ad30 100644
+--- a/candidate/inference.py
++++ b/candidate/inference.py
+@@ -1,5 +1,131 @@
+ import mlx.core as mx
+-from mlx_lm.models.cache import make_prompt_cache
++from mlx_lm.models.cache import KVCache, make_prompt_cache
++from mlx_lm.models.llama import Model
++
++from .certificate import Certificate, weight_bound
++
++
++def _arithmetic_contract():
++    # Fail closed. Audited MLX Metal dispatch distinguishes scalar GEMV from
++    # GEMM (and on some devices wide GEMV) for 2..5 rows. FP32 accumulator
++    # declarations do not prove dot/matrix instruction error or intermediate
++    # precision, nor do they identify the installed binary's arithmetic.
++    # https://github.com/ml-explore/mlx/blob/v0.32.3/mlx/backend/metal/matmul.cpp
++    # https://github.com/ml-explore/mlx/blob/v0.32.3/mlx/backend/metal/kernels/gemv.h
++    # No audited runtime contract is currently available. Do not substitute
++    # a version check, empirical probe, or user flag for such a contract.
++    return None
++
++
++class Request:
++    def __init__(self, cache, prompt, certificate):
++        self.cache = cache
++        self.history = []
++        self.index = {}
++        self.certificate = certificate
++        self.stats = {"accepted_lengths": [0] * 5, "rejected_positions": 0,
++                      "certified": 0, "fallbacks": 0, "scalar_steps": 0}
++        for token in prompt:
++            self.append(int(token))
++
++    def append(self, token):
++        j = len(self.history)
++        # Insert only suffixes whose continuation is observed at j. Inserting
++        # the terminal suffix itself would hide its productive earlier match.
++        for n in range(1, min(3, j) + 1):
++            self.index[tuple(self.history[j - n:j])] = j
++        self.history.append(token)
++
++    def continuation(self):
++        for n in range(min(3, len(self.history)), 0, -1):
++            j = self.index.get(tuple(self.history[-n:]))
++            if j is not None:
++                return j
++        return None
++
++
++def _certificate(model):
++    arithmetic = _arithmetic_contract()
++    if arithmetic is None or type(model) is not Model:
++        return None
++    if not model.args.tie_word_embeddings:
++        return None
++    weights = model.model.embed_tokens.weight
++    if weights.dtype != mx.bfloat16 or weights.ndim != 2:
++        return None
++    # Only immutable weight-derived metadata; kept within this fresh request.
++    promoted = weights.astype(mx.float32)
++    absolute = mx.abs(promoted)
++    maximum = mx.max(absolute)
++    valid = mx.all(mx.isfinite(promoted) &
++                   ((absolute == 0) | (absolute >= 2.0 ** -126)))
++    mx.eval(maximum, valid)
++    good = bool(valid.item())
++    bound = weight_bound(maximum.item(), weights.shape[1], good)
++    return Certificate(arithmetic, weights.shape[1], bound, good)
++
++
++def _room(cache):
++    if not cache or any(type(layer) is not KVCache for layer in cache):
++        return 0
++    offset = cache[0].offset
++    if any(layer.offset != offset or layer.keys is None or layer.values is None
++           or layer.keys.ndim != 4 or layer.values.ndim != 4
++           or layer.keys.shape[0] != 1 or layer.values.shape[0] != 1
++           for layer in cache):
++        return 0
++    capacity = min(min(layer.keys.shape[2], layer.values.shape[2])
++                   for layer in cache)
++    return capacity - offset - 1
++
++
++def _block(model, token, state, drafts):
++    hidden = []
++    for position in [token.item(), *drafts]:
++        inputs = mx.array([position], dtype=token.dtype).reshape(1, 1)
++        h = model.model(inputs, cache=state.cache)
++        # Materialize before advancing: retain native h, not old cache arrays.
++        mx.eval(h, *[array for layer in state.cache
++                     for array in (layer.keys, layer.values)])
++        hidden.append(h)
++
++    joined = mx.concatenate(hidden, axis=1)
++    logits = model.model.embed_tokens.as_linear(joined)[0]
++    ids = mx.argmax(logits, axis=-1)
++    scores = mx.take_along_axis(logits, ids[:, None], axis=-1)[:, 0]
++    competitors = mx.max(mx.where(mx.arange(logits.shape[-1])[None] == ids[:, None],
++                                  -float("inf"), logits), axis=-1)
++    valid = mx.all(mx.isfinite(logits), axis=-1)
++    # One small lossless FP32 transfer, with all summaries and native h values.
++    summaries = mx.concatenate((ids[:, None].astype(mx.float32),
++                                scores[:, None].astype(mx.float32),
++                                competitors[:, None].astype(mx.float32),
++                                valid[:, None].astype(mx.float32),
++                                joined[0].astype(mx.float32)), axis=1).tolist()
++    accepted = 0
++    for i, row in enumerate(summaries):
++        if (hidden[i].dtype == mx.bfloat16 and logits.dtype == mx.bfloat16
++                and logits.shape[-1] < (1 << 24)
++                and state.certificate.winner(row[4:], len(hidden), row[1], row[2], row[3])):
++            prediction = int(row[0])
++            state.stats["certified"] += 1
++        else:
++            # The saved original (1,1,d) hidden selects the scalar dispatch.
++            scalar = model.model.embed_tokens.as_linear(hidden[i])
++            result = mx.argmax(scalar[:, -1, :], axis=-1)
++            mx.eval(result)
++            prediction = result.item()
++            state.stats["fallbacks"] += 1
++        if i == len(drafts) or prediction != drafts[i]:
++            break
++        accepted += 1
++
++    rejected = len(drafts) - accepted
++    for layer in state.cache:
++        layer.trim(rejected)
++    state.stats["accepted_lengths"][accepted] += 1
++    state.stats["rejected_positions"] += rejected
++    return drafts[:accepted] + [prediction]
+ 
+ 
+ def prefill(model, token_ids):
+@@ -11,22 +137,36 @@ def prefill(model, token_ids):
+ 
+     mx.eval(token)
+ 
+-    return token, cache
++    return token, Request(cache, token_ids, _certificate(model))
+ 
+ 
+ def decode(model, first_token, cache, max_new_tokens):
+     if max_new_tokens < 1:
+         return []
+ 
++    state = cache if isinstance(cache, Request) else Request(cache, [], None)
+     token = first_token
+     output = [token.item()]
++    state.append(output[0])
+ 
+-    for _ in range(max_new_tokens - 1):
+-        logits = model(token.reshape(1, 1), cache=cache)
+-        token = mx.argmax(logits[:, -1, :], axis=-1)
+-
+-        mx.eval(token)
+-        output.append(token.item())
++    while len(output) < max_new_tokens:
++        remaining = max_new_tokens - len(output)
++        j = state.continuation() if state.certificate is not None else None
++        k = 0
++        if j is not None:
++            k = min(4, remaining - 1, len(state.history) - j, _room(state.cache))
++        if k >= 1:
++            committed = _block(model, token, state, state.history[j:j + k])
++            token = mx.array([committed[-1]], dtype=first_token.dtype)
++        else:
++            logits = model(token.reshape(1, 1), cache=state.cache)
++            token = mx.argmax(logits[:, -1, :], axis=-1)
++            mx.eval(token)
++            committed = [token.item()]
++            state.stats["scalar_steps"] += 1
++        output.extend(committed)
++        for item in committed:
++            state.append(item)
+ 
+     return output
+ 

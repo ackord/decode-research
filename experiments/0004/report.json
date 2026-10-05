@@ -1,0 +1,94 @@
+{
+  "round": "0004",
+  "parent_commit": "0f6fd3684b09e42c02c2acfcba2655689fe1af30",
+  "models": {
+    "research": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "review": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "implementation": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    }
+  },
+  "status": "accepted",
+  "research": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Pipelined greedy decoding with delayed host reads",
+      "idea": "Submit the next scalar target step before reading the preceding token into Python. Feed the unresolved token tensor directly into the next forward pass, using a bounded queue of two outputs and the original execution stream.",
+      "cost_removed": "Removes the host-wait dependency between successive model submissions, allowing CPU graph construction and dispatch to overlap device execution. Model calls, arithmetic, weight traffic, and token transfers remain unchanged. The potential saving is exposed scheduling and synchronization time on every decode transition.",
+      "source_evidence": "candidate/inference.py:24\u201329 calls the full model, computes argmax, then blocks in mx.eval(token) and reads token.item() before constructing the next step. That next step already consumes the tensor rather than the Python integer, so host completion is unnecessary for its submission. Installed mlx-lm 0.32.0 generate.py:457\u2013469 demonstrates asynchronous submission before reading the preceding token. This follows the portable scheduling mechanism documented by [SGLang](https://www.lmsys.org/blog/2024-12-04-sglang-v0-4/) and [vLLM](https://docs.vllm.ai/en/v0.17.0/design/model_runner_v2/). These establish plausibility, not performance here.",
+      "generalization": "Applies to autoregressive inference with asynchronous execution and device-resident token dependencies. It preserves scalar numerical operations and requires no training, speculation, custom kernels, or compiler transformation. Scheduling overlap also matters for large models under tensor parallelism, where shorter device steps expose CPU overhead; SGLang explicitly identifies that regime.",
+      "risk": "Device execution may dominate sufficiently that little latency is removable. Asynchronous execution can extend array lifetimes or increase cache-copy overhead. Incorrect queue draining or cache dependency handling could cause extra steps, incomplete work at return, or corrupted state. Preserve original shapes, dtypes, stream ordering, and cache operations, then validate exact parity.",
+      "history_relation": "No previous round tested this scheduling change. Round 0001 failed exact evaluation after changing verification shapes; this experiment retains the original scalar calls. Round 0002 measured screening overhead at approximately 0.771x. Round 0003 left batching disabled because its arithmetic contract was unresolved, so its 1.000x result leaves that mechanism unmeasured."
+    },
+    "plan": "1. Modify only candidate/inference.py during implementation. Preserve prefill, public interfaces, shared model objects, and ordinary request-local KV caches.\n2. Preserve the existing handling of budgets below one and emission of first_token. Execute exactly max_new_tokens-1 scalar model calls for positive budgets, with the original reshape, logits slice, dtype, and argmax.\n3. After each new token tensor is constructed, submit mx.async_eval(token) on the existing stream and enqueue it. Once two outputs are queued, read and remove the older one. Construct subsequent forwards from the newest tensor, never from its Python value. Drain the remaining output before returning. Fix this queue depth before evaluation.\n4. Keep all submission, execution, host reads, and draining inside decode. Retain only the bounded pending-token queue; avoid snapshots of caches or accumulated logits. Do not process the final emitted token or retain request state across calls.\n5. Check budgets 0, 1, 2, and longer outputs, fixed-length behavior after EOS, request isolation, and cache-capacity crossings using independent inputs. Compare tokens and final retained KV prefixes against scalar reference execution, including subsequent continuation. Verify model-call counts and completion before return.\n6. Hand authoritative exact evaluation and both unchanged benchmark confirmations to the orchestrator. Retain only gains meeting the existing 1.03x threshold twice; do not tune queue depth from benchmark results.",
+    "reason": "This is a simple, sound opportunity to remove a visible serialization point throughout decode while preserving the reference computation. Its benefit is portable scheduling overlap, and the amount of exposed latency warrants measurement."
+  },
+  "review": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Pipelined greedy decoding with delayed host reads",
+      "idea": "Preserve scalar greedy decoding while submitting each next step before reading the preceding result into Python. Feed token tensors directly between steps, retain at most two pending outputs, and drain them in order.",
+      "cost_removed": "Removes the unnecessary host-completion dependency between successive submissions, allowing graph construction and dispatch to overlap device execution. Target calls, numerical operations, and host token reads remain unchanged. The potential saving is exposed scheduling and synchronization latency.",
+      "source_evidence": "Verified candidate/inference.py:24\u201329 synchronizes and reads each token before constructing its successor. Installed mlx-lm 0.32.0 generate.py:457\u2013469 submits the successor before y.item(); this is scheduling precedent, but its termination logic can compute an extra token and must not be copied. Installed KVCache.update_and_fetch advances offsets from tensor shapes, and the updated KV tensors feed attention. MLX documents chaining asynchronously evaluated arrays. [MLX async_eval](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.async_eval.html). harness/bench.py:20\u201329 synchronizes before timing and after decode, charging all submitted decode execution.",
+      "generalization": "The mechanism is portable overlap of host preparation and accelerator execution through device-resident dependencies. Both [SGLang](https://www.lmsys.org/blog/2024-12-04-sglang-v0-4/) and [vLLM](https://docs.vllm.ai/en/v0.17.0/design/model_runner_v2/#2-async-first) document this scheduling pattern outside MLX. SGLang identifies large tensor-parallel configurations as a favorable regime, supporting possible frontier-scale relevance. Benefit depends on exposed host overhead and may be small when device execution dominates.",
+      "risk": "Asynchronous execution may extend array lifetimes or increase cache-copy overhead. Submission order must preserve token and KV dependencies, including during cache growth. Unchanged scalar operations provide a strong basis for parity, but actual runtime exactness still requires validation. Off-by-one submission or incomplete draining could introduce extra work or incorrect cache state.",
+      "history_relation": "No prior round tested this scheduling change. Round 0001 changed verification shapes and failed exact evaluation; the recorded evidence does not diagnose its cause. Round 0002 measured screening at approximately 0.771x. Round 0003 kept batching disabled because its arithmetic contract was unresolved, so its approximately 1.000x result did not measure active head batching. None resolves this experiment."
+    },
+    "plan": "1. Modify only candidate/inference.py. Preserve prefill, generate, public interfaces, model objects, and ordinary request-local caches. Keep the existing first-token computation and synchronization in prefill; construct no subsequent-token work there.\n\n2. For N=max_new_tokens below one, return [] without decoding. Otherwise initialize token=first_token and output=[token.item()]. Execute exactly N-1 iterations, retaining the original model(token.reshape(1, 1), cache=cache), logits[:, -1, :], and mx.argmax(..., axis=-1), with unchanged dtypes.\n\n3. Immediately submit each resulting token with mx.async_eval(token), then append it to a pending queue. When the queue reaches two elements, remove the oldest and append its item() to output. The next model call consumes the newest token tensor directly. Submit each step separately, keep the existing execution stream, and fix the maximum queue length at two before evaluation. Drain the remaining queue through item() before returning.\n\n4. Preserve the cache invariant: after k decode calls, each layer's offset has advanced by k. For positive N, the final cache contains the prompt followed by output[:-1]; the final emitted token remains unprocessed. Preserve fixed-length behavior after EOS. Keep graph construction, submission, execution, host reads, and draining inside decode. Retain no request state across calls and accumulate no logits or cache snapshots.\n\n5. Validate budgets 0, 1, 2, 3, and longer outputs using independent inputs. Check exact call counts, output ordering, queue bounds, ties, EOS behavior, and isolation when requests share the model. Exercise cache growth around its 256-position allocation boundaries. On the real target, compare exact tokens, every layer's retained KV prefix and offset, and subsequent scalar continuation against fresh reference execution. Inspect caches after decoding so validation does not accidentally synchronize every intermediate step and conceal asynchronous failures.\n\n6. Hand authoritative validation to the orchestrator: unchanged exact-token evaluation, including the complete benchmark workload, followed by both unchanged benchmark confirmations against the current best. Retain only a gain of at least 1.03x in both confirmations. Do not tune queue depth from benchmark results. Record implementation-environment limitations separately from experiment outcomes.",
+    "reason": "No fundamental flaw was found. Device dependencies preserve the autoregressive chain without requiring intermediate Python token values, and the harness charges asynchronous execution. The review sharpens termination, cache invariants, and draining requirements. Exact parity and net throughput remain questions for evaluation and benchmarking."
+  },
+  "implementation": {
+    "outcome": "implemented",
+    "summary": "Updated candidate/inference.py with asynchronous submissions, a two-token pending queue, and ordered draining. Prefill and scalar operations remain unchanged. Passed 210 control-flow checks and git diff --check. Real-model token/KV validation and benchmarking remain with the orchestrator; local MLX initialization failed because no Metal device is available."
+  },
+  "eval": {
+    "correct": true,
+    "cases": [
+      {
+        "prompt": "Explain why the sky is blue.",
+        "correct": true
+      },
+      {
+        "prompt": "Write a short Python function that reverses a list.",
+        "correct": true
+      },
+      {
+        "prompt": "What are the main causes of inflation?",
+        "correct": true
+      },
+      {
+        "prompt": "Describe how photosynthesis works.",
+        "correct": true
+      },
+      {
+        "prompt": "Continue this story: The door opened and nobody was there.",
+        "correct": true
+      },
+      {
+        "prompt": "<benchmark>",
+        "correct": true
+      }
+    ]
+  },
+  "confirmations": [
+    {
+      "baseline_relative_decode_speed": 0.9945747386079169,
+      "candidate_relative_decode_speed": 1.22737303709139,
+      "gain": 1.2340681795410524
+    },
+    {
+      "baseline_relative_decode_speed": 1.0053729489776941,
+      "candidate_relative_decode_speed": 1.343198456274946,
+      "gain": 1.3360200885062277
+    }
+  ],
+  "confirmed_gain": 1.2340681795410524,
+  "reason": "decode gain confirmed twice at >= 1.03x"
+}

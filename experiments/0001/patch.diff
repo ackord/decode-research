@@ -1,0 +1,255 @@
+diff --git a/candidate/inference.py b/candidate/inference.py
+index 9a1b483..430d5f2 100644
+--- a/candidate/inference.py
++++ b/candidate/inference.py
+@@ -1,5 +1,30 @@
+ import mlx.core as mx
+-from mlx_lm.models.cache import make_prompt_cache
++from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
++
++
++class _RequestState:
++    def __init__(self, raw_cache, token_ids):
++        self.raw_cache = raw_cache
++        self.history = []
++        self.index = {}
++        for token in token_ids:
++            self.append(token)
++
++    def append(self, token):
++        # Only index occurrences with an observed following token.
++        j = len(self.history)
++        self.history.append(token)
++        for n in range(1, min(3, j) + 1):
++            self.index[tuple(self.history[j - n : j])] = j
++
++    def draft(self, remaining):
++        history = self.history
++        for n in range(min(3, len(history)), 0, -1):
++            j = self.index.get(tuple(history[-n:]))
++            if j is not None:
++                k = min(4, remaining - 1, len(history) - j)
++                return history[j : j + k]
++        return []
+ 
+ 
+ def prefill(model, token_ids):
+@@ -11,7 +36,7 @@ def prefill(model, token_ids):
+ 
+     mx.eval(token)
+ 
+-    return token, cache
++    return token, _RequestState(cache, token_ids)
+ 
+ 
+ def decode(model, first_token, cache, max_new_tokens):
+@@ -20,13 +45,37 @@ def decode(model, first_token, cache, max_new_tokens):
+ 
+     token = first_token
+     output = [token.item()]
++    cache.append(output[0])
++    raw_cache = cache.raw_cache
++
++    while len(output) < max_new_tokens:
++        draft = cache.draft(max_new_tokens - len(output))
++        if not draft:
++            logits = model(token.reshape(1, 1), cache=raw_cache)
++            token = mx.argmax(logits[:, -1, :], axis=-1)
++            mx.eval(token)
++            emitted = [token.item()]
++        else:
++            start = raw_cache[0].offset
++            tokens = mx.array([output[-1], *draft])[None]
++            logits = model(tokens, cache=raw_cache)
++            predictions = mx.argmax(logits, axis=-1)[0]
++            mx.eval(predictions)
++            predicted_ids = predictions.tolist()
+ 
+-    for _ in range(max_new_tokens - 1):
+-        logits = model(token.reshape(1, 1), cache=cache)
+-        token = mx.argmax(logits[:, -1, :], axis=-1)
++            accepted = 0
++            while accepted < len(draft) and draft[accepted] == predicted_ids[accepted]:
++                accepted += 1
++            emitted = draft[:accepted] + [predicted_ids[accepted]]
++            trim_prompt_cache(raw_cache, len(draft) - accepted)
++            expected_offset = start + 1 + accepted
++            if any(layer.offset != expected_offset for layer in raw_cache):
++                raise RuntimeError("Speculative KV rollback left inconsistent offsets")
++            token = predictions[accepted : accepted + 1]
+ 
+-        mx.eval(token)
+-        output.append(token.item())
++        for token_id in emitted:
++            output.append(token_id)
++            cache.append(token_id)
+ 
+     return output
+ 
+diff --git a/candidate/test_inference.py b/candidate/test_inference.py
+new file mode 100644
+index 0000000..1dc69b2
+--- /dev/null
++++ b/candidate/test_inference.py
+@@ -0,0 +1,161 @@
++"""Synthetic bookkeeping tests; these do not establish target-model parity."""
++
++import importlib.util
++from pathlib import Path
++import sys
++from types import ModuleType
++import unittest
++from unittest.mock import patch
++
++import numpy as np
++
++
++class SyntheticCache:
++    """Offset-only trim with retained, chunked allocation, like ordinary KVCache."""
++
++    def __init__(self):
++        self.offset = 0
++        self.storage = []
++
++    def write(self, tokens):
++        end = self.offset + len(tokens)
++        if end > len(self.storage):
++            self.storage.extend([None] * (((end + 255) // 256) * 256 - len(self.storage)))
++        self.storage[self.offset:end] = tokens
++        self.offset = end
++
++
++def load_candidate():
++    mx = ModuleType("mlx.core")
++    mx.array = np.array
++    mx.argmax = np.argmax
++    mx.eval = lambda *args: None
++    mlx = ModuleType("mlx")
++    mlx.core = mx
++    cache = ModuleType("mlx_lm.models.cache")
++    cache.make_prompt_cache = lambda model: [SyntheticCache() for _ in range(3)]
++
++    def trim(layers, count):
++        for layer in layers:
++            layer.offset -= count
++        return count  # Deliberately not the cache itself.
++
++    cache.trim_prompt_cache = trim
++    modules = {
++        "mlx": mlx,
++        "mlx.core": mx,
++        "mlx_lm": ModuleType("mlx_lm"),
++        "mlx_lm.models": ModuleType("mlx_lm.models"),
++        "mlx_lm.models.cache": cache,
++    }
++    spec = importlib.util.spec_from_file_location(
++        "synthetic_candidate", Path(__file__).with_name("inference.py")
++    )
++    module = importlib.util.module_from_spec(spec)
++    with patch.dict(sys.modules, modules):
++        spec.loader.exec_module(module)
++    return module
++
++
++class SyntheticModel:
++    def __init__(self, prompt, outputs):
++        self.prompt = list(prompt)
++        self.outputs = outputs
++        self.calls = []
++
++    def __call__(self, tokens, cache):
++        start = cache[0].offset
++        committed = self.prompt + self.outputs
++        for layer in cache:
++            assert layer.offset == start
++            assert layer.storage[:start] == committed[:start]
++        inputs = tokens[0].tolist()
++        self.calls.append((start, inputs))
++        logits = np.zeros((1, len(inputs), 64), dtype=np.float32)
++        for position in range(len(inputs)):
++            output_index = start + position - len(self.prompt) + 1
++            prediction = self.outputs[output_index] if output_index >= 0 else 0
++            # A tie also checks that full-vocabulary argmax keeps the first index.
++            logits[0, position, prediction:prediction + 2] = 1
++        for layer in cache:
++            layer.write(inputs)
++        return logits
++
++
++class InferenceTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.candidate = load_candidate()
++
++    def test_index_matches_independent_scan(self):
++        history = [1, 2, 1, 2, 1, 3, 1, 2]
++        state = self.candidate._RequestState([], [])
++        for token in history:
++            state.append(token)
++            observed = state.history
++            expected = {}
++            for j in range(1, len(observed)):
++                for n in range(1, min(3, j) + 1):
++                    expected[tuple(observed[j - n:j])] = j
++            self.assertEqual(state.index, expected)
++
++    def test_lookup_eligibility_overlap_and_budget(self):
++        state = self.candidate._RequestState([], [1, 2])
++        self.assertEqual(state.draft(8), [])  # Terminal suffix has no continuation.
++        state.append(1)
++        self.assertEqual(state.draft(8), [2, 1])  # Observed overlapping span.
++        self.assertEqual(state.draft(2), [2])
++        self.assertEqual(state.draft(1), [])
++        state = self.candidate._RequestState([], [1, 2, 3, 1, 2, 4, 1, 2])
++        self.assertEqual(state.draft(9), [4, 1, 2])  # Most recent longest match.
++
++    def test_acceptance_and_overwrite_across_capacity_boundary(self):
++        draft = [3, 4, 5, 6]
++        for accepted in range(5):
++            with self.subTest(accepted=accepted):
++                prompt = [40] * 244 + [1, 2, 3, 4, 5, 6, 7, 8, 9, 1]
++                expected = [2] + draft[:accepted] + [15, 16, 17, 18, 19, 20, 21]
++                model = SyntheticModel(prompt, expected + [22] * 8)
++                first, state = self.candidate.prefill(model, prompt)
++                self.assertEqual(len(model.calls), 1)
++                self.assertEqual(state.history, prompt)
++                result = self.candidate.decode(model, first, state, len(expected))
++                self.assertEqual(result, expected)
++                self.assertEqual(model.calls[1], (254, [2, *draft]))
++                if accepted < 4:
++                    self.assertEqual(model.calls[2][0], 255 + accepted)
++                for layer in state.raw_cache:
++                    self.assertEqual(layer.offset, len(prompt) + len(expected) - 1)
++                    self.assertEqual(layer.storage[:layer.offset], (prompt + expected)[:-1])
++                    self.assertGreaterEqual(len(layer.storage), 512)
++                self.assertEqual(state.history, prompt + expected)
++
++    def test_small_budgets_no_match_and_fixed_length(self):
++        for budget in [-1, 0, 1, 2, 7]:
++            with self.subTest(budget=budget):
++                prompt = [40, 41]
++                expected = [0, 10, 11, 12, 13, 14, 15, 16]
++                model = SyntheticModel(prompt, expected)
++                first, state = self.candidate.prefill(model, prompt)
++                result = self.candidate.decode(model, first, state, budget)
++                self.assertEqual(result, expected[:max(0, budget)])
++                self.assertEqual(len(model.calls), max(1, budget))
++                self.assertTrue(all(len(inputs) == 1 for _, inputs in model.calls[1:]))
++
++    def test_request_isolation_and_prompt_copy(self):
++        prompt = [1, 2, 1]
++        model = SyntheticModel(prompt, [2, 3, 4, 5, 6, 7])
++        first, state = self.candidate.prefill(model, prompt)
++        other_first, other = self.candidate.prefill(model, prompt)
++        prompt.append(9)
++        self.candidate.decode(model, first, state, 2)
++        self.assertEqual(other.history, [1, 2, 1])
++        self.assertEqual(other_first.item(), 2)
++        self.assertIsNot(state.index, other.index)
++        for left, right in zip(state.raw_cache, other.raw_cache):
++            self.assertIsNot(left, right)
++            self.assertEqual(right.offset, 3)
++
++
++if __name__ == "__main__":
++    unittest.main()

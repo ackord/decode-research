@@ -1,0 +1,77 @@
+{
+  "round": "0001",
+  "parent_commit": "cfeeb474253a761573e5c75d2b0adc03c756b664",
+  "models": {
+    "research": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "review": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "implementation": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    }
+  },
+  "status": "rejected",
+  "research": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Request-local n-gram speculative decoding",
+      "idea": "Draft short continuations by matching the current token suffix against earlier tokens in the same request. Verify each continuation with one causal, multi-token forward pass through the unchanged target. Accept only the consecutive draft tokens matching target argmax, then emit the target's first corrective or bonus token. Roll back rejected KV entries.",
+      "cost_removed": "Amortizes repeated model-weight reads and serial target invocations across several emitted tokens, without running a neural drafter. If a draft accepts a tokens, one verification replaces a+1 sequential target calls. Target arithmetic per accepted token remains; rejected positions add work. The break-even condition is lookup_time + verification_time < (a+1) * single_token_time.",
+      "source_evidence": "candidate<redacted-path> performs a full model call, full-vocabulary argmax, and synchronization for every additional token. The pinned checkpoint contains 134,515,008 BF16 parameters occupying 269,030,016 bytes, including a 49,152-by-576 tied output projection occupying 56,623,104 bytes. The configured model has 30 layers; mlx-lm 0.32.0's llama.py executes four attention projections and three MLP projections per layer. Its KVCache already grows in 256-token blocks and supports offset rollback through trim_prompt_cache; the model supports causal block verification. This directly supports the copy-and-verify mechanism described in [LLMA](https://arxiv.org/abs/2304.04487) and [Prompt Lookup Decoding](https://github.com/apoorvumang/prompt-lookup-decoding).",
+      "generalization": "Requires no training, auxiliary checkpoint, target modification, or cross-request reuse. It applies to decoder-only models with causal verification and trimmable caches. Repeated spans in document-grounded generation, code editing, and within-request conversation history can amortize increasingly large weight sweeps. The mechanism is independent of MLX and hardware-specific kernels; gains depend on accepted continuations and available compute relative to memory bandwidth.",
+      "risk": "Low continuation acceptance can make verification slower than ordinary decoding. BF16 block execution can also round differently from single-token execution, including differences retained in accepted KV entries; mathematical speculative equivalence alone does not establish reference-token equality. Any token divergence fails correctness. Cache rollback, causal positions, and correction-token handling require careful validation.",
+      "history_relation": "There are no prior rounds. This is an untested experiment on the current implementation; published results establish plausibility, not a speedup here. Constants and lookup policy must be fixed before evaluation, without benchmark-based tuning."
+    },
+    "plan": "Implement only inside candidate<redacted-path> Preserve the existing prefill model computation and return request-local state containing the KV cache, prompt tokens, and an incremental n-gram index; prefill must not draft future outputs. Use a fixed maximum match length of 3 and draft length of 4. During decode, search longest suffix first, choose the most recent earlier occurrence with an observed continuation, and fall back to the existing single-token step when none exists. Index only prompt tokens and committed outputs. Maintain the invariant that KV contains the entire committed history except its final pending token. With starting cache offset C, pending token t, and k proposed tokens, evaluate [t, d1, ..., dk] once and take full-vocabulary argmax at every position. If a consecutive draft tokens match, append those tokens followed by prediction a, and trim k-a cache positions, leaving offset C+1+a. Cap k at remaining_output_slots-1 so correction or bonus emission fits. Preserve reference argmax tie handling and fixed-length generation semantics, including zero<redacted-path> requests. Validate no-match, immediate rejection, partial acceptance, full acceptance, cache-capacity crossings, and request isolation using independent synthetic cases. Check exact token parity against the scalar reference, including subsequent decoding from accepted caches. Hand authoritative evaluation and unchanged benchmarking to the orchestrator; retain only an improvement meeting the existing confirmation rule.",
+    "reason": "This targets repeated work across the entire model with negligible drafting cost and existing verification<redacted-path> support. The current path already caches past KV and avoids output softmax. Acceptance, numerical parity, and net throughput remain genuine experimental questions worth resolving."
+  },
+  "review": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Request-local n-gram speculative decoding",
+      "idea": "Copy short continuations from earlier tokens in the current request and verify them with one causal block forward pass through the unchanged target. Emit the consecutive matching draft tokens followed by the target's corrective or bonus token, and trim rejected KV entries.",
+      "cost_removed": "Potentially amortizes model-weight traffic and serial invocations across multiple emitted tokens without a neural drafter. With k draft tokens and a accepted tokens, one k+1-position verification replaces a+1 scalar calls. Arithmetic remains for accepted positions, and rejected positions add work. Break-even must include lookup, verification, synchronization, host transfer, index updates, and rollback.",
+      "source_evidence": "Verified that candidate<redacted-path> and reference<redacted-path> perform a full target call, full-vocabulary argmax, and synchronization for every additional output token. The pinned checkpoint contains 134,515,008 BF16 parameters occupying 269,030,016 bytes; its tied 49,152-by-576 embedding<redacted-path> matrix occupies 56,623,104 bytes. These are storage sizes, not measured memory traffic. Installed mlx-lm 0.32.0 implements the configured 30-layer model with four attention and three MLP projections per layer, causal block evaluation, and ordinary KVCache objects. KVCache grows in 256-position increments; trim_prompt_cache mutates offsets in place and returns a count. [LLMA](https://arxiv.org/abs/2304.04487) and [Prompt Lookup Decoding](https://github.com/apoorvumang/prompt-lookup-decoding) support the copying-and-verification mechanism, but do not establish parity or speed here.",
+      "generalization": "Requires no training, target modification, or cross-request computation reuse. Applicable to causal decoder models with reversible caches, particularly memory-bound decoding with repeated spans in document-grounded generation, code editing, or conversation history. Weight reuse across verification positions is hardware-independent; gains depend on acceptance, workload, and available compute relative to bandwidth. Prompt indexing has linear time and memory cost for fixed maximum n-gram length.",
+      "risk": "Low acceptance can outweigh amortization. More critically, BF16 block execution can change argmax results and retained KV values relative to scalar execution. Trimming rejected entries does not repair rounding in retained entries, and subsequent scalar decoding can diverge. Mathematical speculative equivalence is therefore insufficient; exact-token validation must exercise accepted blocks and their later continuations. Any token divergence fails correctness.",
+      "history_relation": "There are no prior rounds. Source inspection and independent logical checks support implementability, but no target-model parity test or performance measurement was performed during review. Keep the proposed constants and lookup policy fixed before evaluation."
+    },
+    "plan": "1. Implement inside candidate/ only. Preserve the public prefill<redacted-path> interfaces and existing prefill model computation, including its first-token argmax. Return the first token plus fresh request-local state containing the raw KV cache, a copy of prompt token IDs, and the n-gram index. Prefill may build the prompt index but must not perform lookup conditioned on the generated first token or compute later outputs. Do not mutate model weights or retain request state globally.\n\n2. Fix maximum match length at 3 and maximum draft length at 4. For each n, map an n-gram to its most recent continuation-start position j with at least one observed following token. When appending token H[j], insert H[j-n:j] -> j for each eligible n. This excludes the terminal suffix until it has an observed continuation and avoids overwriting a usable match with a self-match. Build the prompt index using this same rule; update it during decode only with committed outputs.\n\n3. For max_new_tokens < 1, return []; otherwise emit the supplied first token and append it to history during decode. A one-token request performs no decode model call. Maintain H as prompt plus committed output, with pending token t=H[-1] and every layer's cache representing H[:-1]. With R output slots remaining, search suffix lengths from min(3,len(H)) down to 1. Choose the stored most recent eligible occurrence at the first matching length. Set k=min(4,R-1,len(H)-j), and copy H[j:j+k] before changing history. Observed overlapping spans are allowed; never extrapolate beyond H. If no match exists or k=0, use the original scalar step.\n\n4. For a block, record starting cache offset C and evaluate [t,d1,...,dk] once through the original model and its causal cache path. Compute full-vocabulary predictions p0,...,pk with the same mx.argmax operation and dtype as the reference, then materialize the prediction vector once. Let a be the longest prefix satisfying di=p(i-1). Emit d1,...,da followed by pa; ignore every prediction after the first mismatch. Call trim_prompt_cache(raw_cache,k-a) in place; do not replace the cache with its integer return value. The resulting offset must be C+1+a, with the last emitted token pending and absent from KV. Update the index sequentially with emitted tokens only. Retain cache allocation and overwrite stale rejected positions on subsequent calls; no whole-cache copy is required.\n\n5. Preserve fixed-length generation, including tokens after EOS, and stop without processing the final pending token. All generated-token indexing, drafting, verification, transfers, synchronization, and rollback belong inside decode. Freeze the lookup policy independently of benchmark contents and results.\n\n6. Use independent synthetic tests for lookup eligibility, overlapping matches, no-match fallback, all acceptance lengths including immediate rejection and full acceptance, small output budgets, and request isolation. Check every layer's rollback offset and subsequent overwrite across cache-capacity boundaries. Run real-target differential tests against scalar reference decoding that actually exercise accepted blocks and continue from their retained KV, including scalar continuation afterward. Preserve argmax tie behavior. Numerical token mismatches are failures; an unproven logit-margin heuristic or switching later steps to scalar does not establish correctness.\n\n7. Hand authoritative validation to the orchestrator: run unchanged exact-token evaluation and separately verify the complete benchmark-workload output against a fresh scalar reference before performance acceptance, without using those results for tuning. Run the unchanged benchmark against the current best and retain only a gain of at least 1.03 in both confirmation runs. Record correctness, acceptance behavior, and measured performance as distinct evidence; implementation-environment limitations are not experiment results.",
+    "reason": "No fundamental flaw was found in the copying mechanism or rollback formula. The review makes indexing, pending-token handling, timing, and validation requirements explicit. Actual BF16 token parity and net throughput remain experimental questions that evaluation and benchmarking should resolve."
+  },
+  "implementation": {
+    "outcome": "implemented",
+    "summary": "Implemented request-local n-gram drafting, causal block verification, and in-place KV rollback in candidate<redacted-path> All five synthetic tests pass, covering acceptance lengths, capacity-boundary overwrite, lookup, budgets, ties, and isolation. Real-target parity and performance remain for the orchestrator; local MLX execution is blocked by unavailable Metal access."
+  },
+  "eval": {
+    "correct": false,
+    "cases": [
+      {
+        "prompt": "Explain why the sky is blue.",
+        "correct": true
+      },
+      {
+        "prompt": "Write a short Python function that reverses a list.",
+        "correct": true
+      },
+      {
+        "prompt": "What are the main causes of inflation?",
+        "correct": false
+      },
+      {
+        "prompt": "Describe how photosynthesis works.",
+        "correct": false
+      },
+      {
+        "prompt": "Continue this story: The door opened and nobody was there.",
+        "correct": false
+      }
+    ]
+  },
+  "reason": "exact-token eval failed"
+}
