@@ -5,3 +5,12 @@ out/
 .browser-cache/
 test-results/
 tsconfig.tsbuildinfo
+.vercel/
+.env
+.env.*
+.npmrc
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json

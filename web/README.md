@@ -33,4 +33,28 @@ Reports are ordered by round. Reviewed proposals take precedence over researcher
 
 Mechanism and lesson summaries are deterministic transformations of report evidence. The recorded status remains authoritative, including when an implementation limitation leaves the mechanism unresolved. Full report prose and tested patches remain available in disclosures.
 
-A new report appears on the next build. There is no manually maintained experiment dataset, ingestion service, deployment configuration, or modification to research code.
+A new report appears on the next build. There is no manually maintained experiment dataset, ingestion service, or modification to research code.
+
+## Vercel deployment
+
+Import `ackord/decode-research` through Vercel's GitHub integration. Configure:
+
+| Setting | Value |
+| --- | --- |
+| Root Directory | `web` |
+| Include source files outside of the Root Directory in the Build Step | Enabled |
+| Framework Preset | Other |
+| Node.js Version | 24.x |
+| Production Branch | `main` |
+| Skip deployments for unaffected projects | Disabled |
+| Environment variables | None required |
+
+`vercel.json` supplies installation, build, and static-output settings. Native Git integration deploys pushed commits to `main` to production and other branches to previews. `ignoreCommand: "exit 1"` permits every build; disabling unaffected-project skipping ensures changes outside `web/` rebuild too. Outside-root source access is necessary for filesystem ingestion. Only `out/` is served, including the reports and source excerpts intentionally shown on the site. No runtime secrets, GitHub Actions workflow, or deploy token are required.
+
+See [Vercel GitHub integration](https://vercel.com/docs/git/vercel-for-github) and [outside-root source access](https://vercel.com/docs/monorepos/monorepo-faq). Project-level settings must be applied when importing; local edits do not trigger deployment.
+
+## Privacy checks
+
+`npm run build` checks exported files for email addresses, personal home paths, private keys, common token formats, and literal credentials. Findings fail the build; messages show filenames and categories, never matching values. This small publication check cannot recognize every possible secret or prevent Git commits.
+
+`.gitignore` excludes environment files, Vercel metadata, private keys, and registry credentials. Review staged changes and enable GitHub secret scanning/push protection where available. Authenticate through account connections rather than storing tokens in the repository, and use a GitHub no-reply author address for commits.
