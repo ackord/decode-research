@@ -1,0 +1,138 @@
+diff --git a/candidate/inference.py b/candidate/inference.py
+index d325ba3..7c8bd30 100644
+--- a/candidate/inference.py
++++ b/candidate/inference.py
+@@ -7,20 +7,23 @@ from mlx_lm.models import llama
+ MAX_CONTEXT = 16
+ MAX_DRAFTS = 16
+ INDEX_CONTEXT = MAX_CONTEXT + MAX_DRAFTS - 1
++MIN_DRAFT_SCORE = 1.0
+ 
+ 
+ class _Successors:
+     """Exact occurrence counts with the most recent winner on frequency ties."""
+ 
+-    __slots__ = ("counts", "preferred")
++    __slots__ = ("counts", "preferred", "total")
+ 
+     def __init__(self, token):
+         self.counts = {token: 1}
+         self.preferred = token
++        self.total = 1
+ 
+     def observe(self, token):
+         count = self.counts.get(token, 0) + 1
+         self.counts[token] = count
++        self.total += 1
+         if count >= self.counts[self.preferred]:
+             self.preferred = token
+ 
+@@ -40,6 +43,11 @@ class RequestCache(list):
+             "draft_lengths": [0] * (MAX_DRAFTS + 1),
+             "accepted_lengths": [0] * (MAX_DRAFTS + 1),
+             "rejected_positions": 0,
++            "gate_checks": 0,
++            "gate_bypasses": 0,
++            "previews": 0,
++            "preview_drains": 0,
++            "verification_positions": 0,
+         }
+         for token in token_ids:
+             self.append_token(int(token))
+@@ -94,28 +102,52 @@ def _supported(model, cache):
+             and (model.args.tie_word_embeddings or type(model.lm_head) is nn.Linear))
+ 
+ 
++def _walk(cache, context, limit, preview=False):
++    """Score full-context extensions using only committed successor counts."""
++    drafts = []
++    probability = 1.0
++    score = 0.0
++    for _ in range(max(0, limit)):
++        successors = cache.index.get(context)
++        if successors is None:
++            break
++        token = successors.preferred
++        probability *= successors.counts[token] / successors.total
++        score += probability
++        if preview:
++            if score >= MIN_DRAFT_SCORE:
++                break
++        else:
++            drafts.append(token)
++        context += (token,)
++    return drafts, score
++
++
++def _preview(cache, remaining):
++    # Advisory only: no KV inspection or reads of pending token tensors.
++    if remaining < 2 or (cache.history[-1],) not in cache.index:
++        return False
++    cache.stats["previews"] += 1
++    context = cache.match()
++    limit = min(MAX_DRAFTS, len(context), remaining - 1)
++    _, score = _walk(cache, context, limit, preview=True)
++    return score >= MIN_DRAFT_SCORE
++
++
+ def _draft(cache, remaining):
+     context = cache.match()
+     if context is None or remaining < 2:
+-        return []
++        return [], 0.0
+     c = cache[0].offset
+     if any(kv.offset != c or kv.keys is None or kv.values is None for kv in cache):
+-        return []
++        return [], 0.0
+     if c != len(cache.history) - 1:
+         raise RuntimeError("Speculation requires drained scalar outputs")
+     capacity = min(min(kv.keys.shape[2], kv.values.shape[2]) for kv in cache)
+     limit = min(MAX_DRAFTS, len(context), remaining - 1, capacity - c - 1)
+-    drafts = []
+     # Extend the entire observed context, without mutating the index or backing
+     # off to a shorter suffix. Every extension occurred in committed history.
+-    for _ in range(max(0, limit)):
+-        successors = cache.index.get(context)
+-        if successors is None:
+-            break
+-        token = successors.preferred
+-        drafts.append(token)
+-        context += (token,)
+-    return drafts
++    return _walk(cache, context, limit)
+ 
+ 
+ def _project(projection, inputs, dependencies):
+@@ -239,7 +271,12 @@ def decode(model, first_token, cache, max_new_tokens):
+         # While outputs are unread, token and KV are ahead of host history.
+         # Recompute speculative lookup and capacity decisions after draining.
+         if supported and not pending:
+-            drafts = _draft(state, max_new_tokens - len(output))
++            drafts, score = _draft(state, max_new_tokens - len(output))
++            if drafts:
++                state.stats["gate_checks"] += 1
++                if score < MIN_DRAFT_SCORE:
++                    state.stats["gate_bypasses"] += 1
++                    drafts = []
+             if drafts:
+                 inputs = [token.reshape(1, 1)] + [
+                     mx.array([[d]], dtype=token.dtype) for d in drafts
+@@ -260,6 +297,7 @@ def decode(model, first_token, cache, max_new_tokens):
+                 del inputs, predictions, ids
+                 stats = state.stats
+                 stats["verifications"] += 1
++                stats["verification_positions"] += len(drafts) + 1
+                 stats["draft_lengths"][len(drafts)] += 1
+                 stats["accepted_lengths"][accepted] += 1
+                 stats["rejected_positions"] += rejected
+@@ -274,7 +312,9 @@ def decode(model, first_token, cache, max_new_tokens):
+         # Preserve round 0004's submit-successor-before-host-read pipeline.
+         if len(pending) == 2:
+             commit(pending.pop(0).item())
+-            if supported and (state.history[-1],) in state.index:
++            remaining = max_new_tokens - len(output) - len(pending)
++            if supported and _preview(state, remaining):
++                state.stats["preview_drains"] += 1
+                 for unread in pending:
+                     commit(unread.item())
+                 pending.clear()

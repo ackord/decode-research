@@ -1,0 +1,94 @@
+{
+  "round": "0015",
+  "parent_commit": "ed2cc9a2d16f6329a0c74b68a95f6dac1fe0f6bd",
+  "models": {
+    "research": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "review": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "implementation": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    }
+  },
+  "status": "rejected",
+  "research": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Confidence-gated suffix speculation",
+      "idea": "Use the existing successor counts to estimate a draft\u2019s expected accepted length. Run speculative verification only when that estimate is at least one draft token; otherwise continue the accepted scalar pipeline. Preserve the current draft choices, length limits, verifier, and exact acceptance rule.",
+      "cost_removed": "Avoids complete target computations spent on weak speculative continuations. An immediately rejected k-token draft currently computes k+1 positions to emit one token. Correctly bypassing it avoids k rejected positions, each costing seven projections and one attention evaluation per layer plus a vocabulary head. Savings depend on the gate\u2019s predictive value; useful output tokens still receive full target computation.",
+      "source_evidence": "candidate/inference.py:12\u201325 maintains successor counts, but _draft at :97\u2013118 uses only the preferred successor and matched-context length. decode at :242\u2013265 unconditionally verifies every nonempty draft. The verifier executes all layers and full vocabulary heads before checking acceptance. The pipeline also drains on mere unigram membership at :277. Frequency-based expected-acceptance scoring is supported by [SuffixDecoding, Section 3](https://proceedings.neurips.cc/paper_files/paper/2025/file/b7aea253ab34a773967f1e4cdea9e4fb-Paper-Conference.pdf); the proposed scalar fallback and fixed threshold remain an experiment.",
+      "generalization": "Avoiding unproductive target positions removes arithmetic, attention reads, and head scans across backends without changing numerical kernels. The potential saving grows with target-model cost. Only existing request-local observations are needed; there is no auxiliary training or cross-request reuse.",
+      "risk": "Observed continuation frequencies are imperfect proxies for greedy agreement. The gate can reject profitable speculation, particularly when verification amortizes weight traffic well. Scoring adds CPU work, and a preview based on committed history can miss opportunities after unread tokens arrive. The threshold is a fixed hypothesis, not a measured break-even point.",
+      "history_relation": "Round 0008 used frequencies to choose successors and context length to limit drafts, but did not gate verification by expected acceptance. Rounds 0009 and 0010 tried avoiding work after target execution had begun and introduced completion boundaries. This gate acts before execution without another device read. Round 0011 tested branching under an existing position budget, leaving this scalar-versus-speculation decision unresolved. Preserve accepted rounds 0004, 0006, 0008, and 0013."
+    },
+    "plan": "1. Modify candidate/ only. Preserve prefill model execution, target parameters, _supported, singleton verification, bulk KV appends, acceptance, rollback, and request isolation. Freeze the threshold at one expected accepted draft token; do not calibrate it from benchmark prompts, timings, or outcomes.\n\n2. Add an exact total-observation count to each _Successors entry, initialized to one and incremented on every observation. For the existing capacity- and output-limited draft d1\u2026dk, obtain each conditional frequency qi=count(di)<redacted-path> for the entire matched context extended by preceding drafts. Compute P0=1, Pi=P(i-1)*qi, and S=sum(P1\u2026Pk). Verify only when S>=1. Retain the entire original draft when eligible; otherwise use scalar decoding. Treat S solely as a scheduling heuristic, never as authorization to emit tokens.\n\n3. Factor a lookup-only eligibility preview that reads committed history and counts without touching KV offsets or mutating the index. While scalar outputs remain pending, use this preview instead of unconditional unigram-triggered draining. It may stop once S reaches one. On a positive preview, drain in order and recompute actual drafting, capacity, budget, and score from the updated history. Never reuse a pre-drain draft. On a negative preview, retain submit-successor-before-host-read pipelining.\n\n4. Keep all generated-token-dependent scoring and updates inside decode. Record gate checks, bypasses, verification positions, and existing acceptance statistics without hot-path logging. Preserve fixed-length generation and small-budget behavior.\n\n5. Validate counts, score construction, conflicting continuations, deterministic continuations, capacity truncation, pending-output transitions, and request isolation. Research-side in-memory checks passed across 1,600 synthetic histories, including 1,398 eligible blocks and both gate outcomes; these checked policy bookkeeping only. Native exact-token correctness and performance remain unmeasured.\n\n6. Have the orchestrator run unchanged exact-token evaluation and both throughput confirmations against the current best. Keep only an exact result meeting the existing 1.03x improvement requirement twice.",
+    "reason": "This is a small, sound experiment that can remove whole rejected target positions using information already maintained by the decoder. It avoids additional target passes and synchronization boundaries. Whether saved work exceeds lost speculation and scoring overhead remains a worthwhile benchmark question."
+  },
+  "review": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Confidence-gated suffix speculation",
+      "idea": "Estimate accepted draft length from the existing request-local successor frequencies. Verify the unchanged, feasible draft only when its score is at least one expected accepted draft token; otherwise continue scalar pipelining. Use the same scoring rule as an advisory check before draining unread scalar outputs. Preserve exact target verification and acceptance.",
+      "cost_removed": "Can avoid whole target positions spent verifying weak continuations. An immediately rejected k-token draft computes k+1 positions to emit one token; scalar decoding needs one position for that token. Avoiding that block removes k unnecessary transformer and vocabulary-head computations. Net savings depend on which blocks the gate bypasses and the speculation benefits it forfeits.",
+      "source_evidence": "Verified candidate/inference.py:12\u201325 maintains successor counts without totals; :97\u2013118 chooses drafts without confidence screening; :242\u2013265 verifies every nonempty draft completely; and :275\u2013280 drains on unigram membership. harness/bench.py:20\u201329 times decode through final synchronization. [SuffixDecoding, Section 3](https://proceedings.neurips.cc/paper_files/paper/2025/file/b7aea253ab34a773967f1e4cdea9e4fb-Paper-Conference.pdf) supports conditional-frequency products, expected-acceptance scoring, and score-based fallback. It does not establish this experiment\u2019s threshold, scalar fallback profitability, or numerical parity.",
+      "generalization": "Skipping unproductive target positions can remove arithmetic, attention reads, and vocabulary projections across inference backends. The mechanism requires no special kernels, model changes, auxiliary training, or state shared between requests. Benefits remain workload-dependent.",
+      "risk": "Empirical frequencies are not calibrated probabilities of greedy agreement: a single historical observation can score as certain and still be wrong. The fixed threshold ignores verification cost and weight-traffic amortization, including the accepted bulk-KV improvement. The gate can suppress profitable speculation, while previews add CPU work and can miss opportunities because committed history excludes unread outputs. Floating-point score comparisons affect scheduling only, never token acceptance.",
+      "history_relation": "Round 0008 introduced successor frequencies for draft selection, without this scalar-versus-speculation gate. Rounds 0009 and 0010 avoided work after verification began and added completion boundaries; their failures do not resolve this pre-execution decision. Round 0011 tested branching, not this gate. Preserve accepted rounds 0004, 0006, 0008, and 0013."
+    },
+    "plan": "1. Change candidate/ only. Preserve target parameters, prefill model execution, _supported, draft choices and length limits, singleton verification, bulk KV appends, exact acceptance, rollback, and fixed-length output behavior. Freeze the inclusive threshold at 1.0; do not tune it using benchmark prompts, timings, or outcomes.\n\n2. Add total to _Successors, initialized to one and incremented exactly once per observation, maintaining total == sum(counts.values()). Preserve frequency ties resolved by recency. Initialize counts from prompt tokens only; update generated-token observations through the existing commit path. Never insert speculative or unread tokens into the index.\n\n3. At a drained boundary, construct the same draft d1\u2026dk with all existing cache, capacity, and output-budget checks. For C1 equal to the matched context and Ci equal to C1 followed by d1\u2026d(i-1), set qi = index[Ci].counts[di] / index[Ci].total. Compute P0=1, Pi=P(i-1)*qi, and S=sum(P1\u2026Pk). This repairs the redacted denominator. Exclude P0 and the corrective/bonus token. Score the capacity- and budget-truncated draft, not a longer hypothetical continuation. Verify only nonempty drafts with S>=1. Retain the entire original draft when eligible; crossing the threshold must not shorten it. Decide before constructing target verification inputs or scheduling target work. A failed gate falls through to the existing scalar path.\n\n4. Factor a lookup-only preview over committed history and counts. Keep unigram membership as a cheap negative prefilter. Invoke the preview at the existing decision point after committing the oldest of two pending outputs. Let R=max_new_tokens-len(output)-len(pending), the output budget remaining after a possible drain; skip preview when R<2. Otherwise use the same contextual walk, limited by min(MAX_DRAFTS, matched-context length, R-1). Do not consult KV state or materialize pending tensors for scoring. Capacity is deliberately omitted from this advisory preview. It may stop when S>=1. On a positive result, drain pending outputs in order, then recompute the actual context, draft, capacity, budget, and gate from updated history. Never reuse the preview draft. On a negative result, retain submit-successor-before-host-read pipelining. Unsupported models retain their current fallback.\n\n5. Preserve the drained invariant kv.offset == len(history)-1, the newest token tensor, full verification completion before trimming, and the existing rollback of k-accepted positions. The score authorizes scheduling only; every emitted token still follows scalar target prediction or exact speculative acceptance. Keep all generated-token-dependent indexing, scoring, previews, bookkeeping, and execution inside decode. Store request-local counters for actual nonempty gate checks, bypasses, previews/drains, and verification positions, alongside existing acceptance statistics. Do not log in the hot path or execute counterfactual verification to estimate savings.\n\n6. Validate totals against independently enumerated observations, recency ties, full-context extension without backoff, missing continuations, both gate outcomes, threshold equality, and unchanged eligible drafts. Cover one-token drafts, maximum-length drafts, and capacity/output truncation that changes eligibility. Exercise stale positive and negative previews, final draining, zero/small output budgets, immediate and partial rejection, all-accepted blocks, allocation boundaries, unsupported fallback, and independent requests. Include native exact-token checks with active gate bypass and verification paths; logical simulations do not establish BF16 parity.\n\n7. Have the orchestrator run unchanged exact-token evaluation, including the benchmark workload, followed by both throughput confirmations against the current best. Keep only exact output with at least 1.03x improvement in both confirmations. Record the fixed policy and actual results without threshold retuning.",
+    "reason": "No fundamental flaw was found. Review clarified the denominator, feasible-draft scoring, score convention, and advisory preview semantics. Independent in-memory checks passed 75,488 policy cases across 1,348 synthetic histories and 6,496 simulated decodes, including rejection, rollback, and pending-output transitions. These establish bookkeeping only; native exactness and net throughput remain for evaluation. No files were edited."
+  },
+  "implementation": {
+    "outcome": "implemented",
+    "summary": "Updated candidate/inference.py with successor totals, the fixed inclusive 1.0 confidence gate, advisory previews, and request-local counters. Preserved exact verification, rollback, and scalar pipelining. Scoring checks and 500 decode simulations passed. Native token parity and benchmarking remain for the orchestrator; MLX cannot initialize a Metal device locally."
+  },
+  "eval": {
+    "correct": true,
+    "cases": [
+      {
+        "prompt": "Explain why the sky is blue.",
+        "correct": true
+      },
+      {
+        "prompt": "Write a short Python function that reverses a list.",
+        "correct": true
+      },
+      {
+        "prompt": "What are the main causes of inflation?",
+        "correct": true
+      },
+      {
+        "prompt": "Describe how photosynthesis works.",
+        "correct": true
+      },
+      {
+        "prompt": "Continue this story: The door opened and nobody was there.",
+        "correct": true
+      },
+      {
+        "prompt": "<benchmark>",
+        "correct": true
+      }
+    ]
+  },
+  "confirmations": [
+    {
+      "baseline_relative_decode_speed": 1.9014336301248294,
+      "candidate_relative_decode_speed": 1.6473458563723162,
+      "gain": 0.8663704219137892
+    },
+    {
+      "baseline_relative_decode_speed": 1.8751320885904745,
+      "candidate_relative_decode_speed": 1.8556853197756609,
+      "gain": 0.9896291205653508
+    }
+  ],
+  "confirmed_gain": 0.8663704219137892,
+  "reason": "decode gain was not >= 1.03x twice"
+}
