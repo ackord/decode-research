@@ -1,0 +1,94 @@
+{
+  "round": "0023",
+  "parent_commit": "65c0e642d337a6da3df1f7a408389dbcd3f2be21",
+  "models": {
+    "research": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "review": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "implementation": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    }
+  },
+  "status": "rejected",
+  "research": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Prune speculative heads using exact rejection witnesses",
+      "idea": "After the unchanged verifier body, compute each draft token\u2019s exact logit and the existing first vocabulary panel for all positions. A panel logit strictly exceeding a draft\u2019s logit proves a mismatch. Read the earliest such position once, then finish the remaining eleven panels only through that position. Every prediction that could be emitted still receives a complete vocabulary scan.",
+      "cost_removed": "For m positions and retained head prefix r, remove 45056*(m-r)*576 weight\u2013activation products, while adding 32*(m-1)*576 probe products. At m=17 and r=1, the net reduction is 414,941,184 products, about 86% of head arithmetic. Logit allocation and assembly also shrink. Transformer work remains unchanged, and every vocabulary panel is still read at least once. Costs include one additional grouped projection, comparisons, reductions, and one additional host synchronization per block.",
+      "source_evidence": "The current [panel head](candidate/inference.py:285) computes all twelve panels for every position; [acceptance](candidate/inference.py:600) subsequently discards predictions beyond the first mismatch. Direct checkpoint inspection confirms the tied BF16 [49152,576] head occupies 56,623,104 bytes and has maximum absolute weight 1.9609375. The inspected [gathered-GEMV dispatch](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/matmul.cpp) uses the same contraction parameters for 32-row probes and 4096-row panels, except BM changes from 8 to 4. With BN=1, [GEMVKernel](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/kernels/gemv.h) uses BM for row assignment without changing each row\u2019s reduction. This supports an arithmetic-equivalence argument; native BF16 validation remains necessary.",
+      "generalization": "Exact rejection witnesses can eliminate irrelevant vocabulary projections in any greedy speculative decoder, including vocabulary-sharded frontier models. The mechanism removes arithmetic and activation movement through ordinary indexed products and conditional scheduling. Benefits depend on rejection frequency and the head\u2019s share of decode cost; no gain requires custom kernels or a particular accelerator.",
+      "risk": "The first panel may rarely expose an early mismatch, leaving only added overhead. Synchronization may outweigh omitted arithmetic, especially when weight bandwidth dominates. Probe logits must match reference arithmetic exactly: an erroneous witness could truncate needed predictions. Nonfinite arithmetic requires a conservative fallback.",
+      "history_relation": "Round 0009 tested sequential complete heads and failed at 0.989x. This uses one fixed screening synchronization and preserves grouped panel execution for the retained prefix. Rounds 0002 and 0014 tested approximate winner certification; this uses an exact counterexample only to discard positions after a proven rejection. Accepted rounds 0017 and 0022 provide the grouping and panel structure that materially change the scheduling tradeoff."
+    },
+    "plan": "1. Modify candidate/ only. Enable within the existing eligible panel-head path for verifier blocks of 3\u201317 positions. Preserve transformer operations, drafting, scalar pipelining, model objects, and cache allocation. An independent gate must retain the current complete panel head when unsupported. Freeze the screening panel to vocabulary rows 0\u20134095 and probe width to 32 before evaluation.\n\n2. Pass the already-known draft IDs into verification without additional token reads. View the unchanged vocabulary matrix as [1536,32,576], then transpose to [1536,576,32] without copying weights. For draft d_i, use an indexed singleton product selecting activation i and weight bank floor(d_i/32), then select output d_i%32. Supply explicit uint32 indices and sorted_indices=False. Preserve the original contraction, weight strides, and BF16 conversion; do not substitute an ordinary sum of elementwise products.\n\n3. Establish finite-arithmetic eligibility. Check once per request that all head weights have absolute value at most 65536; this weight-only check may occur during prefill. During screening, require the same bound for the normalized activation block. These bounds keep every 576-term head accumulation safely finite. If either check fails, disable pruning and finish the existing complete head. Fold the activation check into the screening decision without another host read.\n\n4. Make probe inputs depend on the complete normalized block, preserving completion of every transformer position and KV write. Compute the ordinary first 4096-row panel for all m positions, retaining it for final assembly. For each of the m-1 drafts, test whether that panel\u2019s maximum is strictly greater than its exact probe score. Equality never proves rejection. Materialize one cutoff integer: r=f+1 for earliest witness f, or r=m when no witness exists. Construct no remaining panels before this decision.\n\n5. Compute panels 1\u201311 only for normalized positions [0,r), using matching prefix-length gather indices. Remaining head batches may have one or two positions even though transformer-block eligibility remains unchanged. Preserve panel dependencies and concatenate the retained first-panel prefix with all remaining panels in vocabulary order. Apply the existing singleton argmax and jointly materialize the r predictions. If f is witnessed, the actual first mismatch a must satisfy a<=f, so this prefix contains every necessary prediction.\n\n6. Preserve acceptance and rollback using the original draft count k=m-1. Emit drafts[:a] followed by prediction[a], and trim k-a entries from every cache, leaving offset C+1+a. Complete all submitted work before trimming. Charge screening, host reads, indices, assembly, and cleanup to decode; retain no request-derived state across requests.\n\n7. Add native differential checks comparing probe scores and retained complete logits bitwise with current panel heads and reference singleton heads. Cover all block and retained-prefix sizes, bank boundaries, repeated draft IDs, cancellation, BF16 rounding cases, cross-panel ties, unsafe-value fallback, and no-witness cases. Exercise every acceptance length, retained KV, scalar continuation, capacity crossings, and request isolation. Check storage sharing and complete-body dependencies. Record screen attempts, cutoffs, probe calls, and omitted projection rows without hot-path logging.\n\n8. Have the orchestrator run native validation, unchanged exact-token evaluation, and both throughput confirmations against the current best. Confirm active screening and independently exercise pruning. Keep only exact output with at least 1.03x incremental gain twice; do not adjust panel selection or policy using benchmark prompts or results.",
+    "reason": "A single exact inequality can prove that later heads are unnecessary, allowing substantial conditional work removal while preserving grouped execution. In-memory checks passed 7,500 prefix-selection cases, 30,000 rollback formulas, and 294,912 bank-address checks. These establish bookkeeping only; native parity and net throughput remain experimental questions."
+  },
+  "review": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Prune speculative heads using exact rejection witnesses",
+      "idea": "After the unchanged verifier body, compute each draft token\u2019s logit and the first vocabulary panel across all positions. A strictly larger panel logit proves rejection. Read the earliest witness once, then complete the remaining eleven panels only through that position. Bound acceptance by the returned prediction count, treating the last retained complete-head prediction as the corrective or bonus token.",
+      "cost_removed": "For m transformer positions and r retained heads, omit 45056*(m-r)*576 weight\u2013activation products while adding 32*(m-1)*576 probe products. At m=17 and r=1, the net saving is 414,941,184 products, or 86.2% of baseline head arithmetic. Transformer work and the twelve panel calls remain; every vocabulary panel is still needed at least once. Added costs include probe weight reads, indexing, comparisons, reductions, and one host synchronization per screened block.",
+      "source_evidence": "The current [panel head](candidate/inference.py:285) computes all twelve panels before acceptance discards predictions. Direct inspection confirmed the pinned checkpoint\u2019s tied BF16 head has shape [49152,576], occupies 56,623,104 bytes, and has maximum absolute weight 1.9609375. The audited [MLX dispatch](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/matmul.cpp) gives explicit-index singleton gathers identical contraction parameters for 32-row and 4096-row outputs except BM. With BN=1, [GEMVKernel](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/kernels/gemv.h) uses BM for row assignment without changing each row\u2019s reduction. This supports equivalence, subject to native validation. Ordinary 32-row matmul takes a different reduction configuration and is not an interchangeable probe implementation.",
+      "generalization": "Removing vocabulary projections after a rejected speculative position applies to greedy speculative decoders, including frontier models with sharded vocabulary heads. The saving is omitted arithmetic and activation movement through ordinary indexed products and conditional scheduling. Communication, weight bandwidth, and the vocabulary head\u2019s share of total decode cost determine its practical value.",
+      "risk": "The fixed first panel may expose few early rejections, leaving added synchronization and probe overhead. Unique vocabulary weight traffic does not disappear. Retained heads must preserve reference arithmetic, including batches of one or two positions. Probe equivalence supports the exact-witness claim; bounded acceptance additionally prevents an overly early cutoff from corrupting emitted tokens.",
+      "history_relation": "Round 0009\u2019s sequential complete heads failed at 0.989x; this experiment uses one screening read and retains grouped panel execution. Rounds 0002 and 0014 attempted approximate winner certification, whereas this mechanism seeks rejection witnesses and fully scans every retained head. Accepted rounds 0017 and 0022 materially changed the execution structure available for this experiment."
+    },
+    "plan": "1. Modify candidate/ only. Preserve transformer operations, drafting, scalar pipelining, model objects, and cache allocation. Enable screening only inside the existing eligible panel-head path for m=3\u201317 positions. Add an independent gate whose failure retains the complete panel head. Freeze vocabulary rows 0\u20134095 and probe width 32 before evaluation. Pass known Python draft IDs into _verify; absent IDs retain its existing full-prediction behavior.\n\n2. Retain the audited runtime, BF16, tied-head, shape, and storage restrictions. Require k=m-1 valid draft IDs. Once per request, check all(abs(weight)<=65536); this weight-only check may occur during prefill. During screening, require all(abs(norm_block)<=65536), folded into the cutoff decision. Use elementwise comparison followed by all so NaNs fail eligibility. These bounds keep all 576-term FP32 accumulations and BF16 outputs safely finite. Unsupported weights bypass screening; unsafe activations select the complete head.\n\n3. View the unchanged weight as [1536,32,576], transposed to [1536,576,32], sharing storage with element strides [18432,1,576]. Use the complete normalized block reshaped to [m,1,576], explicit uint32 lhs indices 0..k-1, rhs indices draft_id//32, and sorted_indices=False. Select output draft_id%32. Draft d_i must use normalized row i, not row i+1. Preserve native BF16 conversion and reduction; do not replace the gather with ordinary narrow matmul or an elementwise dot-product sum.\n\n4. Make probe inputs depend on the complete normalized block, preserving completion of every transformer position and KV update. Compute probes, then the ordinary first panel for all m positions, with its consumed input dependent on the probes. Retain this panel. For i<k, witness rejection only when panel_max[i]>probe[i]; equality provides no witness. Materialize one cutoff r=f+1 for the earliest witness f, otherwise r=m. Unsafe activation eligibility also forces r=m. The cutoff must depend on both screening outputs. Construct no remaining panels before this read.\n\n5. Compute panels 1\u201311 only for norm_block[:, :r, :], using matching length-r gather indices rather than the current closure\u2019s length-m indices. Support r=1 and r=2 without changing transformer eligibility. Preserve dependencies between complete panels. Concatenate the retained first-panel prefix and eleven remaining outputs once, in vocabulary order, after the final panel completes. Reuse the first panel when screening falls back to r=m. Apply the existing singleton argmax and jointly materialize all r predictions.\n\n6. Strengthen acceptance independently of the witness: initialize a=0 and advance while a<r-1 and prediction[a]==draft[a]. Emit drafts[:a] followed by prediction[a], retaining that prediction tensor as the pending token. This equals current acceptance for a valid witness and remains a correct greedy prefix even if the cutoff is overly early. Never emit from probe scores or panel-only maxima. Complete all submitted work before trimming k-a entries from every cache, using the original k=m-1, leaving offset C+1+a. Never substitute the shortened head count for the original draft count.\n\n7. Charge every generated-token-dependent operation to decode, including screening, indices, both host reads, assembly, rollback, and cleanup. Only weight-only preparation may precede the timer. Keep views, eligibility state, and counters request-local; clear additional views alongside existing panel cleanup. Record screening attempts, cutoff counts, probe calls, and omitted projection rows without hot-path logging. Do not mutate shared model weights or reuse request-derived computation across requests.\n\n8. Extend candidate\u2019s native checks to compare probe scores and every retained complete logit bitwise against the current complete panel head and reference singleton heads. Cover every m=3\u201317 and r=1..m, all bank offsets, bank/panel boundaries, repeated IDs, cancellation, BF16 rounding, ties, zero inputs, unsafe-value fallback, and no witnesses. Test the active untraced path, storage sharing, consumed-input dependencies, and absence of later-panel construction before the cutoff. Exercise every rejection/acceptance length, deliberately premature cutoffs, exact retained KV, scalar continuation across capacity growth, token limits, and request isolation. Preserve existing baseline checks rather than disabling screening throughout validation.\n\n9. Have the orchestrator run native differential validation, unchanged exact-token evaluation, and both throughput confirmations against the current best. Demonstrate active screening and independently exercise actual pruning; inactive fallback is not validation of the mechanism. Keep only exact output with at least 1.03x incremental gain in both confirmations. Do not tune panel selection or screening policy from benchmark prompts or results.",
+    "reason": "No fundamental flaw was found. Review strengthens bounded acceptance, distinguishes gathered probes from ordinary narrow matmul, and clarifies dependencies, fallback, and work accounting. Independent in-memory checks passed 4,500 screening cases, 17,800 bounded-prefix/KV cases with scalar continuations, and 442,368 bank-address checks. These establish bookkeeping only. Native validation was unavailable because Metal could not be accessed; exactness and throughput remain for the orchestrator. No files were edited."
+  },
+  "implementation": {
+    "outcome": "implemented",
+    "summary": "Implemented exact-witness head screening, bounded acceptance, request-local counters and cleanup, and expanded native checks in candidate/. Syntax checks and 3,568 decode bookkeeping simulations passed. Native validation awaits the orchestrator; this session has no Metal device."
+  },
+  "eval": {
+    "correct": true,
+    "cases": [
+      {
+        "prompt": "Explain why the sky is blue.",
+        "correct": true
+      },
+      {
+        "prompt": "Write a short Python function that reverses a list.",
+        "correct": true
+      },
+      {
+        "prompt": "What are the main causes of inflation?",
+        "correct": true
+      },
+      {
+        "prompt": "Describe how photosynthesis works.",
+        "correct": true
+      },
+      {
+        "prompt": "Continue this story: The door opened and nobody was there.",
+        "correct": true
+      },
+      {
+        "prompt": "<benchmark>",
+        "correct": true
+      }
+    ]
+  },
+  "confirmations": [
+    {
+      "baseline_relative_decode_speed": 2.608418797517414,
+      "candidate_relative_decode_speed": 2.57901021629357,
+      "gain": 0.9887255139965124
+    },
+    {
+      "baseline_relative_decode_speed": 2.6104826140513113,
+      "candidate_relative_decode_speed": 2.562722805233005,
+      "gain": 0.9817046056689932
+    }
+  ],
+  "confirmed_gain": 0.9817046056689932,
+  "reason": "decode gain was not >= 1.03x twice"
+}
