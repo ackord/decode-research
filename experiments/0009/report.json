@@ -1,0 +1,94 @@
+{
+  "round": "0009",
+  "parent_commit": "f15cbec6db64ea6b1a38f97b9916d7e1ee86a611",
+  "models": {
+    "research": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "review": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "implementation": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    }
+  },
+  "status": "rejected",
+  "research": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Demand-driven speculative vocabulary heads",
+      "idea": "Preserve the accepted transformer verifier, but evaluate vocabulary heads through a two-result pipeline. Read predictions in position order and stop submitting heads at the first draft mismatch. Compute the corrective or bonus token exactly with the original scalar head.",
+      "cost_removed": "Eliminates full vocabulary projections and argmax operations for unused speculative suffix positions. With k drafts and a accepted drafts, the pipeline executes at most min(k+1,a+2) heads instead of k+1. For k=16 and immediate rejection, it skips 15 heads, removing 849,346,560 bytes of nominal weight scans plus their arithmetic. Actual memory traffic depends on caching. Transformer work remains unchanged.",
+      "source_evidence": "candidate/inference.py:170\u2013173 constructs every full vocabulary head; lines 201\u2013205 materialize all predictions before checking acceptance. Predictions after the first mismatch are discarded. Direct inspection of the pinned checkpoint confirms the tied BF16 head has shape [49152,576] and occupies 56,623,104 bytes. The current 16-draft limit therefore permits 17 complete head scans per verification. Prefix acceptance follows [speculative decoding](https://arxiv.org/abs/2211.17192); deferring independent heads is the proposed scheduling change.",
+      "generalization": "Omitting unnecessary vocabulary projections is independent of hardware, compiler, and kernels. It applies wherever speculative verification exposes hidden states separately from the output head. Savings could matter for frontier models with large vocabularies, especially when the head represents substantial active-model traffic.",
+      "risk": "Frequent full acceptance leaves little work to remove. Incremental host reads and smaller submissions may outweigh savings, although submitting the successor head before reading its predecessor limits idle time. Round 0008's improved drafting may reduce the opportunity. Exactness requires preserving native singleton head inputs and draining any already-submitted unused head.",
+      "history_relation": "Retains rounds 0006 and 0008's transformer schedule and drafting policy, and applies round 0004's bounded pipeline to head evaluation. Rounds 0002 and 0007 changed head computation; this experiment removes unused invocations. Round 0003's disabled batching path does not resolve this mechanism."
+    },
+    "plan": "1. Modify only candidate/. Split _verify at the final normalized hidden states, preserving every existing transformer operation, dependency, cache update, and native hidden-state shape. Preserve prefill, drafting, capacity limits, and scalar fallback.\n\n2. For blocks with at least three positions, submit the original scalar head and argmax for positions 0 and 1 asynchronously. Keep at most two unread predictions. Read the oldest prediction; only after it matches the corresponding draft, submit the next head before reading the next prediction. Preserve head ordering through dependencies on consumed inputs. Keep the existing path for two-position blocks, where this pipeline cannot skip a head.\n\n3. At the first mismatch, stop submission, retain that exact prediction as the corrective token, and drain any outstanding head. On full acceptance, evaluate and emit the final bonus prediction. Preserve the original argmax and singleton prediction tensor; introduce no approximate computation or numerical batching.\n\n4. Commit the accepted draft prefix and corrective or bonus token exactly once. Since all transformer positions still execute, retain the existing rollback: trim k-a entries, leaving offset C+1+a and the emitted prediction pending outside KV. Release unused hidden states and head results. Charge all submissions, transfers, draining, and rollback to decode.\n\n5. On independent cases, compare consumed logits, emitted tokens, retained KV, and continuation after rollback against the current verifier and reference. Exercise every acceptance length, immediate rejection, full acceptance, small budgets, capacity boundaries, pipeline transitions, and request isolation. Verify the head-call bound with counters and confirm omitted heads are never submitted.\n\n6. Freeze the two-result policy before authoritative evaluation. Have the orchestrator run unchanged exact-token evaluation and both throughput confirmations against round 0008. Record heads executed and skipped alongside acceptance statistics; retain only the required improvement without benchmark-based tuning.",
+    "reason": "This removes potentially substantial computation that cannot influence the accepted output, while preserving the numerical operations that determine tokens and retained state. The balance between skipped head scans and incremental synchronization is a practical, unresolved benchmark question."
+  },
+  "review": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Demand-driven speculative vocabulary heads",
+      "idea": "Preserve the accepted transformer verifier and drafting policy. Evaluate the original singleton vocabulary heads through a fixed two-result pipeline, checking predictions in order and stopping further head construction at the first draft mismatch. Emit the accepted prefix followed by the exact corrective or bonus prediction.",
+      "cost_removed": "For k drafts and a accepted drafts, execute H=min(k+1,a+2) heads instead of k+1, skipping max(0,k-a-1) projections and argmax operations. Immediate rejection with k=16 skips 15 heads: 849,346,560 bytes of nominal weight scans plus their arithmetic. This is a storage-based estimate, not measured memory traffic. All speculative transformer work remains.",
+      "source_evidence": "Verified candidate/inference.py:170\u2013173 constructs every full vocabulary head, and lines 201\u2013209 materialize every prediction before selecting the accepted prefix. The pinned checkpoint's safetensors header confirms model.embed_tokens.weight is BF16 with shape [49152,576], occupying 56,623,104 bytes. Installed Embedding.as_linear computes x @ weight.T without changing cache state. KVCache.trim changes only the offset. harness/bench.py:20\u201329 synchronizes before timing and after decode, charging asynchronous work. The accepted-prefix and corrective/bonus rule follows [speculative decoding, Section 2](https://arxiv.org/html/2211.17192v2); that paper does not establish this scheduling change's numerical parity or performance.",
+      "generalization": "Removing unused output projections reduces arithmetic independently of hardware, compiler, or kernels. It applies to speculative decoders exposing hidden states separately from a stateless vocabulary head. Potential benefit grows with vocabulary-head cost and early rejection; frontier-scale applicability depends on the head's share of total work and the efficiency of existing head batching.",
+      "risk": "Full or nearly full acceptance skips no heads while adding host reads and smaller submissions. Two pending results may not hide that overhead. Correctness requires preserving singleton arithmetic and the complete transformer dependency barrier, and finishing submitted work before cache rollback. Round 0008's improved acceptance may reduce the opportunity.",
+      "history_relation": "Retains rounds 0006 and 0008's verifier body and drafting policy, and uses round 0004's bounded asynchronous submission pattern. Round 0001's failed block verification motivates preserving native singleton computation. Rounds 0002 and 0007 changed head computation; neither tested omission of unused invocations. Round 0003's batching remained disabled and does not resolve this mechanism."
+    },
+    "plan": "1. Modify candidate/ only. Preserve prefill, public interfaces, model weights and bindings, support checks, drafting constants and policy, speculative capacity restrictions, and the scalar pipeline. Freeze the two-result policy before authoritative evaluation; use no benchmark-derived tuning.\n\n2. Split _verify immediately after its existing final normalization. Preserve every transformer operation, singleton shape, dtype, layout construction, projection dependency, bounded attention view, and cache update. Return the normalized singleton states without constructing their vocabulary heads. Preserve the current final-normalization dependencies on all terminal states. Each submitted head must consume an input dependent on all normalized states, ensuring the complete transformer computation and cache writes finish even on immediate rejection. Preserve head order by gating each later head's consumed input on the preceding submitted head's logits. Do not merely attach dependencies to an already-created result.\n\n3. Let inputs be [pending,d0,...,d(k-1)], with predictions p0,...,pk. For k=1, retain the existing eager two-head path and joint result read. For k>=2, construct and asynchronously submit only heads 0 and 1 initially. Use the unchanged tied or untied head on native (1,1,D) inputs and unchanged mx.argmax(logits[:, -1, :], axis=-1), retaining native prediction tensors. Keep at most two unread results. After reading pi, if i<k and pi matches di, submit the next unsubmitted head, when one exists, before reading the next queued prediction. On mismatch, stop immediately without constructing further heads. After all drafts match, consume pk as the bonus. Do not eagerly build all heads or stack hidden states into a numerical batch.\n\n4. Preserve the selected prediction tensor pa and its already-read ID. On rejection, wait for the outstanding lookahead prediction to finish without committing it; no host conversion of its value is necessary. Drain before trimming or starting another model call. Commit d0 through d(a-1), followed by pa, exactly once. All k+1 transformer positions executed, so trim k-a entries from each cache. Starting from offset C, the resulting offset is C+1+a, history length is C+2+a, and pa remains pending outside KV. Retain allocation and release unused hidden states, logits, predictions, and input references. This preserves the original acceptance rule because consumed heads are unchanged pure functions and every omitted head lies beyond the first mismatch.\n\n5. Keep graph construction, submissions, acceptance reads, draining, indexing, rollback, and cleanup inside decode. Preserve empty and one-token budgets, fixed-length generation after EOS, and termination without processing the final pending token. Keep all request-specific state local and shared model objects unchanged. Do not defer outstanding work into another request or rely solely on the harness's final synchronization.\n\n6. On independent inputs, compare against the current eager verifier and teacher-forced scalar reference using separate equivalent caches. Compare consumed logits and retained KV prefixes bitwise, offsets and allocation shapes, emitted tokens, and greedy continuation after rollback. Exercise draft lengths 1\u201316 and every acceptance length, including immediate rejection, rejection at the final draft, and full acceptance. Cover small budgets, cache-capacity boundaries and subsequent scalar growth, scalar/speculative transitions, argmax ties, and request isolation. Inspect dependencies to confirm the complete body executes while omitted heads are never constructed or submitted. Native discrepancies require investigation; mock checks alone do not establish BF16 parity.\n\n7. Add inexpensive request-local counters for speculative heads executed and skipped, retaining existing acceptance statistics and avoiding hot-path logging. Verify H=min(k+1,a+2), including the two-head fallback, and confirm the optimized path actually executes. Have the orchestrator run unchanged exact-token evaluation, including the benchmark workload, then both throughput confirmations against accepted round 0008. Retain only at least 1.03x incremental gain in each confirmation. Record correctness, activation, head counts, acceptance, and performance without changing policy from benchmark results.",
+    "reason": "No fundamental flaw was found. Vocabulary heads do not affect hidden states or KV, and predictions beyond the first mismatch cannot affect committed output. The review makes the complete-body dependency barrier, conditional head construction, and draining before rollback explicit. Exactness and net throughput remain for evaluation and benchmarking; neither was measured during review."
+  },
+  "implementation": {
+    "outcome": "implemented",
+    "summary": "Changed candidate/inference.py to use the fixed two-result speculative head pipeline, preserving singleton heads, transformer dependencies, one-draft fallback, rollback, and drafting policy. Added request-local executed/skipped head counters. Passed 304 mock scheduling cases, syntax and diff checks. Native correctness and performance remain unverified because MLX cannot access Metal in this session."
+  },
+  "eval": {
+    "correct": true,
+    "cases": [
+      {
+        "prompt": "Explain why the sky is blue.",
+        "correct": true
+      },
+      {
+        "prompt": "Write a short Python function that reverses a list.",
+        "correct": true
+      },
+      {
+        "prompt": "What are the main causes of inflation?",
+        "correct": true
+      },
+      {
+        "prompt": "Describe how photosynthesis works.",
+        "correct": true
+      },
+      {
+        "prompt": "Continue this story: The door opened and nobody was there.",
+        "correct": true
+      },
+      {
+        "prompt": "<benchmark>",
+        "correct": true
+      }
+    ]
+  },
+  "confirmations": [
+    {
+      "baseline_relative_decode_speed": 1.5536354403096282,
+      "candidate_relative_decode_speed": 1.5369463760805204,
+      "gain": 0.9892580564293888
+    },
+    {
+      "baseline_relative_decode_speed": 1.5600796874944391,
+      "candidate_relative_decode_speed": 1.5515096878972243,
+      "gain": 0.9945066911223114
+    }
+  ],
+  "confirmed_gain": 0.9892580564293888,
+  "reason": "decode gain was not >= 1.03x twice"
+}

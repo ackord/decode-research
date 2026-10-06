@@ -1,0 +1,114 @@
+diff --git a/candidate/inference.py b/candidate/inference.py
+index 2ff26c4..e5f4bd3 100644
+--- a/candidate/inference.py
++++ b/candidate/inference.py
+@@ -38,6 +38,8 @@ class RequestCache(list):
+             "draft_lengths": [0] * (MAX_DRAFTS + 1),
+             "accepted_lengths": [0] * (MAX_DRAFTS + 1),
+             "rejected_positions": 0,
++            "speculative_heads_executed": 0,
++            "speculative_heads_skipped": 0,
+         }
+         for token in token_ids:
+             self.append_token(int(token))
+@@ -132,6 +134,7 @@ def _verify(model, cache, tokens):
+     Cache insertion returns each position's own bounded view, never a view of
+     the final speculative prefix. Dependencies also protect earlier reads from
+     subsequent cache writes. No new numerical batching or compilation is used.
++    Return normalized singleton states; decode schedules their vocabulary heads.
+     """
+     body = model.model
+     xs = [body.embed_tokens(t) for t in tokens]
+@@ -167,10 +170,13 @@ def _verify(model, cache, tokens):
+         activated = [llama.swiglu(g, mx.depends(u, ups)) for g, u in zip(gates, ups)]
+         downs = _project(layer.mlp.down_proj, activated, activated)
+         xs = [h + r for h, r in zip(hs, downs)]
+-    norm = [body.norm(mx.depends(x, xs)) for x in xs]
+-    head = body.embed_tokens.as_linear if model.args.tie_word_embeddings else model.lm_head
+-    logits = _project(head, norm, norm)
+-    return [mx.argmax(x[:, -1, :], axis=-1) for x in logits]
++    return [body.norm(mx.depends(x, xs)) for x in xs]
++
++
++def _prediction(head, x, dependencies):
++    # Gate the consumed input, including the complete normalized verifier body.
++    logits = head(mx.depends(x, dependencies))
++    return logits, mx.argmax(logits[:, -1, :], axis=-1)
+ 
+ 
+ def decode(model, first_token, cache, max_new_tokens):
+@@ -198,25 +204,65 @@ def decode(model, first_token, cache, max_new_tokens):
+                 inputs = [token.reshape(1, 1)] + [
+                     mx.array([[d]], dtype=token.dtype) for d in drafts
+                 ]
+-                predictions = _verify(model, cache, inputs)
+-                mx.async_eval(*predictions)
+-                ids = mx.stack(predictions).tolist()
+-                accepted = 0
+-                while accepted < len(drafts) and drafts[accepted] == ids[accepted][0]:
+-                    accepted += 1
++                normalized = _verify(model, cache, inputs)
++                body = model.model
++                head = (body.embed_tokens.as_linear if model.args.tie_word_embeddings
++                        else model.lm_head)
++                if len(drafts) == 1:
++                    # Preserve the eager two-head path and joint host read.
++                    logits = _project(head, normalized, normalized)
++                    predictions = [mx.argmax(x[:, -1, :], axis=-1) for x in logits]
++                    mx.async_eval(*predictions)
++                    ids = mx.stack(predictions).tolist()
++                    accepted = int(drafts[0] == ids[0][0])
++                    token = predictions[accepted]
++                    selected_id = ids[accepted][0]
++                    submitted = 2
++                    del logits, predictions, ids
++                else:
++                    # Fixed two-result lookahead; never construct heads beyond
++                    # the first mismatch plus its already-submitted successor.
++                    queue = []
++                    for i in range(2):
++                        deps = normalized if not queue else [*normalized, queue[-1][0]]
++                        result = _prediction(head, normalized[i], deps)
++                        mx.async_eval(result[1])
++                        queue.append(result)
++                    submitted = 2
++                    accepted = 0
++                    while queue:
++                        logits, prediction = queue.pop(0)
++                        selected_id = prediction.item()
++                        token = prediction
++                        del logits, prediction
++                        if accepted == len(drafts) or selected_id != drafts[accepted]:
++                            # Finish lookahead and all cache writes before rollback.
++                            # Its ID is unused and never converted to a host value.
++                            if queue:
++                                mx.eval(queue[0][1])
++                            break
++                        accepted += 1
++                        if submitted < len(normalized):
++                            deps = [*normalized, queue[-1][0]]
++                            result = _prediction(head, normalized[submitted], deps)
++                            mx.async_eval(result[1])
++                            queue.append(result)
++                            submitted += 1
++                    del queue, deps, result
+                 for value in drafts[:accepted]:
+                     commit(value)
+-                commit(ids[accepted][0])
+-                token = predictions[accepted]
++                commit(selected_id)
+                 rejected = len(drafts) - accepted
+                 for kv in cache:
+                     kv.trim(rejected)
+-                del inputs, predictions, ids
++                del inputs, normalized, head, body
+                 stats = state.stats
+                 stats["verifications"] += 1
+                 stats["draft_lengths"][len(drafts)] += 1
+                 stats["accepted_lengths"][accepted] += 1
+                 stats["rejected_positions"] += rejected
++                stats["speculative_heads_executed"] += submitted
++                stats["speculative_heads_skipped"] += len(drafts) + 1 - submitted
+                 continue
+ 
+         logits = model(token.reshape(1, 1), cache=cache)
