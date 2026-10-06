@@ -1,5 +1,6 @@
 import mlx.core as mx
 import mlx.nn as nn
+from importlib.metadata import version
 from mlx_lm.models.cache import KVCache, make_prompt_cache
 from mlx_lm.models import llama
 
@@ -7,6 +8,8 @@ from mlx_lm.models import llama
 MAX_CONTEXT = 16
 MAX_DRAFTS = 16
 INDEX_CONTEXT = MAX_CONTEXT + MAX_DRAFTS - 1
+HEAD_PANEL_ROWS = 4096
+_HEAD_RUNTIME = version("mlx") == "0.32.3"
 
 
 class _Successors:
@@ -36,6 +39,8 @@ class RequestCache(list):
         self.grouped_eligible = None
         self.rotary_eligible = None
         self.attention_eligible = None
+        self.head_eligible = None
+        self.head_panels = None
         self.stats = {
             "scalar_steps": 0,
             "verifications": 0,
@@ -46,6 +51,10 @@ class RequestCache(list):
             "grouped_blocks": 0,
             "grouped_positions": 0,
             "grouped_projection_calls": 0,
+            "panel_head_blocks": 0,
+            "panel_head_positions": 0,
+            "panel_head_calls": 0,
+            "panel_view_sets": 0,
             "attention_blocks": 0,
             "attention_calls": 0,
             "causal_chunks": 0,
@@ -244,6 +253,45 @@ def _grouped_project(weight, block, dependencies, lhs_indices, rhs_indices):
     w = mx.contiguous(weight).T[None]
     return mx.gather_mm(x, w, lhs_indices=lhs_indices, rhs_indices=rhs_indices,
                         sorted_indices=False).reshape(1, m, weight.shape[0])
+
+
+def _head_supported(model):
+    """Independent gate for the audited native gathered-GEMV row layout.
+
+    At both output widths the audited runtime uses the same singleton GEMV
+    contraction/reduction/BF16 conversion. 4096-row offsets preserve its
+    32-row groups and K=576 tail; neither width has a partial row group.
+    This is a correctness restriction, not the source of the locality gain.
+    """
+    if (not _HEAD_RUNTIME or mx.default_device().type != mx.gpu
+            or not mx.metal.is_available() or not model.args.tie_word_embeddings
+            or type(model.model.embed_tokens) is not nn.Embedding):
+        return False
+    weight = model.model.embed_tokens.weight
+    if weight.dtype != mx.bfloat16 or weight.shape != (49152, 576):
+        return False
+    # The buffer protocol exposes native strides without copying or casting.
+    # Only the already-loaded weight is inspected, once per request; no
+    # generated activation is synchronized to inspect its layout.
+    with memoryview(weight) as view:
+        return view.strides == (1152, 2)
+
+
+def _head_views(weight):
+    return tuple(weight[lo:lo + HEAD_PANEL_ROWS]
+                 for lo in range(0, 49152, HEAD_PANEL_ROWS))
+
+
+def _panel_head(panels, norm_block, group):
+    outputs = []
+    for panel in panels:
+        # group gates the consumed activation, before projection, on the
+        # preceding complete panel. No host synchronization between panels.
+        deps = [outputs[-1]] if outputs else [norm_block]
+        outputs.append(group(panel, norm_block, deps))
+    # Prevent assembly reads from interleaving with the panel working sets.
+    ready = mx.depends(outputs, [outputs[-1]])
+    return mx.concatenate(ready, axis=-1)
 
 
 def _rows(block):
@@ -487,7 +535,22 @@ def _verify(model, cache, tokens, *, _trace=None):
     head = body.embed_tokens.as_linear if model.args.tie_word_embeddings else model.lm_head
     if grouped:
         norm_block = body.norm(x_block)
-        logits = _rows(group(body.embed_tokens.weight, norm_block, [norm_block]))
+        if cache.head_eligible is None:
+            cache.head_eligible = _head_supported(model)
+        panelled = (cache.head_eligible and 3 <= len(tokens) <= 17
+                    and norm_block.dtype == mx.bfloat16
+                    and norm_block.shape == (1, len(tokens), 576))
+        if panelled:
+            if cache.head_panels is None:
+                cache.head_panels = _head_views(body.embed_tokens.weight)
+                cache.stats["panel_view_sets"] += 1
+            logit_block = _panel_head(cache.head_panels, norm_block, group)
+            cache.stats["panel_head_blocks"] += 1
+            cache.stats["panel_head_positions"] += len(tokens)
+            cache.stats["panel_head_calls"] += 12
+        else:
+            logit_block = group(body.embed_tokens.weight, norm_block, [norm_block])
+        logits = _rows(logit_block)
     else:
         if batched:
             norm = _rows(body.norm(x_block))
@@ -500,6 +563,14 @@ def _verify(model, cache, tokens, *, _trace=None):
 
 
 def decode(model, first_token, cache, max_new_tokens):
+    try:
+        return _decode(model, first_token, cache, max_new_tokens)
+    finally:
+        if isinstance(cache, RequestCache):
+            cache.head_panels = None
+
+
+def _decode(model, first_token, cache, max_new_tokens):
     if max_new_tokens < 1:
         return []
 

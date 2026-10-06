@@ -1,0 +1,94 @@
+{
+  "round": "0022",
+  "parent_commit": "e91d9ce6f854d3ef5cf902dc471288857eda7a56",
+  "models": {
+    "research": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "review": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "implementation": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    }
+  },
+  "status": "accepted",
+  "research": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Grouped vocabulary-row blocking",
+      "idea": "Partition the unchanged vocabulary matrix into twelve 4096-row panels. Process all speculative positions through each panel using the existing grouped singleton projection, completing one panel before starting the next. Concatenate the resulting logit blocks in vocabulary order and retain the original argmax.",
+      "cost_removed": "Targets repeated vocabulary-weight traffic by reducing the active weight working set from 56,623,104 to 4,718,592 bytes. If panels remain cached across positions, repeated backing-memory reads can fall substantially; the ideal saving is (m-1)*56,623,104 bytes for m positions. This is a traffic opportunity, not a measured saving. Arithmetic stays unchanged. Costs increase by eleven projection calls and one concatenation carrying at most 1,671,168 bytes of logits, with corresponding reads and writes.",
+      "source_evidence": "candidate/inference.py:235\u2013246 represents positions as independent M=1 products; lines 487\u2013490 apply that helper to the complete vocabulary matrix. Direct inspection of the pinned checkpoint confirms a tied BF16 matrix shaped [49152,576]. The inspected [GatherMM dispatch](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/matmul.cpp) selects identical parameters for 49152 and 4096 output rows: BM=8, BN=1, SM=1, SN=32, TM=4, TN=4. Both use the same [per-row arithmetic](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/kernels/gemv.h). Panel boundaries align with complete 32-row groups and preserve the 576-element contraction and weight leading dimension. This supports arithmetic equivalence; native parity remains to be validated.",
+      "generalization": "Panel blocking is a portable memory-locality transformation using ordinary views, grouped matrix-vector products, and concatenation. It can matter for large vocabulary heads and vocabulary shards, especially when the head represents a substantial fraction of active model traffic. Benefits require useful reuse in a faster memory tier; no custom kernels, compiler changes, or particular accelerator are required.",
+      "risk": "The current grouped head may already reuse weights sufficiently, or extra calls and assembly may outweigh traffic savings. Panel residency is not guaranteed. Numerical equivalence requires preserving layouts, reduction geometry, and BF16 conversion; unchanged contraction length alone is insufficient.",
+      "history_relation": "Round 0007 actually tested scalar panel blocking and achieved only 1.011x. Its overhead was eleven additional projection calls per position. Round 0017 subsequently supplied grouped singleton projections, reducing that overhead to eleven calls per block and permitting one block concatenation instead of separate per-position assemblies. This materially changes the tested tradeoff. Round 0003's disabled certified batching remains unresolved; this experiment needs no approximate arithmetic or certificate."
+    },
+    "plan": "1. Modify only candidate/. Enable panel blocking exclusively within the currently supported grouped verifier for m=3 through 17. Preserve all transformer operations, drafting, prefill, scalar pipelining, acceptance, rollback, and shared model objects. An independent head gate must fall back to the current complete grouped head without disabling other accepted optimizations.\n\n2. Freeze panel width at 4096 before evaluation. Create twelve immutable row-slice views of the original head, preferably once per request at its first eligible verification. Preserve BF16 storage and the transposed weight strides; do not replicate weights or materialize a contiguous transpose.\n\n3. After the existing final normalization, invoke _grouped_project once per panel with the existing position indices and zero weight indices. Keep M=1 and sorted_indices=False. Gate each consumed activation block on the preceding complete panel output, enforcing panel order without host synchronization. Every result has shape [1,m,4096].\n\n4. After the final panel completes, concatenate all twelve outputs along the vocabulary axis into [1,m,49152]. Gate assembly on final-panel completion so copies do not interrupt panel reuse. Apply the existing singleton splits and argmax operations. Materialize all predictions before the unchanged acceptance and cache trimming. Include views, dependencies, assembly, and cleanup inside timed decode.\n\n5. Extend native differential checks to compare complete BF16 logits against both the current grouped head and original singleton head for every m=3\u201317 and every panel offset. Cover independent random inputs, cancellation, BF16 rounding boundaries, zero inputs, and ties spanning panels. Check storage sharing and phase dependencies. Reuse trajectory, retained-KV, rejection, scalar-transition, budget, and request-isolation checks. Active blocks should record twelve head projections and 222 total grouped projections, versus the current 211. Numerical discrepancies must be resolved before enabling affected cases.\n\n6. Have the orchestrator run unchanged exact-token evaluation and both throughput confirmations against the current best. Record active panel execution and retain only exact output with at least 1.03x incremental gain twice. Do not adjust panel width or eligibility from benchmark prompts or results.",
+    "reason": "The grouped primitive removes most of the overhead burden present in the earlier unsuccessful blocking experiment. The remaining full-head operation exposes substantial potential weight reuse, with a concrete per-row equivalence argument and a small implementation. Net throughput is genuinely uncertain and warrants evaluation."
+  },
+  "review": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Grouped vocabulary-row blocking",
+      "idea": "Partition the unchanged tied vocabulary matrix into twelve 4096-row views. Run the existing grouped singleton projection across all speculative positions for each panel, completing that panel before starting the next. Assemble full logits in vocabulary order and retain the existing singleton argmax.",
+      "cost_removed": "Reduces the active weight working set from 56,623,104 to 4,718,592 bytes. If full-head accesses miss and panels remain cached across positions, ideal avoided backing-memory traffic is (m-1)*56,623,104 bytes. This is conditional, not measured. Arithmetic is unchanged. Costs include eleven additional grouped projections per block, allocations, dependencies, repeated activation reads, and concatenation. At m=17, assembly requires another 1,671,168-byte logit buffer and 3,342,336 bytes of copy reads and writes.",
+      "source_evidence": "Verified the current grouped helper and complete-head call in [candidate/inference.py](candidate/inference.py:235), installed MLX 0.32.3, and the pinned checkpoint's tied BF16 [49152,576] matrix. With explicit indices, sorted_indices=False and M=1, the [dispatch](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/matmul.cpp) selects gathered GEMV with BM=8, BN=1, SM=1, SN=32, TM=4, TN=4 for both widths. The [GEMV arithmetic](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/kernels/gemv.h) preserves each row's contraction, float reduction and BF16 conversion. Panel offsets preserve 32-row grouping, matrix leading dimension 576, and the contraction tail; neither output width has a partial row group.",
+      "generalization": "Output-row blocking shortens weight reuse distance using ordinary views and grouped matrix-vector products. It can apply to large vocabulary heads and vocabulary shards when panels plus intervening data fit a faster memory tier. Other model sizes require separately justified panel sizes and arithmetic support. The runtime audit supports correctness; the proposed performance mechanism is portable memory locality.",
+      "risk": "The complete grouped head may already reuse weights effectively. Additional calls, allocations and assembly may outweigh any traffic saving. Panels are not guaranteed to remain cached. Incorrect dependency placement can defeat panel ordering, and unaudited layouts or dispatch paths can change arithmetic.",
+      "history_relation": "Round 0007 passed exact evaluation but achieved confirmation gains of 1.079x and 1.011x, failing the required threshold twice. It added eleven calls per position. Round 0017 subsequently reduced the proposed overhead to eleven calls per block, with one block assembly. This materially changes the tradeoff. Round 0003's certified batching remained disabled and does not resolve this mechanism."
+    },
+    "plan": "1. Modify only candidate/. Change the grouped verifier's final head phase and its checks. Preserve transformer computation, drafting, prefill, scalar pipelining, acceptance, rollback and budgets. Do not mutate shared model parameters, module bindings or execution settings.\n\n2. Freeze panel width at 4096. Enable only for existing grouped blocks with m=3 through 17, the ordinary tied BF16 [49152,576] head, BF16 normalized [1,m,576] activations, and the audited native runtime/layout path. Add an independent head gate; failure must retain the current complete grouped head without disabling other accepted optimizations. Unsupported runtimes retain that fallback.\n\n3. Create twelve immutable row-slice views during the first eligible verification of each request. Preserve native contiguous weight rows and their transposed strides. Reuse _grouped_project, whose contiguous operation must be storage-preserving for these native views. Do not replicate weights, cast operands, materialize a contiguous transpose, or replace gathered singleton products with ordinary batched GEMM.\n\n4. After the unchanged final normalization, invoke the existing counted group wrapper once per panel, reusing uint32 arange(m) position indices and zero weight indices with sorted_indices=False. The first consumed activation depends on normalization; each subsequent consumed activation must depend on the preceding complete [1,m,4096] output. Dependencies attached only after projection are insufficient. Keep every panel's outputs until assembly, without host synchronization between panels.\n\n5. Gate every concatenation input on the final complete panel output, then concatenate once along the vocabulary axis into [1,m,49152]. Apply the existing _rows and argmax operations. Preserve joint prediction materialization before acceptance and KV trimming. Charge view construction, projections, dependencies, assembly and temporary cleanup to decode; clear the new request-local view state before returning. Cache no logits or generated-state computation across requests.\n\n6. Extend native differential checks for every m=3 through 17 and all twelve offsets. Compare complete BF16 logit bit patterns against both the current complete grouped head and original singleton head. Use target weights, independent synthetic weights and inputs, and model-derived normalized states; cover cancellation, varied magnitudes, rounding boundaries, zeros and ties spanning panels. Verify weight storage sharing, consumed-input dependencies and assembly barriers outside timing. An unexplained discrepancy blocks activation; sampled agreement or empirical margins cannot replace the arithmetic argument.\n\n7. Add a head-only fallback comparison with identical transformer gates. Preserve existing attention/rotary comparisons and trajectory, retained-KV, rejection, scalar-transition, capacity, budget and request-isolation checks. Update existing 211-call assertions conditionally: an active panel block makes twelve head calls and 222 total grouped projections; a complete-head grouped block makes 211. Disabling attention or rotary alone must not disable eligible panel blocking. Record request-local activation counters without hot-path logging.\n\n8. Have the orchestrator run native validation, unchanged exact-token evaluation and both throughput confirmations against the current best. Confirm actual panel execution; a disabled path does not test the experiment. Retain only exact output with at least 1.03x incremental gain in both confirmations. Do not tune panel width or eligibility using benchmark prompts or results.",
+    "reason": "No fundamental flaw was found. Independent in-memory checks using the existing helper passed 180 panel-layout checks, 360 dependency checks and 150 shared-row checks across all fifteen block sizes. These establish bookkeeping only; native BF16 checks were unavailable because this sandbox cannot access Metal. The revised specification clarifies eligibility, assembly dependencies, memory costs and test baselines. Throughput remains an experimental question."
+  },
+  "implementation": {
+    "outcome": "implemented",
+    "summary": "Implemented twelve-panel grouped vocabulary projection with independent runtime/layout gating, ordered dependencies, request-local views and cleanup, activation counters, and extended native differential/fallback checks. Only candidate/ changed. Python compilation and diff checks passed; native validation could not run because Metal is unavailable here."
+  },
+  "eval": {
+    "correct": true,
+    "cases": [
+      {
+        "prompt": "Explain why the sky is blue.",
+        "correct": true
+      },
+      {
+        "prompt": "Write a short Python function that reverses a list.",
+        "correct": true
+      },
+      {
+        "prompt": "What are the main causes of inflation?",
+        "correct": true
+      },
+      {
+        "prompt": "Describe how photosynthesis works.",
+        "correct": true
+      },
+      {
+        "prompt": "Continue this story: The door opened and nobody was there.",
+        "correct": true
+      },
+      {
+        "prompt": "<benchmark>",
+        "correct": true
+      }
+    ]
+  },
+  "confirmations": [
+    {
+      "baseline_relative_decode_speed": 2.37519751628741,
+      "candidate_relative_decode_speed": 2.628990048240846,
+      "gain": 1.1068511272065198
+    },
+    {
+      "baseline_relative_decode_speed": 2.381901241604182,
+      "candidate_relative_decode_speed": 2.6331350009382812,
+      "gain": 1.1054761444118044
+    }
+  ],
+  "confirmed_gain": 1.1054761444118044,
+  "reason": "decode gain confirmed twice at >= 1.03x"
+}

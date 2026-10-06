@@ -1,0 +1,420 @@
+diff --git a/candidate/checks.py b/candidate/checks.py
+index f03cc19..487774a 100644
+--- a/candidate/checks.py
++++ b/candidate/checks.py
+@@ -81,6 +81,155 @@ def _projection_checks(model):
+                     deps = [grouped]
+ 
+ 
++def _head_compare(weight, x, panelled, label):
++    m = x.shape[1]
++    lhs = mx.arange(m, dtype=mx.uint32)
++    rhs = mx.zeros((m,), dtype=mx.uint32)
++    complete = ci._grouped_project(weight, x, [x], lhs, rhs)
++    _equal(panelled, complete, label + "/complete")
++    singleton = ci._project(lambda t: t @ weight.T, ci._rows(x), [x])
++    for i, row in enumerate(ci._rows(panelled)):
++        _equal(row, singleton[i], label + f"/singleton/row{i}")
++
++
++def _head_storage(weight, panels):
++    native = np.asarray(weight.view(mx.uint16), copy=False)
++    assert native.strides == (1152, 2)
++    for i, panel in enumerate(panels):
++        row = np.asarray(panel.view(mx.uint16), copy=False)
++        contiguous = np.asarray(mx.contiguous(panel).view(mx.uint16), copy=False)
++        transpose = np.asarray(mx.contiguous(panel).T[None].view(mx.uint16), copy=False)
++        address = native.ctypes.data + i * 4096 * 1152
++        assert row.shape == (4096, 576) and row.strides == (1152, 2)
++        assert row.ctypes.data == contiguous.ctypes.data == transpose.ctypes.data == address
++        assert np.shares_memory(native, row) and np.shares_memory(row, contiguous)
++        assert transpose.strides[-2:] == (2, 1152)
++
++
++def _head_checks(model):
++    """All widths/offsets, complete bits, storage and consumed-input barriers."""
++    assert ci._head_supported(model), "Native head audit must exercise panels"
++    target = model.model.embed_tokens.weight
++    j = mx.arange(576, dtype=mx.float32)
++    r = mx.arange(49152, dtype=mx.float32)[:, None]
++    cancellation = ((j // 2 % 7 - 3)[None] + (r % 5) / 8).astype(mx.bfloat16)
++    boundary = (1 + ((r + j[None]) % 5 - 2) / 256
++                + ((r + j[None]) % 3 - 1) / 262144).astype(mx.bfloat16)
++    # Identical rows span every panel; all logits tie for zero inputs too.
++    tied = mx.broadcast_to((j % 7 - 3)[None], target.shape)
++    tied = mx.contiguous(tied.astype(mx.bfloat16))
++    for weight in (target, cancellation, boundary, tied):
++        _head_storage(weight, ci._head_views(weight))
++    for m in range(3, 18):
++        positions = mx.arange(m, dtype=mx.float32)[:, None]
++        base = mx.random.normal((1, m, 576), key=mx.random.key(1901 + m))
++        cases = ((target, base), (target, base * 1e-4), (target, base * 1000),
++                 (cancellation, ((j % 2 * 2 - 1)[None] * (1 + positions / 16))[None]),
++                 (boundary, (1 + ((j[None] + positions) % 5 - 2) / 256
++                             + ((j[None] + positions) % 3 - 1) / 262144)[None]),
++                 (target, mx.zeros((1, m, 576))), (tied, base))
++        lhs = mx.arange(m, dtype=mx.uint32)
++        rhs = mx.zeros((m,), dtype=mx.uint32)
++        for case, (weight, inputs) in enumerate(cases):
++            x = mx.contiguous(inputs.astype(mx.bfloat16))
++            panels = ci._head_views(weight)
++            outputs, gated, products, assemblies = [], [], [], []
++            depends, gather, concatenate = mx.depends, mx.gather_mm, mx.concatenate
++
++            def checked_depends(a, deps):
++                if isinstance(a, list):
++                    assert len(outputs) == 12 and len(a) == 12
++                    assert all(v is out for v, out in zip(a, outputs))
++                    assert len(deps) == 1 and deps[0] is outputs[-1]
++                    ready = depends(a, deps)
++                    assemblies.extend(ready)
++                    return ready
++                assert a.shape == (1, m, 576)
++                assert len(deps) == 1 and deps[0] is (outputs[-1] if outputs else x)
++                result = depends(a, deps)
++                # A check-only copy gives the gated return distinct storage;
++                # ignoring that return cannot pass the consumed-input check.
++                result = mx.asarray(result, copy=True).reshape(m, 1, 576)
++                gated.append(result)
++                return result
++
++            def checked_gather(a, b, **kwargs):
++                assert len(gated) == len(outputs) + 1
++                av = np.asarray(a.view(mx.uint16), copy=False)
++                gv = np.asarray(gated[-1].view(mx.uint16), copy=False)
++                assert av.ctypes.data == gv.ctypes.data and np.shares_memory(av, gv), \
++                    "projection must consume the gated activation"
++                assert b.shape == (1, 576, 4096)
++                assert kwargs["lhs_indices"] is lhs and kwargs["rhs_indices"] is rhs
++                assert kwargs["sorted_indices"] is False
++                products.append(a)
++                return gather(a, b, **kwargs)
++
++            def group(w, block, deps):
++                assert w is panels[len(outputs)] and block is x
++                out = ci._grouped_project(w, block, deps, lhs, rhs)
++                assert out.shape == (1, m, 4096)
++                outputs.append(out)
++                return out
++
++            def checked_concatenate(a, axis=0):
++                assert axis == -1 and len(assemblies) == 12
++                assert all(v is barrier for v, barrier in zip(a, assemblies))
++                return concatenate(a, axis=axis)
++
++            with patch.object(mx, "depends", checked_depends), \
++                 patch.object(mx, "gather_mm", checked_gather), \
++                 patch.object(mx, "concatenate", checked_concatenate):
++                result = ci._panel_head(panels, x, group)
++            assert len(products) == len(outputs) == 12
++            _head_compare(weight, x, result, f"panels/m{m}/case{case}")
++            if case in (5, 6):
++                assert mx.all(mx.argmax(result, axis=-1) == 0).item(), "cross-panel tie order"
++
++
++def _projection_counts(cache):
++    blocks = cache.stats["grouped_blocks"]
++    panels = cache.stats["panel_head_blocks"]
++    assert cache.stats["grouped_projection_calls"] == 211 * blocks + 11 * panels
++    assert cache.stats["panel_head_calls"] == 12 * panels
++    if blocks and cache.head_eligible:
++        assert panels == blocks, "eligible panels were not exercised"
++
++
++def _head_gate_checks(model, base, pending):
++    assert ci._head_supported(model)
++    with patch.object(ci, "_HEAD_RUNTIME", False):
++        assert not ci._head_supported(model)
++        assert ci._grouped_supported(model, base)
++    with patch.object(mx, "default_device", return_value=mx.Device(mx.cpu)):
++        assert not ci._head_supported(model)
++    embedding = model.model.embed_tokens
++    weight = embedding.weight
++    for unsupported in (weight.T, weight.astype(mx.float32),
++                        mx.contiguous(weight.T).T):
++        with patch.object(embedding, "weight", unsupported):
++            assert not ci._head_supported(model)
++    # Exercise a failed independent gate, with identical transformer gates.
++    g, r = _clone(model, base), _clone(model, base)
++    for cache in (g, r):
++        cache.append_token(pending.item())
++    gt, rt = [], []
++    tokens = [pending.reshape(1, 1)] * 3
++    gp = ci._verify(model, g, tokens, _trace=gt)
++    with patch.object(ci, "_HEAD_RUNTIME", False):
++        rp = ci._verify(model, r, tokens, _trace=rt)
++    mx.eval(*gp, *rp)
++    assert g.stats["panel_head_blocks"] == 1 and r.stats["panel_head_blocks"] == 0
++    assert r.head_eligible is False and r.head_panels is None
++    _projection_counts(g)
++    _projection_counts(r)
++    for (name, a), (other, b) in zip(gt, rt):
++        assert name == other and len(a) == len(b)
++        for i, (x, y) in enumerate(zip(a, b)):
++            _equal(x, y, f"head gate fallback/{name}/row{i}")
++    _prefixes(g, r, "head gate fallback")
++
++
+ def _rotary_checks(model):
+     """Isolate vector dispatch from the verifier, including int32 endpoints."""
+     rope = model.layers[0].self_attn.rope
+@@ -289,11 +438,13 @@ def _verification_checks(model, base, pending, sizes=range(3, 18), transitions=T
+         tokens = [pending.reshape(1, 1)] + [mx.array([[31 + 13 * i]]) for i in range(m - 1)]
+         for capacity in (max(base[0].keys.shape[2], base[0].offset + m), base[0].offset + m,
+                          (base[0].offset + m + 7, base[0].offset + m)):
+-            grouped, previous, reference = [_clone(model, base, capacity) for _ in range(3)]
++            grouped, previous, head_fallback, reference = [_clone(model, base, capacity) for _ in range(4)]
+             grouped.append_token(pending.item())
+             previous.append_token(pending.item())
++            head_fallback.append_token(pending.item())
++            head_fallback.head_eligible = False
+             previous.attention_eligible = False
+-            gt, pt = [], []
++            gt, pt, ht = [], [], []
+             rope_call = nn.RoPE.__call__
+             offsets = {}
+ 
+@@ -306,15 +457,31 @@ def _verification_checks(model, base, pending, sizes=range(3, 18), transitions=T
+                 offsets[id(module)] = i + 1
+                 return rope_call(module, x, offset=offset)
+ 
+-            with patch.object(nn.RoPE, "__call__", grouped_rope):
++            panel_head = ci._panel_head
++
++            def model_head(panels, norm, group):
++                result = panel_head(panels, norm, group)
++                _head_compare(model.model.embed_tokens.weight, norm, result,
++                              f"model-derived/m{m}/capacity{capacity}")
++                return result
++
++            with patch.object(nn.RoPE, "__call__", grouped_rope), \
++                 patch.object(ci, "_panel_head", model_head):
+                 gp = ci._verify(model, grouped, tokens, _trace=gt)
+             assert len(offsets) == 30 and all(n == 2 for n in offsets.values())
+             assert grouped.stats["rotary_blocks"] == 1
+             assert grouped.stats["grouped_rotary_calls"] == 60
+             pp = ci._verify(model, previous, tokens, _trace=pt)
+-            mx.eval(*gp, *pp)
+-            assert grouped.stats["grouped_projection_calls"] == 211
+-            assert previous.stats["grouped_projection_calls"] == 211
++            hp = ci._verify(model, head_fallback, tokens, _trace=ht)
++            mx.eval(*gp, *pp, *hp)
++            _projection_counts(grouped)
++            _projection_counts(previous)
++            _projection_counts(head_fallback)
++            assert grouped.stats["panel_head_blocks"] == previous.stats["panel_head_blocks"] == 1
++            assert head_fallback.stats["panel_head_blocks"] == 0
++            assert head_fallback.head_panels is None
++            for name in ("attention_calls", "causal_chunks", "grouped_rotary_calls"):
++                assert grouped.stats[name] == head_fallback.stats[name], name
+             assert previous.stats["rotary_blocks"] == 1
+             assert previous.stats["grouped_rotary_calls"] == 60
+             schedule = ci._attention_schedule(base[0].offset, m)
+@@ -324,16 +491,18 @@ def _verification_checks(model, base, pending, sizes=range(3, 18), transitions=T
+             assert grouped.stats["causal_chunks"] == 30 * sum(hi - lo > 1 for lo, hi in schedule)
+             assert previous.stats["attention_calls"] == 30 * m
+             assert previous.stats["attention_blocks"] == previous.stats["causal_chunks"] == 0
+-            gd, pd = _trace_dict(gt), _trace_dict(pt)
++            gd, pd, hd = _trace_dict(gt), _trace_dict(pt), _trace_dict(ht)
+             rd = _reference_trace(model, reference, tokens)
+-            assert gd.keys() == pd.keys() == rd.keys()
++            assert gd.keys() == pd.keys() == hd.keys() == rd.keys()
+             for key in gd:
+                 assert len(gd[key]) == len(pd[key]) == len(rd[key]) == m, key
+                 for row, (g, p, r) in enumerate(zip(gd[key], pd[key], rd[key])):
+                     label = f"verifier/m{m}/capacity{capacity}/{key}/row{row}"
+                     _equal(g, p, label + "/previous")
+                     _equal(g, r, label + "/reference")
++                    _equal(g, hd[key][row], label + "/head-only fallback")
+             _prefixes(grouped, previous, "previous verifier")
++            _prefixes(grouped, head_fallback, "head-only fallback verifier")
+             _prefixes(grouped, reference, "singleton reference")
+             untraced = _clone(model, base, capacity)
+             untraced.append_token(pending.item())
+@@ -392,7 +561,8 @@ def _attention_gate_checks(model, base, pending):
+     mx.eval(*predictions)
+     for i, (a, b) in enumerate(zip(dict(trace)["logits"], ref)):
+         _equal(a, b, f"attention-only fallback/row{i}")
+-    assert g.stats["grouped_projection_calls"] == 211
++    _projection_counts(g)
++    assert g.stats["panel_head_blocks"] == 1
+     assert g.stats["grouped_rotary_calls"] == 60
+     assert g.stats["attention_blocks"] == g.stats["causal_chunks"] == 0
+     assert g.stats["attention_calls"] == 90
+@@ -440,7 +610,9 @@ def _decode_checks(model, base, pending):
+         assert cache.stats["attention_calls"] == 90
+         assert cache.stats["causal_chunks"] == 60
+         assert cache.stats["grouped_positions"] == 17
+-        assert cache.stats["grouped_projection_calls"] == 211
++        _projection_counts(cache)
++        assert cache.stats["panel_head_blocks"] == cache.stats["panel_view_sets"] == 1
++        assert cache.head_panels is None
+         assert cache.stats["rotary_blocks"] == 1
+         assert cache.stats["grouped_rotary_calls"] == 60
+         assert all(kv.offset == base[0].offset + 23 for kv in cache)
+@@ -463,6 +635,9 @@ def _decode_checks(model, base, pending):
+     assert cache.stats["attention_calls"] == 60
+     assert cache.stats["rotary_blocks"] == 2
+     assert cache.stats["grouped_rotary_calls"] == 120
++    _projection_counts(cache)
++    assert cache.stats["panel_head_blocks"] == 2 and cache.stats["panel_view_sets"] == 1
++    assert cache.head_panels is None
+     _prefixes(cache, oracle_cache, "consecutive blocks then scalar growth")
+ 
+     # A rotary-only gate failure must leave accepted projection grouping on.
+@@ -478,7 +653,8 @@ def _decode_checks(model, base, pending):
+     assert len(logits) == len(ref) == 3
+     for i in range(3):
+         _equal(logits[i], ref[i], f"rotary-only fallback/row{i}")
+-    assert g.stats["grouped_projection_calls"] == 211
++    _projection_counts(g)
++    assert g.stats["panel_head_blocks"] == 1
+     assert g.stats["rotary_blocks"] == g.stats["grouped_rotary_calls"] == 0
+     _prefixes(g, r, "rotary-only fallback")
+ 
+@@ -543,6 +719,8 @@ def check_grouped(model):
+     _attention_checks(model)
+     _rotary_checks(model)
+     _projection_checks(model)
++    _head_checks(model)
++    _head_gate_checks(model, base, pending)
+     _verification_checks(model, base, pending)
+     _decode_checks(model, base, pending)
+     # Real model prefixes exercise short vector boundaries and unchanged
+@@ -557,8 +735,10 @@ def check_grouped(model):
+     assert second.stats["grouped_blocks"] == second.stats["grouped_projection_calls"] == 0
+     assert second.grouped_eligible is None and second.rotary_eligible is None
+     assert second.attention_eligible is None
++    assert second.head_eligible is None and second.head_panels is None
++    assert second.stats["panel_head_blocks"] == second.stats["panel_view_sets"] == 0
+     assert second.stats["attention_blocks"] == second.stats["attention_calls"] == 0
+     assert second.stats["rotary_blocks"] == second.stats["grouped_rotary_calls"] == 0
+     assert second.index is not base.index and second.history is not base.history
+     _prefixes(base, second, "independent request")
+-    print("Native causal attention, grouped rotary/projections, intermediates, logits, KV and transitions passed.")
++    print("Native panel heads, causal attention, grouped rotary/projections, logits, KV and transitions passed.")
+diff --git a/candidate/inference.py b/candidate/inference.py
+index d604352..0d57b7c 100644
+--- a/candidate/inference.py
++++ b/candidate/inference.py
+@@ -1,5 +1,6 @@
+ import mlx.core as mx
+ import mlx.nn as nn
++from importlib.metadata import version
+ from mlx_lm.models.cache import KVCache, make_prompt_cache
+ from mlx_lm.models import llama
+ 
+@@ -7,6 +8,8 @@ from mlx_lm.models import llama
+ MAX_CONTEXT = 16
+ MAX_DRAFTS = 16
+ INDEX_CONTEXT = MAX_CONTEXT + MAX_DRAFTS - 1
++HEAD_PANEL_ROWS = 4096
++_HEAD_RUNTIME = version("mlx") == "0.32.3"
+ 
+ 
+ class _Successors:
+@@ -36,6 +39,8 @@ class RequestCache(list):
+         self.grouped_eligible = None
+         self.rotary_eligible = None
+         self.attention_eligible = None
++        self.head_eligible = None
++        self.head_panels = None
+         self.stats = {
+             "scalar_steps": 0,
+             "verifications": 0,
+@@ -46,6 +51,10 @@ class RequestCache(list):
+             "grouped_blocks": 0,
+             "grouped_positions": 0,
+             "grouped_projection_calls": 0,
++            "panel_head_blocks": 0,
++            "panel_head_positions": 0,
++            "panel_head_calls": 0,
++            "panel_view_sets": 0,
+             "attention_blocks": 0,
+             "attention_calls": 0,
+             "causal_chunks": 0,
+@@ -246,6 +255,45 @@ def _grouped_project(weight, block, dependencies, lhs_indices, rhs_indices):
+                         sorted_indices=False).reshape(1, m, weight.shape[0])
+ 
+ 
++def _head_supported(model):
++    """Independent gate for the audited native gathered-GEMV row layout.
++
++    At both output widths the audited runtime uses the same singleton GEMV
++    contraction/reduction/BF16 conversion. 4096-row offsets preserve its
++    32-row groups and K=576 tail; neither width has a partial row group.
++    This is a correctness restriction, not the source of the locality gain.
++    """
++    if (not _HEAD_RUNTIME or mx.default_device().type != mx.gpu
++            or not mx.metal.is_available() or not model.args.tie_word_embeddings
++            or type(model.model.embed_tokens) is not nn.Embedding):
++        return False
++    weight = model.model.embed_tokens.weight
++    if weight.dtype != mx.bfloat16 or weight.shape != (49152, 576):
++        return False
++    # The buffer protocol exposes native strides without copying or casting.
++    # Only the already-loaded weight is inspected, once per request; no
++    # generated activation is synchronized to inspect its layout.
++    with memoryview(weight) as view:
++        return view.strides == (1152, 2)
++
++
++def _head_views(weight):
++    return tuple(weight[lo:lo + HEAD_PANEL_ROWS]
++                 for lo in range(0, 49152, HEAD_PANEL_ROWS))
++
++
++def _panel_head(panels, norm_block, group):
++    outputs = []
++    for panel in panels:
++        # group gates the consumed activation, before projection, on the
++        # preceding complete panel. No host synchronization between panels.
++        deps = [outputs[-1]] if outputs else [norm_block]
++        outputs.append(group(panel, norm_block, deps))
++    # Prevent assembly reads from interleaving with the panel working sets.
++    ready = mx.depends(outputs, [outputs[-1]])
++    return mx.concatenate(ready, axis=-1)
++
++
+ def _rows(block):
+     # Native row operations produce contiguous blocks. Enforce that contract
+     # without copying suitable storage; split keeps the reduction stride at 1
+@@ -487,7 +535,22 @@ def _verify(model, cache, tokens, *, _trace=None):
+     head = body.embed_tokens.as_linear if model.args.tie_word_embeddings else model.lm_head
+     if grouped:
+         norm_block = body.norm(x_block)
+-        logits = _rows(group(body.embed_tokens.weight, norm_block, [norm_block]))
++        if cache.head_eligible is None:
++            cache.head_eligible = _head_supported(model)
++        panelled = (cache.head_eligible and 3 <= len(tokens) <= 17
++                    and norm_block.dtype == mx.bfloat16
++                    and norm_block.shape == (1, len(tokens), 576))
++        if panelled:
++            if cache.head_panels is None:
++                cache.head_panels = _head_views(body.embed_tokens.weight)
++                cache.stats["panel_view_sets"] += 1
++            logit_block = _panel_head(cache.head_panels, norm_block, group)
++            cache.stats["panel_head_blocks"] += 1
++            cache.stats["panel_head_positions"] += len(tokens)
++            cache.stats["panel_head_calls"] += 12
++        else:
++            logit_block = group(body.embed_tokens.weight, norm_block, [norm_block])
++        logits = _rows(logit_block)
+     else:
+         if batched:
+             norm = _rows(body.norm(x_block))
+@@ -500,6 +563,14 @@ def _verify(model, cache, tokens, *, _trace=None):
+ 
+ 
+ def decode(model, first_token, cache, max_new_tokens):
++    try:
++        return _decode(model, first_token, cache, max_new_tokens)
++    finally:
++        if isinstance(cache, RequestCache):
++            cache.head_panels = None
++
++
++def _decode(model, first_token, cache, max_new_tokens):
+     if max_new_tokens < 1:
+         return []
+ 
