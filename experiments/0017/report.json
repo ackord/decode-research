@@ -1,0 +1,94 @@
+{
+  "round": "0017",
+  "parent_commit": "ee3ae23facb336893ce463665128f79de5a85d92",
+  "models": {
+    "research": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "review": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "implementation": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    }
+  },
+  "status": "accepted",
+  "research": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Grouped singleton projections for speculative verification",
+      "idea": "Execute each projection across speculative positions as one batch of independent matrix-vector products, preserving each singleton\u2019s reduction arithmetic. Keep activations in contiguous blocks between projections and the already-batched row operations. Retain singleton RoPE, causal attention, bulk KV insertion, drafting, and acceptance.",
+      "cost_removed": "For m verification positions, reduce dense-projection calls from 211m to 211: at m=17, 3,587 calls become 211. Returning projection outputs directly as blocks also removes four concatenations per layer while adding one to pack attention outputs. This eliminates 90 concatenation operations and 3,720,960 bytes of copied BF16 payload per maximum-length block. Projection FLOPs remain unchanged; reduced weight traffic is possible but not guaranteed.",
+      "source_evidence": "candidate/inference.py:_project invokes each projection separately for every position. _verify uses it for seven projections per layer and the vocabulary head; its batched branch then concatenates output, gate, up, and down projections. The pinned checkpoint header confirms 30 layers and BF16 weight shapes (576,576), (192,576), (1536,576), (576,1536), and (49152,576). MLX 0.32.3 provides matrix-level indexing through [gather_mm](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.gather_mm.html). With explicit indices, sorted_indices=False, and M=1, its [dispatch](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/matmul.cpp) selects gathered GEMV. For every target shape, scalar and gathered paths select identical reduction parameters and invoke the same [GEMVKernel arithmetic](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/kernels/gemv.h); gathering changes operand addresses, not the inner calculation. This supports numerical equivalence but does not replace native validation.",
+      "generalization": "Batching independent matrix-vector operations removes repeated invocation and allocation work without changing model arithmetic or requiring custom kernels. Comparable grouped operations exist in [oneMKL](https://www.intel.com/content/www/us/en/docs/onemkl/developer-reference-dpcpp/2024-0/gemv-batch.html). The mechanism can help exact speculative verification in deep models, tensor-parallel shards, and small expert workloads. Other implementations require their own numerical audit; benefits diminish when weight bandwidth dominates.",
+      "risk": "Incorrect layouts or dispatch eligibility could change reductions and retained KV. Indexing overhead, attention packing, and concurrent weight reads could offset the invocation savings. Ordinary broadcasted matmul is unsuitable because it can collapse positions into a different reduction path. Native parity and throughput remain untested: this research environment cannot initialize MLX\u2019s Metal device.",
+      "history_relation": "Builds directly on round 0016\u2019s contiguous activation blocks while preserving accepted scheduling, drafting, and KV improvements. Round 0001 failed with general block verification; this proposal preserves singleton matrix problems and attention. Round 0005 packed different projections within a token, whereas this groups positions using unchanged matrices. Round 0003 never enabled its certified head path; this requires no interval certification. Round 0007 added vocabulary panels and calls; this retains the complete head and reduces calls."
+    },
+    "plan": "1. Implement only inside candidate/. Enable the new path only for existing eligible batched verification blocks, m=3 through 17, with audited native BF16, bias-free projections and compatible layouts. Keep the current verifier as the fallback selected before cache mutation. Preserve prefill, scalar pipelining, drafting constants, and shared model objects.\n\n2. Add a grouped projection helper. Reshape contiguous X=[1,m,K] to [m,1,K], and view the unchanged weight transpose as [1,K,N]. Call mx.gather_mm with lhs_indices=arange(m), rhs_indices=zeros(m), both uint32, and sorted_indices=False. Reshape its [m,1,N] result to [1,m,N]. Reuse the two index arrays throughout the block. Do not replicate weights, use ordinary broadcasted matmul, or introduce compilation wrappers.\n\n3. Keep normalized activations as blocks. Execute grouped Q, K, and V projections in the existing phase order, gating consumed inputs on preceding phase outputs. Split their outputs into native singleton views for the unchanged RoPE, bulk KV append, and sequential causal attention. Pack attention outputs once per layer for grouped output projection. Feed its block directly into the existing residual and normalization operations. Likewise, grouped gate/up outputs feed the original batched SwiGLU directly, and grouped down output feeds the residual without concatenation. Group the full vocabulary projection after final normalization; retain the original per-position argmax operation and tie behavior.\n\n4. Preserve completion dependencies, cache capacity, and singleton attention prefixes. Materialize all predictions before acceptance and rollback. For k drafts and a accepted drafts, trim k-a entries, leaving offset C+1+a and the final emitted token pending. All generated-token work stays inside decode; retain fixed-length, zero/one-token, and independent-request semantics.\n\n5. Validate grouped versus original singleton projections bitwise across every target matrix shape and block length, including row offsets, cancellation, extreme finite values, and BF16 rounding boundaries. Compare intermediate activations, complete logits, and retained KV against the existing verifier on independent teacher-forced sequences. Exercise rejection, partial/full acceptance, subsequent scalar continuation, capacity boundaries, and fallback. Add request-local counters demonstrating active grouped execution. Numerical discrepancies must be resolved before enabling the path; sampled token agreement alone is insufficient.\n\n6. Freeze eligibility and implementation independently of benchmark prompts and results. Have the orchestrator run unchanged exact-token evaluation and both throughput confirmations against the current best. Keep only an incremental gain of at least 1.03x twice; record active-path status and numerical validation separately from performance.",
+    "reason": "This removes substantial, directly counted invocation and packing work throughout the verifier, with a concrete source-backed argument for preserving scalar reductions. Net throughput remains genuinely uncertain and merits evaluation."
+  },
+  "review": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Grouped singleton projections for speculative verification",
+      "idea": "Execute each projection across speculative positions as one batch of independent matrix-vector products with the original singleton reduction arithmetic. Return contiguous activation blocks directly to the existing batched row operations. Preserve singleton RoPE, causal attention, bulk KV insertion, drafting, acceptance, and scalar pipelining.",
+      "cost_removed": "For m positions, reduce dense-projection calls from 211m to 211: 3,587 become 211 at m=17. Remove four projection-output concatenations per layer and add one attention-output concatenation, eliminating 90 concatenations and 3,720,960 bytes of copied BF16 payload per maximum block. The inspected concatenation implementation copies each input separately, so this also removes 1,530 such input copies at m=17. These are operation and payload counts, not measured memory traffic. Projection FLOPs remain unchanged; reduced weight traffic is not guaranteed. Index creation, gathering, views, and remaining packing still cost work.",
+      "source_evidence": "Verified candidate/inference.py:_project and _verify, native bias-free Linear and Embedding.as_linear, installed MLX 0.32.3, and the pinned checkpoint: 30 layers with BF16 weight shapes (576,576), (192,576), (1536,576), (576,1536), and (49152,576). Explicit indices retain the GatherMM primitive in the [operation constructor](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/ops.cpp). With M=1 and sorted_indices=False, [dispatch](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/matmul.cpp) reaches gathered GEMV. For the intended layouts and all five shapes, scalar and gathered paths select identical reduction parameters: (BM,BN,SM,SN,TM,TN)=(4,1,1,32,4,4), with BM=8 for the vocabulary head. Both invoke the same [GEMVKernel arithmetic](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/kernels/gemv.h). This equivalence does not extend automatically to other shapes: scalar-only branches change geometry when K<=64 or K>=16N. The [concatenation source](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/slicing.cpp) confirms per-input copying.",
+      "generalization": "The portable mechanism is batching independent matrix-vector tasks and eliminating intermediate packing, reducing invocation, allocation, and scheduling work. Comparable grouped interfaces exist in [oneMKL gemv_batch](https://www.intel.com/content/www/us/en/docs/onemkl/developer-reference-dpcpp/2024-0/gemv-batch.html). This can matter for deep speculative verifiers and smaller tensor-parallel or expert projections. It requires no custom kernels, compiler changes, or target changes. Other implementations need separate numerical audits; their APIs do not establish BF16 parity. Benefits diminish when weight bandwidth or attention dominates.",
+      "risk": "A wrong transpose layout, changed reduction dispatch, shared-buffer lifetime error, or different downstream singleton layout could alter logits or retained KV. Gathering overhead and concurrent weight reads may offset invocation savings. The complete vocabulary output remains allocated. Source equivalence supports the experiment but does not establish native bitwise parity or throughput; both remain untested in this review.",
+      "history_relation": "Builds directly on round 0016 and preserves accepted projection-phase scheduling, drafting, pipelining, and bulk KV updates. Round 0001's block-verification failure makes numerical validation essential but does not resolve independent singleton grouping. Round 0005 packed different projections within one position. Round 0003 left its certified batching path disabled. Round 0007 increased calls through vocabulary panels. None tested this grouping mechanism."
+    },
+    "plan": "1. Implement only inside candidate/. Preserve public interfaces, prefill, shared model objects, drafting constants, and scalar decoding. Select the grouped path before any cache mutation, only for existing eligible batched blocks with m=3 through 17, drained scalar outputs, common offset C, and allocated capacity at least C+m. Add metadata-only eligibility for the audited native BF16, bias-free projection classes, exact target weight shapes, tied head, and layout contract. Unsupported cases retain the current verifier, including its existing row batching where eligible. Freeze eligibility independently of benchmark prompts and results.\n\n2. Add one grouped projection helper taking the unchanged weight W=[N,K], contiguous X=[1,m,K], preceding-phase dependencies, and two shared index arrays. Gate the consumed X on those dependencies, reshape it to [m,1,K], and use W.T[None] as [1,K,N]. Preserve the transpose view's final strides (1,K); do not materialize a contiguous W.T. Pass lhs_indices=arange(m) and rhs_indices=zeros(m), both uint32, with sorted_indices=False. Reshape the [m,1,N] output to [1,m,N]. Create the indices once per verification block and reuse them throughout it. Do not replicate weights, substitute ordinary broadcasted matmul, or add compilation wrappers.\n\n3. Keep normalized activations as blocks. Execute grouped Q, then K gated on Q, then V gated on K. Split their completed outputs into [1,1,N] views for the existing singleton reshapes and RoPE. Preserve row contiguity, feature stride, and every row offset through those operations. Grouping must not turn RoPE or attention into multi-position operations. Preserve functional array ownership; do not manually recycle shared output buffers.\n\n4. Retain singleton RoPE at explicit offsets C+i, one bulk KV update per layer, and the existing sequential singleton attentions against allocated-buffer prefixes ending at C+i+1. Each attention must depend on both updated buffers and the preceding attention result. Concatenate all attention outputs once along position, then apply the grouped output projection. Feed its block directly into the existing separate residual addition and post-attention normalization. Likewise, grouped gate and up projections feed the existing batched SwiGLU directly, followed by grouped down projection and the existing residual addition. Preserve phase barriers and every dtype and rounding boundary. Keep cache layout, allocation capacity, and causal-view construction unchanged.\n\n5. After the existing final normalization, group the complete tied vocabulary projection. Split its output into singleton logits and retain the original per-position argmax operation, shape, vocabulary order, and tie behavior. Materialize every prediction before acceptance or rollback. For k=m-1 drafts and a accepted drafts, emit drafts[:a] followed by prediction[a], trim k-a entries, and leave every cache at C+1+a with the final emitted token pending. Preserve fixed-length generation, zero/one-token requests, remaining-output limits, and scalar transitions.\n\n6. Keep generated-token work inside decode: eligibility checks, index construction, packing, projections, dependencies, transfers, counters, and cleanup. Add inexpensive request-local counters for grouped blocks, positions, and actual grouped projection calls. Do not retain request-derived tensors across requests or move speculative work into prefill. The harness already synchronizes before stopping its decode timer; add no alternate timing boundary or timed scalar recomputation for validation.\n\n7. Provide native differential checks inside candidate/. Compare grouped outputs bitwise with the existing singleton projection calls for all five matrix shapes, every m from 3 through 17, and every row offset. Use independent inputs covering cancellation, small and large finite magnitudes, and BF16 rounding boundaries. Exercise the actual helper layouts and dependencies, not merely equivalent dense products. Compare intermediate activations, complete logits, and valid KV prefixes against the current verifier and teacher-forced reference singleton execution. Check that grouped-output views retain the intended singleton RoPE path. Exercise every acceptance length, immediate rejection, full acceptance, subsequent scalar continuation, stale-tail overwrite, exact-capacity endings, later scalar growth, fallback, and independent requests. Investigate the first numerical discrepancy; matching token samples alone is insufficient. If native execution is unavailable locally, provide runnable checks and report validation as pending rather than treating the environment limitation as an experiment failure.\n\n8. Have the orchestrator perform authoritative numerical validation, unchanged exact-token evaluation, and both throughput confirmations against the current accepted candidate. Counters must demonstrate active grouped execution; a fallback-only run does not test the mechanism. Retain only exact output and an incremental gain of at least 1.03x in both confirmations. Record numerical validation, activation, and performance separately, without tuning from benchmark results.",
+    "reason": "No fundamental flaw was found. The review confirms the counted work reduction and source-level arithmetic match for the target, while narrowing eligibility because scalar and gathered dispatch differ outside that scope. Layout, dependency, and native validation requirements are now explicit. Performance remains genuinely uncertain and should be measured. No files were edited."
+  },
+  "implementation": {
+    "outcome": "implemented",
+    "summary": "Implemented grouped singleton projections in candidate/inference.py, preserving scalar fallback, singleton attention, and acceptance behavior. Added activation counters and runnable differential checks via candidate.inference.check_grouped(model). Syntax and diff checks passed. Native numerical validation remains pending because MLX cannot access a Metal device locally; authoritative evaluation and benchmarking remain with the orchestrator."
+  },
+  "eval": {
+    "correct": true,
+    "cases": [
+      {
+        "prompt": "Explain why the sky is blue.",
+        "correct": true
+      },
+      {
+        "prompt": "Write a short Python function that reverses a list.",
+        "correct": true
+      },
+      {
+        "prompt": "What are the main causes of inflation?",
+        "correct": true
+      },
+      {
+        "prompt": "Describe how photosynthesis works.",
+        "correct": true
+      },
+      {
+        "prompt": "Continue this story: The door opened and nobody was there.",
+        "correct": true
+      },
+      {
+        "prompt": "<benchmark>",
+        "correct": true
+      }
+    ]
+  },
+  "confirmations": [
+    {
+      "baseline_relative_decode_speed": 1.9654463146484322,
+      "candidate_relative_decode_speed": 2.110531822409457,
+      "gain": 1.0738180975383074
+    },
+    {
+      "baseline_relative_decode_speed": 1.9564261188784946,
+      "candidate_relative_decode_speed": 2.0972016522153276,
+      "gain": 1.071955455909335
+    }
+  ],
+  "confirmed_gain": 1.071955455909335,
+  "reason": "decode gain confirmed twice at >= 1.03x"
+}

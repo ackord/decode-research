@@ -33,6 +33,7 @@ class RequestCache(list):
         self.history = []
         self.index = {}
         self.batch_rows_eligible = None
+        self.grouped_eligible = None
         self.stats = {
             "scalar_steps": 0,
             "verifications": 0,
@@ -40,6 +41,9 @@ class RequestCache(list):
             "bulk_updates": 0,
             "batched_blocks": 0,
             "batched_positions": 0,
+            "grouped_blocks": 0,
+            "grouped_positions": 0,
+            "grouped_projection_calls": 0,
             "draft_lengths": [0] * (MAX_DRAFTS + 1),
             "accepted_lengths": [0] * (MAX_DRAFTS + 1),
             "rejected_positions": 0,
@@ -146,6 +150,40 @@ def _batch_supported(model, cache):
                     for p in projections))
 
 
+def _grouped_supported(model, cache):
+    """Metadata-only gate for the five audited native projection geometries."""
+    if not _batch_supported(model, cache) or not model.args.tie_word_embeddings:
+        return False
+    body = model.model
+    if len(body.layers) != 30 or body.embed_tokens.weight.shape != (49152, 576):
+        return False
+    shapes = ((576, 576), (192, 576), (192, 576), (576, 576),
+              (1536, 576), (1536, 576), (576, 1536))
+    for layer in body.layers:
+        a, f = layer.self_attn, layer.mlp
+        if a.n_heads != 9 or a.n_kv_heads != 3 or type(a.rope) is not nn.RoPE:
+            return False
+        projections = (a.q_proj, a.k_proj, a.v_proj, a.o_proj,
+                       f.gate_proj, f.up_proj, f.down_proj)
+        if any(p.weight.shape != shape for p, shape in zip(projections, shapes)):
+            return False
+    return True
+
+
+def _grouped_project(weight, block, dependencies, lhs_indices, rhs_indices):
+    """Independent M=1 products; keep the weight transpose column-major.
+
+    contiguous establishes row/feature strides, including for unusual storage;
+    on native checkpoint weights and row operations it is a storage-preserving
+    no-op. Never make the transposed weight contiguous or broadcast its data.
+    """
+    m, k = block.shape[1:]
+    x = mx.depends(mx.contiguous(block), dependencies).reshape(m, 1, k)
+    w = mx.contiguous(weight).T[None]
+    return mx.gather_mm(x, w, lhs_indices=lhs_indices, rhs_indices=rhs_indices,
+                        sorted_indices=False).reshape(1, m, weight.shape[0])
+
+
 def _rows(block):
     # Native row operations produce contiguous blocks. Enforce that contract
     # without copying suitable storage; split keeps the reduction stride at 1
@@ -176,7 +214,7 @@ def _bulk_start(cache, count):
     return start
 
 
-def _verify(model, cache, tokens):
+def _verify(model, cache, tokens, *, _trace=None):
     """Teacher-forced singleton forwards, interchanged only across projections.
 
     tokens contains pending followed by drafts, each with native shape (1, 1).
@@ -192,6 +230,29 @@ def _verify(model, cache, tokens):
                and all(t.shape == (1, 1) for t in tokens)
                and all(kv.keys.dtype == mx.bfloat16
                        and kv.values.dtype == mx.bfloat16 for kv in cache))
+    if isinstance(cache, RequestCache) and cache.grouped_eligible is None:
+        cache.grouped_eligible = _grouped_supported(model, cache)
+    grouped = (batched and cache.grouped_eligible
+               and all(kv.keys.shape[:2] == (1, 3)
+                       and kv.values.shape[:2] == (1, 3)
+                       and kv.keys.ndim == kv.values.ndim == 4
+                       and kv.keys.shape[3] == kv.values.shape[3] == 64
+                       for kv in cache))
+    if grouped:
+        lhs_indices = mx.arange(len(tokens), dtype=mx.uint32)
+        rhs_indices = mx.zeros((len(tokens),), dtype=mx.uint32)
+        cache.stats["grouped_blocks"] += 1
+        cache.stats["grouped_positions"] += len(tokens)
+
+    def group(weight, block, deps):
+        result = _grouped_project(weight, block, deps, lhs_indices, rhs_indices)
+        cache.stats["grouped_projection_calls"] += 1
+        return result
+
+    def trace(name, arrays):
+        if _trace is not None:
+            _trace.append((name, arrays if isinstance(arrays, list) else [arrays]))
+
     if start is not None:
         cache.stats["bulk_verifications"] += 1
     if batched:
@@ -203,13 +264,24 @@ def _verify(model, cache, tokens):
         x_block = mx.concatenate(xs, axis=1)
     for layer, kv in zip(body.layers, cache):
         if batched:
-            norm = _rows(layer.input_layernorm(x_block))
+            norm_block = layer.input_layernorm(x_block)
+            norm = _rows(norm_block) if not grouped else None
         else:
             norm = [layer.input_layernorm(mx.depends(x, xs)) for x in xs]
         attn = layer.self_attn
-        qs = _project(attn.q_proj, norm, norm)
-        ks = _project(attn.k_proj, norm, qs)
-        vs = _project(attn.v_proj, norm, ks)
+        if grouped:
+            q_block = group(attn.q_proj.weight, norm_block, [norm_block])
+            k_block = group(attn.k_proj.weight, norm_block, [q_block])
+            v_block = group(attn.v_proj.weight, norm_block, [k_block])
+            qs, ks, vs = _rows(q_block), _rows(k_block), _rows(v_block)
+        else:
+            qs = _project(attn.q_proj, norm, norm)
+            ks = _project(attn.k_proj, norm, qs)
+            vs = _project(attn.v_proj, norm, ks)
+        if _trace is not None:
+            trace("q", qs)
+            trace("k", ks)
+            trace("v", vs)
         attention = []
         if start is not None:
             rotated_qs, rotated_ks, reshaped_vs = [], [], []
@@ -221,6 +293,9 @@ def _verify(model, cache, tokens):
                 rotated_qs.append(attn.rope(q, offset=start + i))
                 rotated_ks.append(attn.rope(k, offset=start + i))
                 reshaped_vs.append(v)
+            if _trace is not None:
+                trace("rope_q", rotated_qs)
+                trace("rope_k", rotated_ks)
             kv.update_and_fetch(mx.concatenate(rotated_ks, axis=2),
                                 mx.concatenate(reshaped_vs, axis=2))
             cache.stats["bulk_updates"] += 1
@@ -255,32 +330,68 @@ def _verify(model, cache, tokens):
                     q, k, v, cache=kv, scale=attn.scale, mask=None
                 )
                 attention.append(out.transpose(0, 2, 1, 3).reshape(1, 1, -1))
-        projected = _project(attn.o_proj, attention, attention)
-        if batched:
-            h_block = x_block + mx.concatenate(projected, axis=1)
-            norm = _rows(layer.post_attention_layernorm(h_block))
+        if _trace is not None:
+            trace("attention", attention)
+        if grouped:
+            projected_block = group(attn.o_proj.weight,
+                                    mx.concatenate(attention, axis=1), attention)
+            h_block = x_block + projected_block
+            norm_block = layer.post_attention_layernorm(h_block)
+            gate_block = group(layer.mlp.gate_proj.weight, norm_block, [projected_block])
+            up_block = group(layer.mlp.up_proj.weight, norm_block, [gate_block])
+            activated_block = llama.swiglu(mx.depends(gate_block, up_block), up_block)
+            down_block = group(layer.mlp.down_proj.weight, activated_block, [activated_block])
+            x_block = h_block + down_block
+            if _trace is not None:
+                trace("projected", _rows(projected_block))
+                trace("h", _rows(h_block))
+                trace("gate", _rows(gate_block))
+                trace("up", _rows(up_block))
+                trace("activated", _rows(activated_block))
+                trace("down", _rows(down_block))
         else:
-            hs = [x + r for x, r in zip(xs, projected)]
-            norm = [layer.post_attention_layernorm(h) for h in hs]
-        gates = _project(layer.mlp.gate_proj, norm, projected)
-        ups = _project(layer.mlp.up_proj, norm, gates)
-        if batched:
-            gate_block = mx.concatenate(mx.depends(gates, ups), axis=1)
-            up_block = mx.concatenate(ups, axis=1)
-            activated = _rows(llama.swiglu(gate_block, up_block))
-        else:
-            activated = [llama.swiglu(g, mx.depends(u, ups)) for g, u in zip(gates, ups)]
-        downs = _project(layer.mlp.down_proj, activated, activated)
-        if batched:
-            x_block = h_block + mx.concatenate(downs, axis=1)
-        else:
-            xs = [h + r for h, r in zip(hs, downs)]
-    if batched:
-        norm = _rows(body.norm(x_block))
-    else:
-        norm = [body.norm(mx.depends(x, xs)) for x in xs]
+            projected = _project(attn.o_proj, attention, attention)
+            if batched:
+                h_block = x_block + mx.concatenate(projected, axis=1)
+                norm = _rows(layer.post_attention_layernorm(h_block))
+            else:
+                hs = [x + r for x, r in zip(xs, projected)]
+                norm = [layer.post_attention_layernorm(h) for h in hs]
+            gates = _project(layer.mlp.gate_proj, norm, projected)
+            ups = _project(layer.mlp.up_proj, norm, gates)
+            if batched:
+                gate_block = mx.concatenate(mx.depends(gates, ups), axis=1)
+                up_block = mx.concatenate(ups, axis=1)
+                activated = _rows(llama.swiglu(gate_block, up_block))
+            else:
+                activated = [llama.swiglu(g, mx.depends(u, ups)) for g, u in zip(gates, ups)]
+            downs = _project(layer.mlp.down_proj, activated, activated)
+            if batched:
+                x_block = h_block + mx.concatenate(downs, axis=1)
+            else:
+                xs = [h + r for h, r in zip(hs, downs)]
+            if _trace is not None:
+                trace("projected", projected)
+                trace("h", _rows(h_block) if batched else hs)
+                trace("gate", gates)
+                trace("up", ups)
+                trace("activated", activated)
+                trace("down", downs)
+        if _trace is not None:
+            trace("x", _rows(x_block) if batched else xs)
+            trace("kv", [kv.keys[..., :kv.offset, :], kv.values[..., :kv.offset, :]])
     head = body.embed_tokens.as_linear if model.args.tie_word_embeddings else model.lm_head
-    logits = _project(head, norm, norm)
+    if grouped:
+        norm_block = body.norm(x_block)
+        logits = _rows(group(body.embed_tokens.weight, norm_block, [norm_block]))
+    else:
+        if batched:
+            norm = _rows(body.norm(x_block))
+        else:
+            norm = [body.norm(mx.depends(x, xs)) for x in xs]
+        logits = _project(head, norm, norm)
+    if _trace is not None:
+        trace("logits", logits)
     return [mx.argmax(x[:, -1, :], axis=-1) for x in logits]
 
 
@@ -354,3 +465,13 @@ def decode(model, first_token, cache, max_new_tokens):
 def generate(model, token_ids, max_new_tokens):
     token, cache = prefill(model, token_ids)
     return decode(model, token, cache, max_new_tokens)
+
+
+def check_grouped(model):
+    """Run the optional native differential suite, outside decode/benchmarking.
+
+    Example: from harness.model import load_model; from candidate.inference
+    import check_grouped; check_grouped(load_model()[0])
+    """
+    from .checks import check_grouped as run_checks
+    return run_checks(model)
