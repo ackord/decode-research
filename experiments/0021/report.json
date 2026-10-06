@@ -1,0 +1,94 @@
+{
+  "round": "0021",
+  "parent_commit": "70b8a67748fe822fc626eb3a031a10cd42319e45",
+  "models": {
+    "research": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "review": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "implementation": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    }
+  },
+  "status": "accepted",
+  "research": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Short causal chunks for speculative attention",
+      "idea": "Replace eligible runs of singleton attention calls with causal chunks of up to eight consecutive queries, using the existing attention primitive and shared KV prefix. Preserve all accepted projections, rotary embeddings, cache updates, drafting, and verification logic. Initially enable chunks only when their KV prefix length is below 1024, where inspected source supports preserving scalar reduction order.",
+      "cost_removed": "For a wholly eligible m-position block, reduce attention invocations from 30m to 30*ceil(m/8): 510 to 90 at m=17. Valid attention arithmetic and logical KV reads remain unchanged. Unlike round 0019, this needs neither explicit mask arrays nor per-KV-head query packing. Output transposition and chunk assembly still cost data movement and must be included.",
+      "source_evidence": "candidate/inference.py:312\u2013325 already produces contiguous position-major rotary queries and appends all speculative KV. Lines 342\u2013354 then invoke attention separately for every position; lines 375\u2013377 concatenate their outputs. The installed API supports lower-right-aligned mask=\"causal\". The inspected [MLX dispatcher](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/scaled_dot_product_attention.cpp) accepts the proposed transposed query view without copying and uses single-pass vector attention for this geometry with query length <=8 and KV length <1024. Its [reduction implementation](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/kernels/sdpa_vector.h) assigns each query independent accumulators and skips future keys before arithmetic. This supports an arithmetic-equivalence argument; native bitwise validation remains necessary.",
+      "generalization": "Grouping consecutive causal queries over shared KV is a portable inference transformation that amortizes attention invocation and scheduling work. It can apply to speculative decoding of large decoder-only GQA models without changing weights or introducing custom kernels. The initial numerical gate limits coverage to short contexts; already-batched engines gain nothing from this change.",
+      "risk": "Causal and transposed-query execution may still differ numerically from scalar execution despite matching source arithmetic. Incorrect alignment could expose future KV. Output reordering, extra masked loop iterations, and existing weight costs may erase the invocation savings. Longer contexts must retain singleton attention because multi-query execution can change reduction partitions.",
+      "history_relation": "Round 0019 tested three head-separated calls with explicit masks and query packing, reaching only 1.015x. This proposal directly removes those costs and uses fewer calls for eligible blocks of three through sixteen positions. Round 0001's numerical failure remains relevant: retain accepted singleton projection arithmetic and restrict attention grouping to the audited reduction regime. No prior round tested these causal chunks."
+    },
+    "plan": "1. Implement only inside candidate/. Add an independent eligibility gate requiring the current grouped-projection/grouped-RoPE path, audited BF16 geometry, ordinary KVCache, and no sliding attention or sinks. Gate failure preserves the current verifier.\n2. With starting offset C and m positions, partition the eligible prefix into consecutive chunks of at most eight, each ending at N=C+hi<1024. Use existing singleton attention for one-position fragments and all remaining positions. These limits come from numerical dispatch compatibility, not benchmark tuning.\n3. After the unchanged bulk KV append, reshape q[lo:hi] from [r,9,1,64] to [1,r,9,64], then transpose to [1,9,r,64] as a view. Supply existing KV views through N and mask=\"causal\". Query j must see exactly keys 0 through C+lo+j. Never tile KV or construct an array mask.\n4. Preserve dependencies on updated KV buffers and prior attention fragments. Convert outputs to position order, assemble one contiguous activation block, and feed the existing grouped output projection. Account for output reordering; construct singleton views only for tracing or fallback. Preserve prediction completion before rollback and all existing commit/cache invariants.\n5. Extend native differential checks across block lengths 3\u201317, chunk boundaries, prefixes around 1024, unequal cache capacities, cancellation and rounding cases, and poisoned future tails. Compare attention, downstream intermediates, logits, and retained KV against actual scalar calls and the accepted verifier. Exercise every acceptance length, consecutive blocks, scalar continuation, and fallback; add counters proving activation and invocation counts.\n6. Keep prefill and drafting unchanged. Freeze the implementation before authoritative exact-token evaluation and both benchmark confirmations against the current best. Retain only an exact improvement meeting the existing threshold.",
+    "reason": "The mechanism removes substantial repeated attention invocation work and addresses concrete overhead introduced by the earlier unsuccessful grouping. In-memory checks passed 1,725 configurations and 457,024 ordered-key-subsequence comparisons, establishing layout and causal-index bookkeeping only. Native numerical parity and net throughput remain genuinely unresolved and worth testing."
+  },
+  "review": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Short causal chunks for speculative attention",
+      "idea": "Within the accepted grouped verifier, replace eligible consecutive singleton attentions with causal chunks of at most eight queries over shared KV prefixes. Restrict chunks to prefix lengths below 1024. Preserve projections, rotary embeddings, bulk KV insertion, drafting, prediction handling, and singleton fallback.",
+      "cost_removed": "For an m-position block starting at C, let e=min(m,max(0,1023-C)). Attention calls become 30*(ceil(e/8)+m-e), versus 30m. A fully eligible 17-position block drops from 510 calls to 90. Valid attention arithmetic and logical KV reads remain unchanged. The intended query layout requires no additional packing or explicit masks. Masked loop iterations, output allocation, position-order assembly, and production counters remain decode costs. Assemble strided outputs together before flattening to avoid an unnecessary copy per chunk.",
+      "source_evidence": "Verified candidate/inference.py:312\u2013377: grouped rotary supplies position-major queries, bulk insertion precedes attention, and every position currently receives a singleton attention call. Installed versions are MLX 0.32.3 and mlx-lm 0.32.0. The [dispatcher](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/scaled_dot_product_attention.cpp) accepts the proposed query and KV views without input copies and selects single-pass vector attention for the proposed geometry below 1024 keys. The [vector implementation](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/kernels/sdpa_vector.h) gives each query independent accumulators and skips future keys before arithmetic. This supports source-level equivalence, not established native bitwise parity. harness/bench.py synchronizes before and after timed decode.",
+      "generalization": "Grouping causal queries over shared KV is a portable reduction in attention invocation and scheduling work, applicable to speculative decoding in larger GQA models. The initial bounds restrict numerical eligibility; they are not universal performance thresholds. Already-batched engines gain nothing, and this experiment leaves long-context attention unchanged.",
+      "risk": "Causal specialization or changed layout may produce numerical differences despite matching source arithmetic. Wrong prefix endpoints can expose future KV. Output assembly and masked-loop overhead may erase savings. Retained hidden-state or KV discrepancies can affect later tokens and cannot be repaired merely by returning to scalar decoding.",
+      "history_relation": "Round 0019 passed exact evaluation but achieved only 1.015x using head-separated batches, query packing, and explicit masks. Causal chunks remove those added costs and use fewer calls for eligible blocks of three through sixteen positions; seventeen-position blocks have the same call count. Round 0001 remains evidence that mathematical equivalence alone is insufficient. Overall two-position verification remains unchanged, preserving the boundary established before round 0020."
+    },
+    "plan": "1. Implement only inside candidate/. Add an independent attention eligibility gate requiring the accepted grouped-projection/grouped-RoPE path, native BF16 geometry [nine query heads, three KV heads, dimension 64], ordinary KVCache, and no sliding attention, sinks, or additional masks. Require drained history, equal starting offsets, and existing capacity for the complete block. Gate failure must preserve accepted optimizations. Do not change backend execution flags or force dispatch.\n\n2. Before cache mutation, save starting offset C and input count m. Keep the existing overall eligibility of 3<=m<=17. Compute e=min(m,max(0,1023-C)); partition [0,e) into consecutive chunks of at most eight positions and use singleton attention for every remaining position. One-position fragments also use the existing singleton operation with mask=None. Reuse this schedule across layers. The strict endpoint bound is N=C+hi<1024, not merely C<1024.\n\n3. Preserve bulk KV insertion. For each chunk [lo,hi), let r=hi-lo and N=C+hi. From contiguous rotated queries [m,9,1,64], form q[lo:hi].reshape(1,r,9,64).transpose(0,2,1,3). Independently slice both allocated KV buffers through N, yielding [1,3,N,64]; never infer the value endpoint from key capacity. Call the existing attention helper with unchanged scale and mask=\"causal\". Its lower-right alignment gives query j exactly keys 0 through N-r+j=C+lo+j. Never pass the complete speculative block or spare capacity as the chunk prefix, tile KV, or construct an array mask.\n\n4. Gate consumed queries on both updated buffers and the preceding attention fragment. Keep buffers alive and immutable until dependent reads finish. Transpose each raw result into [1,r,9,64], concatenate these strided views in position order, then ensure contiguity and reshape once to [1,m,576]. For a single fragment, ensure contiguity directly. Feed this block to the existing grouped output projection; construct singleton output views only for tracing. Preserve the original path when chunking is inactive.\n\n5. Preserve complete prediction materialization before rollback. For a accepted drafts, emit those drafts plus prediction a and trim m-1-a entries, leaving offset C+1+a and the final emitted token pending. Leave prefill, drafting, fixed-length generation, and request isolation unchanged. All scheduling, assembly, diagnostics used in production, synchronization, and cleanup belong inside decode.\n\n6. Extend candidate/checks.py with native bitwise comparisons against both actual scalar attention/model calls and the accepted verifier with only the new attention gate disabled. Cover m=3\u201317, chunk lengths 2\u20138, singleton tails, prefixes around 32 and 1024, boundary-crossing blocks, longer-context fallback, exact and unequal capacities, distinct head/position data, cancellation, BF16 rounding cases, and poisoned future tails. Compare attention outputs, downstream intermediates, logits, and retained KV. Exercise every acceptance length, consecutive active blocks, stale-tail overwrite, scalar continuation and growth, small output budgets, fresh requests, and traced/untraced execution. Add counters proving actual chunk activation and expected call counts; check query/KV storage sharing and output assembly. Resolve numerical discrepancies before enabling affected cases.\n\n7. Freeze the implementation independently of benchmark prompts and results. Require native differential validation, unchanged authoritative exact-token evaluation, and both existing throughput confirmations against the current best. Retain only exact output with at least 1.03x incremental gain in both confirmations. Record unavailable execution facilities separately from experiment results.",
+    "reason": "No fundamental flaw was found. Review sharpened endpoint bounds, independent KV slicing, output assembly, dependencies, and active-path validation. Independent in-memory checks passed 15,720 schedules, 4,818,880 ordered-key comparisons, 273 cache configurations, and 2,925 rollback checks. These establish bookkeeping only. Native validation was unavailable because Metal could not be accessed; numerical parity and net throughput remain unresolved. No files were edited."
+  },
+  "implementation": {
+    "outcome": "implemented",
+    "summary": "Implemented gated causal attention chunks in candidate/inference.py and expanded native differential checks in candidate/checks.py. Syntax, diff checks, and 16,500 scheduling cases passed. Native correctness and benchmarking remain pending: this session cannot initialize a Metal device."
+  },
+  "eval": {
+    "correct": true,
+    "cases": [
+      {
+        "prompt": "Explain why the sky is blue.",
+        "correct": true
+      },
+      {
+        "prompt": "Write a short Python function that reverses a list.",
+        "correct": true
+      },
+      {
+        "prompt": "What are the main causes of inflation?",
+        "correct": true
+      },
+      {
+        "prompt": "Describe how photosynthesis works.",
+        "correct": true
+      },
+      {
+        "prompt": "Continue this story: The door opened and nobody was there.",
+        "correct": true
+      },
+      {
+        "prompt": "<benchmark>",
+        "correct": true
+      }
+    ]
+  },
+  "confirmations": [
+    {
+      "baseline_relative_decode_speed": 2.208546473256966,
+      "candidate_relative_decode_speed": 2.318889529817663,
+      "gain": 1.0499618449948092
+    },
+    {
+      "baseline_relative_decode_speed": 2.2204181676209664,
+      "candidate_relative_decode_speed": 2.32308541469647,
+      "gain": 1.0462377981646154
+    }
+  ],
+  "confirmed_gain": 1.0462377981646154,
+  "reason": "decode gain confirmed twice at >= 1.03x"
+}

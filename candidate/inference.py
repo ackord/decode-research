@@ -35,6 +35,7 @@ class RequestCache(list):
         self.batch_rows_eligible = None
         self.grouped_eligible = None
         self.rotary_eligible = None
+        self.attention_eligible = None
         self.stats = {
             "scalar_steps": 0,
             "verifications": 0,
@@ -45,6 +46,10 @@ class RequestCache(list):
             "grouped_blocks": 0,
             "grouped_positions": 0,
             "grouped_projection_calls": 0,
+            "attention_blocks": 0,
+            "attention_calls": 0,
+            "causal_chunks": 0,
+            "causal_positions": 0,
             "rotary_blocks": 0,
             "grouped_rotary_calls": 0,
             "draft_lengths": [0] * (MAX_DRAFTS + 1),
@@ -181,6 +186,47 @@ def _rotary_supported(model):
                for a in (layer.self_attn for layer in model.layers))
 
 
+def _attention_supported(model, cache):
+    """Independent gate; no change to the accepted projection/RoPE gates."""
+    return (_grouped_supported(model, cache) and _rotary_supported(model)
+            and all(type(kv) is KVCache and not layer.use_sliding
+                    and layer.self_attn.head_dim == 64
+                    and getattr(layer.self_attn, "sinks", None) is None
+                    and getattr(layer.self_attn, "mask", None) is None
+                    for layer, kv in zip(model.layers, cache)))
+
+
+def _attention_schedule(start, count):
+    eligible = min(count, max(0, 1023 - start))
+    chunks = [(lo, min(lo + 8, eligible)) for lo in range(0, eligible, 8)]
+    return chunks + [(i, i + 1) for i in range(eligible, count)]
+
+
+def _chunk_attention(attn, kv, queries, start, schedule, stats):
+    """Read shared, independently bounded K/V prefixes; assemble only once."""
+    fragments = []
+    for lo, hi in schedule:
+        r, end = hi - lo, start + hi
+        if r == 1:
+            q = queries[lo:hi]
+        else:
+            q = queries[lo:hi].reshape(1, r, 9, 64).transpose(0, 2, 1, 3)
+        # Both updated buffers and the preceding read precede consumed queries.
+        deps = [kv.keys, kv.values]
+        if fragments:
+            deps.append(fragments[-1])
+        out = llama.scaled_dot_product_attention(
+            mx.depends(q, deps), kv.keys[..., :end, :], kv.values[..., :end, :],
+            cache=kv, scale=attn.scale, mask="causal" if r > 1 else None)
+        fragments.append(out.transpose(0, 2, 1, 3))
+        stats["attention_calls"] += 1
+        if r > 1:
+            stats["causal_chunks"] += 1
+            stats["causal_positions"] += r
+    block = fragments[0] if len(fragments) == 1 else mx.concatenate(fragments, axis=1)
+    return mx.contiguous(block).reshape(1, queries.shape[0], 576), fragments
+
+
 def _rotary_offsets(start, count):
     # Avoid a float position conversion and an overflowing exclusive endpoint.
     return mx.arange(count, dtype=mx.int32) + mx.array(start, dtype=mx.int32)
@@ -231,7 +277,7 @@ def _bulk_start(cache, count):
 
 
 def _verify(model, cache, tokens, *, _trace=None):
-    """Teacher-forced singleton forwards with grouped projections and rotary.
+    """Teacher-forced forwards with grouped projections, rotary and short attention.
 
     tokens contains pending followed by drafts, each with native shape (1, 1).
     Each attention reads its own native causal prefix. Eligible blocks append
@@ -258,6 +304,13 @@ def _verify(model, cache, tokens, *, _trace=None):
         cache.rotary_eligible = _rotary_supported(model) if grouped else None
     rotary = (grouped and cache.rotary_eligible and 0 <= start
               and start + len(tokens) - 1 <= 2147483647)
+    if isinstance(cache, RequestCache) and cache.attention_eligible is None:
+        cache.attention_eligible = _attention_supported(model, cache) if rotary else None
+    schedule = (_attention_schedule(start, len(tokens))
+                if rotary and cache.attention_eligible else [])
+    chunked = any(hi - lo > 1 for lo, hi in schedule)
+    if chunked:
+        cache.stats["attention_blocks"] += 1
     if rotary:
         rotary_offsets = _rotary_offsets(start, len(tokens))
         cache.stats["rotary_blocks"] += 1
@@ -307,6 +360,7 @@ def _verify(model, cache, tokens, *, _trace=None):
             trace("k", ks)
             trace("v", vs)
         attention = []
+        attention_block = None
         if start is not None:
             if rotary:
                 # Gate both rotary inputs on the final projection phase. Batch
@@ -317,7 +371,9 @@ def _verify(model, cache, tokens, *, _trace=None):
                 k = attn.rope(k.reshape(len(tokens), 3, 1, 64),
                               offset=rotary_offsets)
                 cache.stats["grouped_rotary_calls"] += 2
-                rotated_qs = mx.split(mx.contiguous(q), len(tokens), axis=0)
+                q = mx.contiguous(q)
+                if not chunked or _trace is not None:
+                    rotated_qs = mx.split(q, len(tokens), axis=0)
                 if _trace is not None:
                     trace("rope_q", rotated_qs)
                     trace("rope_k", mx.split(k, len(tokens), axis=0))
@@ -339,19 +395,23 @@ def _verify(model, cache, tokens, *, _trace=None):
                 kv.update_and_fetch(mx.concatenate(rotated_ks, axis=2),
                                     mx.concatenate(reshaped_vs, axis=2))
             cache.stats["bulk_updates"] += 1
-            for i, q in enumerate(rotated_qs):
-                end = start + i + 1
-                if end < kv.keys.shape[2]:
+            if chunked:
+                attention_block, fragments = _chunk_attention(
+                    attn, kv, q, start, schedule, cache.stats)
+                if _trace is not None:
+                    attention = _rows(attention_block)
+            else:
+                for i, q in enumerate(rotated_qs):
+                    end = start + i + 1
                     k, v = kv.keys[..., :end, :], kv.values[..., :end, :]
-                else:
-                    k, v = kv.keys, kv.values
-                deps = [kv.keys, kv.values]
-                if attention:
-                    deps.append(attention[-1])
-                out = llama.scaled_dot_product_attention(
-                    mx.depends(q, deps), k, v, cache=kv, scale=attn.scale, mask=None
-                )
-                attention.append(out.transpose(0, 2, 1, 3).reshape(1, 1, -1))
+                    deps = [kv.keys, kv.values]
+                    if attention:
+                        deps.append(attention[-1])
+                    out = llama.scaled_dot_product_attention(
+                        mx.depends(q, deps), k, v, cache=kv, scale=attn.scale, mask=None
+                    )
+                    cache.stats["attention_calls"] += 1
+                    attention.append(out.transpose(0, 2, 1, 3).reshape(1, 1, -1))
         else:
             for i in range(len(xs)):
                 deps = vs if not attention else [*vs, attention[-1]]
@@ -369,12 +429,16 @@ def _verify(model, cache, tokens, *, _trace=None):
                 out = llama.scaled_dot_product_attention(
                     q, k, v, cache=kv, scale=attn.scale, mask=None
                 )
+                if isinstance(cache, RequestCache):
+                    cache.stats["attention_calls"] += 1
                 attention.append(out.transpose(0, 2, 1, 3).reshape(1, 1, -1))
         if _trace is not None:
             trace("attention", attention)
         if grouped:
-            projected_block = group(attn.o_proj.weight,
-                                    mx.concatenate(attention, axis=1), attention)
+            if attention_block is None:
+                attention_block = mx.concatenate(attention, axis=1)
+                fragments = attention
+            projected_block = group(attn.o_proj.weight, attention_block, fragments)
             h_block = x_block + projected_block
             norm_block = layer.post_attention_layernorm(h_block)
             gate_block = group(layer.mlp.gate_proj.weight, norm_block, [projected_block])
