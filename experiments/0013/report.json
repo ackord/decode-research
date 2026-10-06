@@ -1,0 +1,94 @@
+{
+  "round": "0013",
+  "parent_commit": "e6a92ddaf4cdb4d9af712b9e58e09bc7bac28e1e",
+  "models": {
+    "research": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "review": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "implementation": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    }
+  },
+  "status": "accepted",
+  "research": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Bulk KV append for singleton speculative verification",
+      "idea": "Append each layer\u2019s speculative keys and values once, then run the existing singleton attentions against separately bounded causal views. Preserve all projection arithmetic, singleton RoPE operations, drafting, vocabulary heads, and acceptance rules.",
+      "cost_removed": "For m verification positions across L layers, reduce cache updates from L*m to L and cache slice writes from 2*L*m to 2*L, adding two small K/V concatenations per layer. At L=30 and m=17, this replaces 1,020 cache writes with 60 writes plus 60 packing operations. It removes intermediate cache versions and interleaved mutation stages. Any avoided full-buffer copying is an additional, unmeasured benefit; transformer and head arithmetic remain unchanged.",
+      "source_evidence": "candidate/inference.py:141\u2013157 computes every position\u2019s Q/K/V projections before attention, but subsequently calls update_and_fetch separately for each position and protects successive writes with dependencies. The installed [KVCache implementation](https://raw.githubusercontent.com/ml-explore/mlx-lm/v0.32.0/mlx_lm/models/cache.py) performs separate key and value slice assignments per update and already accepts multiple positions. The [attention helper](https://raw.githubusercontent.com/ml-explore/mlx-lm/v0.32.0/mlx_lm/models/base.py) uses the supplied K/V tensors without consulting an ordinary cache\u2019s offset. Existing drafting limits prevent speculative allocation growth.",
+      "generalization": "Coalescing cache mutations applies to causal speculative verification across hardware and frameworks. It reduces update and dependency overhead without custom kernels or changed numerical reductions. Larger layer counts and cache buffers increase its potential relevance, although efficient in-place implementations may benefit less.",
+      "risk": "Packing may outweigh update savings, particularly for short blocks. Exactness requires original singleton RoPE offsets, identical attention-view shapes and layouts, and exclusion of future entries. Cache storage must remain unchanged throughout the attention-read phase. Native numerical parity and net throughput remain unmeasured.",
+      "history_relation": "Preserves the accepted mechanisms from rounds 0004, 0006, and 0008. Previous rounds did not coalesce KV updates. Round 0006\u2019s interleaved writes required read-before-write protection; one append followed by read-only attention removes that hazard. Unlike round 0001, this does not batch numerical attention or projection operations."
+    },
+    "plan": "1. Modify candidate/ only. Preserve public interfaces, prefill, shared model objects, drafting, scalar pipelining, and rollback. Use the new path for verification blocks with at least three positions; retain the existing path for shorter blocks. This threshold follows the update-versus-packing operation count, without benchmark tuning.\n\n2. For each layer, capture starting offset C and retain the original projection phases. Reshape each Q/K/V separately and apply the original singleton RoPE to Q and K at C+i. Concatenate only the resulting K and V tensors along the cache sequence dimension. Require the entire block to fit existing allocations, then call update_and_fetch once.\n\n3. Run attention sequentially with original singleton queries, scale, and mask=None. Position i must receive views of the allocated cache ending exactly at C+i+1, preserving native layout and full-capacity behavior. Make attention depend on completed block writes and perform no further mutations of that layer\u2019s cache during its attention phase. Preserve the remaining verifier operations and dependencies.\n\n4. Materialize predictions and apply acceptance exactly as today. For k drafts and a accepted drafts, trim k-a positions, leaving offset C+a+1. Keep all generated-token work inside decode and all state request-local.\n\n5. Validate full logits, causal-view layouts, retained KV, and greedy continuation against original singleton execution on independent inputs. Exercise lengths 3\u201317, every acceptance boundary, exact-capacity endings, subsequent growth, and scalar transitions. In-memory checks using the installed cache methods already passed 320 cache configurations and 3,040 causal-view and rollback/next-append cases; these establish bookkeeping only, not native BF16 parity.\n\n6. Record active bulk-update counts without hot-path logging. Have the orchestrator run unchanged exact-token evaluation and both throughput confirmations against the current best. Keep only the required improvement.",
+    "reason": "Already-computed K/V data permits eliminating hundreds of cache mutations per longer verification block without introducing a new floating-point reduction. The mechanism is practical and sound; whether its reduced update overhead exceeds packing cost warrants evaluation."
+  },
+  "review": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Bulk KV append for singleton speculative verification",
+      "idea": "Append each layer\u2019s already-computed speculative keys and values once, then execute the existing singleton attentions sequentially against exact causal prefix views of the allocated buffers. Preserve singleton projections, RoPE, vocabulary heads, drafting, acceptance, and rollback.",
+      "cost_removed": "For m verification positions across L layers, reduce cache updates from L*m to L and slice assignments from 2*L*m to 2*L, adding two K/V concatenations per layer. At L=30 and m=17, this replaces 1,020 assignments with 60 assignments plus 60 concatenations. It also removes intermediate cache versions and read-before-next-write dependencies. Arithmetic and appended KV payload remain unchanged; packing adds memory traffic. No full-buffer-copy savings are assumed.",
+      "source_evidence": "candidate/inference.py:141\u2013161 computes all singleton Q/K/V projections before its interleaved cache-update and attention loop. Installed mlx-lm 0.32.0 matches the relevant pinned [KVCache methods](https://raw.githubusercontent.com/ml-explore/mlx-lm/v0.32.0/mlx_lm/models/cache.py): updates accept multiple positions, perform two slice assignments, and return either prefix views or full allocated buffers. The [attention helper](https://raw.githubusercontent.com/ml-explore/mlx-lm/v0.32.0/mlx_lm/models/base.py) does not inspect an ordinary cache\u2019s offset. Existing drafting bounds prevent speculative allocation growth. harness/bench.py:20\u201329 synchronizes before and after timed decode; the pinned model configuration has 30 layers.",
+      "generalization": "Coalescing available KV updates reduces cache transactions and dependency stages across frameworks and hardware. It applies when singleton causal verification is retained and a layer\u2019s candidate KV is available before attention. Frontier-scale relevance depends on cache-management overhead relative to model computation; implementations that already coalesce updates may gain little.",
+      "risk": "Packing and additional live tensors may outweigh mutation savings. Exactness requires unchanged singleton arithmetic, explicit original RoPE offsets, native prefix layouts, and exclusion of future entries. Matching logical tensor values alone does not establish native BF16 parity. Performance and numerical equivalence remain unmeasured.",
+      "history_relation": "Preserves accepted rounds 0004, 0006, and 0008. No previous round tested coalescing cache updates. Round 0006 protected attention reads from subsequent writes; completing one append before a read-only attention phase removes that hazard. Round 0001\u2019s failed block verification does not resolve this mechanism, which introduces no numerical batching."
+    },
+    "plan": "1. Implement only inside candidate/. Add a bulk branch within the existing verifier\u2019s cache/attention phase, keeping common projection and downstream code shared. Use it for m=len(tokens)>=3, with m including the pending token. Retain the existing path for shorter blocks. Preserve supported-model restrictions, public interfaces, prefill, drafting constants, shared model objects, and scalar pipelining. The threshold follows the two packing operations versus eliminated assignments and must remain fixed before benchmarking.\n\n2. Before any verifier cache mutation, require a drained scalar queue, common starting offset C, and allocated key/value capacity of at least C+m in every layer. Existing drafting already guarantees these conditions; retain its bounds and use the original verifier if bulk eligibility fails. The bulk path must preserve allocation capacity throughout verification.\n\n3. Preserve all existing singleton normalization and Q/K/V projection phases and their consumed-input dependencies. Reshape each position separately using the original operations. Apply singleton Q and K RoPE with explicit offset C+i, captured independently of the subsequently advanced cache offset. Concatenate only the rotated K tensors and the reshaped V tensors along sequence axis 2, preserving dtype, and call update_and_fetch once per layer. Packing must introduce no arithmetic, casting, or batched RoPE.\n\n4. Construct position i\u2019s attention inputs directly from the updated allocated kv.keys and kv.values, ending at e=C+i+1. Reproduce keys_and_values exactly: when e is below allocated key capacity, slice both buffers to e; otherwise pass both full buffers. Avoid intermediate prefix repacking or contiguous conversions. Keep the original singleton query, attention helper, scale, mask=None, and output reshape. Gate the query consumed by attention on both completed updated buffers and, after the first position, the preceding attention result. This enforces append-before-read and sequential attention without host synchronization. Keep that layer\u2019s cache unchanged throughout its attention phase and retain all existing downstream projection and inter-layer dependencies.\n\n5. Preserve joint prediction materialization before acceptance or trimming. For k=m-1 drafts and a accepted drafts, emit drafts[:a] followed by prediction[a], retain its native tensor as pending, and trim k-a positions. Every cache must end at C+a+1, representing committed history except its final pending token. Stale rejected slots remain outside valid views and are overwritten by later updates. Preserve output-budget accounting, fixed-length generation, and scalar transitions. All packing, dependency construction, evaluation, transfers, counters, and rollback remain inside timed decode; no request-specific state crosses requests.\n\n6. Validate with independent inputs. Compare the bulk path against the unchanged verifier and original teacher-forced singleton model calls, including full logits and valid KV prefixes bitwise. Check original RoPE offsets, causal-view shapes and native layout construction, allocation capacity, and subsequent greedy continuation. Cover m=3 through 17, every acceptance boundary, immediate rejection, full acceptance, exact-capacity endings, stale rejected slots, subsequent scalar growth, short-block fallback, and scalar pipeline transitions. Investigate the first numerical discrepancy; matching immediate token IDs alone is insufficient. Check dependency structure separately because an eager stand-in cannot validate lazy execution ordering.\n\n7. Retain existing request-local statistics and add inexpensive bulk-verification and actual bulk-update counts without hot-path logging. Confirm the optimized path executes and performs one update per layer. Have the orchestrator run unchanged exact-token evaluation, including the benchmark workload, then both throughput confirmations against the current accepted candidate. Keep only exact output and at least 1.03x incremental gain in each confirmation. Record active-path status, correctness, and performance separately; do not tune from benchmark results.",
+    "reason": "No fundamental flaw was found. Review sharpens buffer-view construction, explicit RoPE offsets, eligibility, and completion dependencies. Independent checks using the installed cache class with a NumPy stand-in passed 684 configurations, 6,699 causal-view checks, and 6,699 rollback/next-append cases. These establish bookkeeping only. Native MLX execution was unavailable; BF16 parity and net throughput remain for evaluation."
+  },
+  "implementation": {
+    "outcome": "implemented",
+    "summary": "Changed candidate/inference.py to bulk-append KV for eligible blocks of at least three positions, preserving singleton arithmetic, causal views, fallback, acceptance, and rollback. Added request-local counters. Eager checks passed 600 numerical/rollback cases and 32 decode/pipeline cases. Native MLX validation and benchmarking remain with the orchestrator; local initialization lacked a Metal device."
+  },
+  "eval": {
+    "correct": true,
+    "cases": [
+      {
+        "prompt": "Explain why the sky is blue.",
+        "correct": true
+      },
+      {
+        "prompt": "Write a short Python function that reverses a list.",
+        "correct": true
+      },
+      {
+        "prompt": "What are the main causes of inflation?",
+        "correct": true
+      },
+      {
+        "prompt": "Describe how photosynthesis works.",
+        "correct": true
+      },
+      {
+        "prompt": "Continue this story: The door opened and nobody was there.",
+        "correct": true
+      },
+      {
+        "prompt": "<benchmark>",
+        "correct": true
+      }
+    ]
+  },
+  "confirmations": [
+    {
+      "baseline_relative_decode_speed": 1.506003949432809,
+      "candidate_relative_decode_speed": 1.6436660988370084,
+      "gain": 1.0914088900338181
+    },
+    {
+      "baseline_relative_decode_speed": 1.5031586759192725,
+      "candidate_relative_decode_speed": 1.6469032779522026,
+      "gain": 1.0956283620190805
+    }
+  ],
+  "confirmed_gain": 1.0914088900338181,
+  "reason": "decode gain confirmed twice at >= 1.03x"
+}

@@ -35,6 +35,8 @@ class RequestCache(list):
         self.stats = {
             "scalar_steps": 0,
             "verifications": 0,
+            "bulk_verifications": 0,
+            "bulk_updates": 0,
             "draft_lengths": [0] * (MAX_DRAFTS + 1),
             "accepted_lengths": [0] * (MAX_DRAFTS + 1),
             "rejected_positions": 0,
@@ -125,14 +127,31 @@ def _project(projection, inputs, dependencies):
     return outputs
 
 
+def _bulk_start(cache, count):
+    """Choose bulk insertion only with drained history and existing capacity."""
+    if count < 3 or not isinstance(cache, RequestCache) or not cache:
+        return None
+    start = cache[0].offset
+    if start != len(cache.history) - 1:
+        return None
+    for kv in cache:
+        if (kv.offset != start or kv.keys is None or kv.values is None
+                or min(kv.keys.shape[2], kv.values.shape[2]) < start + count):
+            return None
+    return start
+
+
 def _verify(model, cache, tokens):
     """Teacher-forced singleton forwards, interchanged only across projections.
 
     tokens contains pending followed by drafts, each with native shape (1, 1).
-    Cache insertion returns each position's own bounded view, never a view of
-    the final speculative prefix. Dependencies also protect earlier reads from
-    subsequent cache writes. No new numerical batching or compilation is used.
+    Each attention reads its own native causal prefix. Eligible blocks append
+    all singleton K/V results before the read-only attention phase; shorter
+    blocks retain dependencies protecting reads from subsequent cache writes.
     """
+    start = _bulk_start(cache, len(tokens))
+    if start is not None:
+        cache.stats["bulk_verifications"] += 1
     body = model.model
     xs = [body.embed_tokens(t) for t in tokens]
     for layer, kv in zip(body.layers, cache):
@@ -142,23 +161,50 @@ def _verify(model, cache, tokens):
         ks = _project(attn.k_proj, norm, qs)
         vs = _project(attn.v_proj, norm, ks)
         attention = []
-        for i in range(len(xs)):
-            deps = vs if not attention else [*vs, attention[-1]]
-            q, k, v = mx.depends([qs[i], ks[i], vs[i]], deps)
-            q = q.reshape(1, 1, attn.n_heads, -1).transpose(0, 2, 1, 3)
-            k = k.reshape(1, 1, attn.n_kv_heads, -1).transpose(0, 2, 1, 3)
-            v = v.reshape(1, 1, attn.n_kv_heads, -1).transpose(0, 2, 1, 3)
-            q = attn.rope(q, offset=kv.offset)
-            k = attn.rope(k, offset=kv.offset)
-            if attention:
-                kv.keys, kv.values = mx.depends(
-                    [kv.keys, kv.values], attention[-1]
+        if start is not None:
+            rotated_qs, rotated_ks, reshaped_vs = [], [], []
+            for i in range(len(xs)):
+                q, k, v = mx.depends([qs[i], ks[i], vs[i]], vs)
+                q = q.reshape(1, 1, attn.n_heads, -1).transpose(0, 2, 1, 3)
+                k = k.reshape(1, 1, attn.n_kv_heads, -1).transpose(0, 2, 1, 3)
+                v = v.reshape(1, 1, attn.n_kv_heads, -1).transpose(0, 2, 1, 3)
+                rotated_qs.append(attn.rope(q, offset=start + i))
+                rotated_ks.append(attn.rope(k, offset=start + i))
+                reshaped_vs.append(v)
+            kv.update_and_fetch(mx.concatenate(rotated_ks, axis=2),
+                                mx.concatenate(reshaped_vs, axis=2))
+            cache.stats["bulk_updates"] += 1
+            for i, q in enumerate(rotated_qs):
+                end = start + i + 1
+                if end < kv.keys.shape[2]:
+                    k, v = kv.keys[..., :end, :], kv.values[..., :end, :]
+                else:
+                    k, v = kv.keys, kv.values
+                deps = [kv.keys, kv.values]
+                if attention:
+                    deps.append(attention[-1])
+                out = llama.scaled_dot_product_attention(
+                    mx.depends(q, deps), k, v, cache=kv, scale=attn.scale, mask=None
                 )
-            k, v = kv.update_and_fetch(k, v)
-            out = llama.scaled_dot_product_attention(
-                q, k, v, cache=kv, scale=attn.scale, mask=None
-            )
-            attention.append(out.transpose(0, 2, 1, 3).reshape(1, 1, -1))
+                attention.append(out.transpose(0, 2, 1, 3).reshape(1, 1, -1))
+        else:
+            for i in range(len(xs)):
+                deps = vs if not attention else [*vs, attention[-1]]
+                q, k, v = mx.depends([qs[i], ks[i], vs[i]], deps)
+                q = q.reshape(1, 1, attn.n_heads, -1).transpose(0, 2, 1, 3)
+                k = k.reshape(1, 1, attn.n_kv_heads, -1).transpose(0, 2, 1, 3)
+                v = v.reshape(1, 1, attn.n_kv_heads, -1).transpose(0, 2, 1, 3)
+                q = attn.rope(q, offset=kv.offset)
+                k = attn.rope(k, offset=kv.offset)
+                if attention:
+                    kv.keys, kv.values = mx.depends(
+                        [kv.keys, kv.values], attention[-1]
+                    )
+                k, v = kv.update_and_fetch(k, v)
+                out = llama.scaled_dot_product_attention(
+                    q, k, v, cache=kv, scale=attn.scale, mask=None
+                )
+                attention.append(out.transpose(0, 2, 1, 3).reshape(1, 1, -1))
         projected = _project(attn.o_proj, attention, attention)
         hs = [x + r for x, r in zip(xs, projected)]
         norm = [layer.post_attention_layernorm(h) for h in hs]
