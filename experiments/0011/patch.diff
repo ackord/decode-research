@@ -1,0 +1,280 @@
+diff --git a/candidate/inference.py b/candidate/inference.py
+index 2ff26c4..3c6009f 100644
+--- a/candidate/inference.py
++++ b/candidate/inference.py
+@@ -1,3 +1,5 @@
++import heapq
++
+ import mlx.core as mx
+ import mlx.nn as nn
+ from mlx_lm.models.cache import KVCache, make_prompt_cache
+@@ -38,6 +40,9 @@ class RequestCache(list):
+             "draft_lengths": [0] * (MAX_DRAFTS + 1),
+             "accepted_lengths": [0] * (MAX_DRAFTS + 1),
+             "rejected_positions": 0,
++            "branching_activations": 0,
++            "verified_nodes": 0,
++            "restored_kv_slots": 0,
+         }
+         for token in token_ids:
+             self.append_token(int(token))
+@@ -125,16 +130,99 @@ def _project(projection, inputs, dependencies):
+     return outputs
+ 
+ 
+-def _verify(model, cache, tokens):
++class _DraftTree:
++    """Stable node IDs; the root is the pending token at depth zero."""
++
++    def __init__(self):
++        self.parents = [None]
++        self.tokens = [None]
++        self.depths = [0]
++        self.scores = [1.0]
++        self.children = [[]]
++
++    def preorder(self):
++        order = []
++        stack = [0]
++        while stack:
++            node = stack.pop()
++            order.append(node)
++            # Children are selected in priority order. LIFO visits weak first.
++            stack.extend(self.children[node])
++        return order
++
++    def path(self, node):
++        path = []
++        while node is not None:
++            path.append(node)
++            node = self.parents[node]
++        return path[::-1]
++
++
++def _draft_tree(cache, drafts):
++    """Spend exactly the existing chain budget, keeping it on score ties."""
++    budget = len(drafts)
++    if budget < 2:
++        return None
++    context = cache.match()
++    chain_score = 0.0
++    score = 1.0
++    branching = False
++    for token in drafts:
++        successors = cache.index[context]
++        branching |= len(successors.counts) > 1
++        score *= successors.counts[token] / sum(successors.counts.values())
++        chain_score += score
++        context += (token,)
++    if not branching:
++        return None
++
++    tree = _DraftTree()
++    frontier = []
++    serial = 0
++
++    def expand(parent, context):
++        nonlocal serial
++        successors = cache.index.get(context)
++        if successors is None:
++            return
++        total = sum(successors.counts.values())
++        children = sorted(successors.counts, key=lambda token: (
++            -successors.counts[token], token != successors.preferred, token
++        ))[:budget]
++        for token in children:
++            score = tree.scores[parent] * (successors.counts[token] / total)
++            heapq.heappush(frontier, (-score, serial, parent, token, context))
++            serial += 1
++
++    expand(0, cache.match())
++    for _ in range(budget):
++        if not frontier:
++            return None
++        negative_score, _, parent, token, context = heapq.heappop(frontier)
++        node = len(tree.tokens)
++        tree.parents.append(parent)
++        tree.tokens.append(token)
++        tree.depths.append(tree.depths[parent] + 1)
++        tree.scores.append(-negative_score)
++        tree.children.append([])
++        tree.children[parent].append(node)
++        expand(node, context + (token,))
++    return tree if sum(tree.scores[1:]) > chain_score else None
++
++
++def _verify(model, cache, tokens, tree=None, order=None):
+     """Teacher-forced singleton forwards, interchanged only across projections.
+ 
+-    tokens contains pending followed by drafts, each with native shape (1, 1).
++    tokens contains pending followed by chain or DFS drafts, each with native
++    shape (1, 1). Tree depths set positions; traversal order never sets RoPE.
+     Cache insertion returns each position's own bounded view, never a view of
+     the final speculative prefix. Dependencies also protect earlier reads from
+     subsequent cache writes. No new numerical batching or compilation is used.
+     """
+     body = model.model
+     xs = [body.embed_tokens(t) for t in tokens]
++    start = cache[0].offset
++    saved = []
+     for layer, kv in zip(body.layers, cache):
+         norm = [layer.input_layernorm(mx.depends(x, xs)) for x in xs]
+         attn = layer.self_attn
+@@ -142,7 +230,10 @@ def _verify(model, cache, tokens):
+         ks = _project(attn.k_proj, norm, qs)
+         vs = _project(attn.v_proj, norm, ks)
+         attention = []
++        layer_saved = {}
+         for i in range(len(xs)):
++            if tree is not None:
++                kv.trim(kv.offset - (start + tree.depths[order[i]]))
+             deps = vs if not attention else [*vs, attention[-1]]
+             q, k, v = mx.depends([qs[i], ks[i], vs[i]], deps)
+             q = q.reshape(1, 1, attn.n_heads, -1).transpose(0, 2, 1, 3)
+@@ -150,6 +241,10 @@ def _verify(model, cache, tokens):
+             v = v.reshape(1, 1, attn.n_kv_heads, -1).transpose(0, 2, 1, 3)
+             q = attn.rope(q, offset=kv.offset)
+             k = attn.rope(k, offset=kv.offset)
++            if tree is not None:
++                # These are independent projection/RoPE results, not slices of
++                # the mutable cache buffers returned by update_and_fetch.
++                layer_saved[order[i]] = (k, v)
+             if attention:
+                 kv.keys, kv.values = mx.depends(
+                     [kv.keys, kv.values], attention[-1]
+@@ -159,6 +254,8 @@ def _verify(model, cache, tokens):
+                 q, k, v, cache=kv, scale=attn.scale, mask=None
+             )
+             attention.append(out.transpose(0, 2, 1, 3).reshape(1, 1, -1))
++        if tree is not None:
++            saved.append(layer_saved)
+         projected = _project(attn.o_proj, attention, attention)
+         hs = [x + r for x, r in zip(xs, projected)]
+         norm = [layer.post_attention_layernorm(h) for h in hs]
+@@ -170,7 +267,30 @@ def _verify(model, cache, tokens):
+     norm = [body.norm(mx.depends(x, xs)) for x in xs]
+     head = body.embed_tokens.as_linear if model.args.tie_word_embeddings else model.lm_head
+     logits = _project(head, norm, norm)
+-    return [mx.argmax(x[:, -1, :], axis=-1) for x in logits]
++    predictions = [mx.argmax(x[:, -1, :], axis=-1) for x in logits]
++    return predictions if tree is None else (predictions, saved)
++
++
++def _restore_tree(cache, tree, order, accepted_path, saved, predictions, start):
++    final_path = tree.path(order[-1])
++    common = 0
++    for final, accepted in zip(final_path, accepted_path):
++        if final != accepted:
++            break
++        common += 1
++    arrays = []
++    for kv, layer_saved in zip(cache, saved):
++        kv.trim(kv.offset - (start + common))
++        if common < len(accepted_path):
++            kv.keys, kv.values = mx.depends([kv.keys, kv.values], predictions)
++            for node in accepted_path[common:]:
++                k, v = mx.depends(layer_saved[node], predictions)
++                kv.update_and_fetch(k, v)
++            arrays.extend((kv.keys, kv.values))
++    # Submit writes explicitly, including when decode ends on this verification.
++    if arrays:
++        mx.async_eval(*arrays)
++    return arrays, len(accepted_path) - common
+ 
+ 
+ def decode(model, first_token, cache, max_new_tokens):
+@@ -182,6 +302,7 @@ def decode(model, first_token, cache, max_new_tokens):
+     token = first_token
+     output = []
+     pending = []
++    restoration = []
+ 
+     def commit(value):
+         output.append(value)
+@@ -195,28 +316,66 @@ def decode(model, first_token, cache, max_new_tokens):
+         if supported and not pending:
+             drafts = _draft(state, max_new_tokens - len(output))
+             if drafts:
++                tree = _draft_tree(state, drafts)
++                order = tree.preorder() if tree is not None else None
++                if tree is not None and all(len(c) <= 1 for c in tree.children):
++                    drafts = [tree.tokens[node] for node in order[1:]]
++                    tree = None
++                draft_tokens = drafts if tree is None else [
++                    tree.tokens[node] for node in order[1:]
++                ]
+                 inputs = [token.reshape(1, 1)] + [
+-                    mx.array([[d]], dtype=token.dtype) for d in drafts
++                    mx.array([[d]], dtype=token.dtype) for d in draft_tokens
+                 ]
+-                predictions = _verify(model, cache, inputs)
++                start = cache[0].offset
++                if tree is None:
++                    predictions = _verify(model, cache, inputs)
++                else:
++                    predictions, saved = _verify(model, cache, inputs, tree, order)
+                 mx.async_eval(*predictions)
+                 ids = mx.stack(predictions).tolist()
+-                accepted = 0
+-                while accepted < len(drafts) and drafts[accepted] == ids[accepted][0]:
+-                    accepted += 1
+-                for value in drafts[:accepted]:
+-                    commit(value)
+-                commit(ids[accepted][0])
+-                token = predictions[accepted]
++                if tree is None:
++                    accepted = 0
++                    while accepted < len(drafts) and drafts[accepted] == ids[accepted][0]:
++                        accepted += 1
++                    for value in drafts[:accepted]:
++                        commit(value)
++                    commit(ids[accepted][0])
++                    token = predictions[accepted]
++                    for kv in cache:
++                        kv.trim(len(drafts) - accepted)
++                else:
++                    positions = {node: i for i, node in enumerate(order)}
++                    path = [0]
++                    while True:
++                        node = path[-1]
++                        position = positions[node]
++                        value = ids[position][0]
++                        child = next((child for child in tree.children[node]
++                                      if tree.tokens[child] == value), None)
++                        commit(value)
++                        if child is None:
++                            token = predictions[position]
++                            break
++                        path.append(child)
++                    accepted = len(path) - 1
++                    restoration, slots = _restore_tree(
++                        cache, tree, order, path, saved, predictions, start
++                    )
++                    # Carry write completion into subsequent singleton calls.
++                    if restoration:
++                        token = mx.depends(token, restoration)
++                    state.stats["branching_activations"] += 1
++                    state.stats["restored_kv_slots"] += slots * len(cache)
++                    del saved
+                 rejected = len(drafts) - accepted
+-                for kv in cache:
+-                    kv.trim(rejected)
+                 del inputs, predictions, ids
+                 stats = state.stats
+                 stats["verifications"] += 1
+                 stats["draft_lengths"][len(drafts)] += 1
+                 stats["accepted_lengths"][accepted] += 1
+                 stats["rejected_positions"] += rejected
++                stats["verified_nodes"] += len(drafts) + 1
+                 continue
+ 
+         logits = model(token.reshape(1, 1), cache=cache)
+@@ -235,6 +394,8 @@ def decode(model, first_token, cache, max_new_tokens):
+ 
+     for unread in pending:
+         commit(unread.item())
++    if restoration:
++        mx.eval(*restoration)
+     return output
+ 
+ 
