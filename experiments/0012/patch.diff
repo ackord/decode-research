@@ -1,0 +1,165 @@
+diff --git a/candidate/inference.py b/candidate/inference.py
+index 2ff26c4..fb59701 100644
+--- a/candidate/inference.py
++++ b/candidate/inference.py
+@@ -1,3 +1,5 @@
++from collections import OrderedDict
++
+ import mlx.core as mx
+ import mlx.nn as nn
+ from mlx_lm.models.cache import KVCache, make_prompt_cache
+@@ -7,6 +9,7 @@ from mlx_lm.models import llama
+ MAX_CONTEXT = 16
+ MAX_DRAFTS = 16
+ INDEX_CONTEXT = MAX_CONTEXT + MAX_DRAFTS - 1
++MAX_FORECASTS = 4096
+ 
+ 
+ class _Successors:
+@@ -26,26 +29,37 @@ class _Successors:
+ 
+ 
+ class RequestCache(list):
+-    """Ordinary caches plus request-local successor counts and decode counters."""
++    """Ordinary caches plus request-local counts, forecasts and decode counters."""
+ 
+     def __init__(self, caches, token_ids):
+         super().__init__(caches)
+         self.history = []
+         self.index = {}
++        self.forecasts = OrderedDict()
+         self.stats = {
+             "scalar_steps": 0,
+             "verifications": 0,
+             "draft_lengths": [0] * (MAX_DRAFTS + 1),
+             "accepted_lengths": [0] * (MAX_DRAFTS + 1),
+             "rejected_positions": 0,
++            "forecast_suggestions": 0,
++            "accepted_forecast_suggestions": 0,
+         }
+         for token in token_ids:
+             self.append_token(int(token))
+ 
+-    def append_token(self, token):
++    def record_forecast(self, context, token):
++        self.forecasts[context] = token
++        self.forecasts.move_to_end(context)
++        if len(self.forecasts) > MAX_FORECASTS:
++            self.forecasts.popitem(last=False)
++
++    def append_token(self, token, forecast=False):
+         j = len(self.history)
+         for n in range(1, min(INDEX_CONTEXT, j) + 1):
+             context = tuple(self.history[j - n : j])
++            if forecast:
++                self.record_forecast(context, token)
+             successors = self.index.get(context)
+             if successors is None:
+                 self.index[context] = _Successors(token)
+@@ -53,10 +67,21 @@ class RequestCache(list):
+                 successors.observe(token)
+         self.history.append(token)
+ 
++    def record_rejected(self, drafts, ids, accepted):
++        # Prediction i is conditioned on history + drafts[:i], including the
++        # final prediction. Hypothetical tokens never enter history or counts.
++        tail = tuple(self.history[-INDEX_CONTEXT:])
++        for i, prediction in enumerate(ids):
++            if i > accepted:
++                for n in range(1, len(tail) + 1):
++                    self.record_forecast(tail[-n:], prediction[0])
++            if i < len(drafts):
++                tail = (*tail, drafts[i])[-INDEX_CONTEXT:]
++
+     def match(self):
+         for n in range(min(MAX_CONTEXT, len(self.history)), 0, -1):
+             context = tuple(self.history[-n:])
+-            if context in self.index:
++            if context in self.forecasts or context in self.index:
+                 return context
+         return None
+ 
+@@ -95,25 +120,30 @@ def _supported(model, cache):
+ def _draft(cache, remaining):
+     context = cache.match()
+     if context is None or remaining < 2:
+-        return []
++        return [], []
+     c = cache[0].offset
+     if any(kv.offset != c or kv.keys is None or kv.values is None for kv in cache):
+-        return []
++        return [], []
+     if c != len(cache.history) - 1:
+         raise RuntimeError("Speculation requires drained scalar outputs")
+     capacity = min(min(kv.keys.shape[2], kv.values.shape[2]) for kv in cache)
+     limit = min(MAX_DRAFTS, len(context), remaining - 1, capacity - c - 1)
+     drafts = []
+-    # Extend the entire observed context, without mutating the index or backing
+-    # off to a shorter suffix. Every extension occurred in committed history.
++    forecast_positions = []
++    # Extend the entire context without suffix backoff or table mutation.
++    # Forecasts, including rejected-path predictions, are only suggestions.
+     for _ in range(max(0, limit)):
+-        successors = cache.index.get(context)
+-        if successors is None:
+-            break
+-        token = successors.preferred
++        token = cache.forecasts.get(context)
++        forecast = token is not None
++        if not forecast:
++            successors = cache.index.get(context)
++            if successors is None:
++                break
++            token = successors.preferred
+         drafts.append(token)
++        forecast_positions.append(forecast)
+         context += (token,)
+-    return drafts
++    return drafts, forecast_positions
+ 
+ 
+ def _project(projection, inputs, dependencies):
+@@ -186,14 +216,14 @@ def decode(model, first_token, cache, max_new_tokens):
+     def commit(value):
+         output.append(value)
+         if state is not None:
+-            state.append_token(value)
++            state.append_token(value, forecast=True)
+ 
+     commit(token.item())
+     while len(output) + len(pending) < max_new_tokens:
+         # While outputs are unread, token and KV are ahead of host history.
+         # Recompute speculative lookup and capacity decisions after draining.
+         if supported and not pending:
+-            drafts = _draft(state, max_new_tokens - len(output))
++            drafts, forecast_positions = _draft(state, max_new_tokens - len(output))
+             if drafts:
+                 inputs = [token.reshape(1, 1)] + [
+                     mx.array([[d]], dtype=token.dtype) for d in drafts
+@@ -204,6 +234,7 @@ def decode(model, first_token, cache, max_new_tokens):
+                 accepted = 0
+                 while accepted < len(drafts) and drafts[accepted] == ids[accepted][0]:
+                     accepted += 1
++                state.record_rejected(drafts, ids, accepted)
+                 for value in drafts[:accepted]:
+                     commit(value)
+                 commit(ids[accepted][0])
+@@ -217,6 +248,8 @@ def decode(model, first_token, cache, max_new_tokens):
+                 stats["draft_lengths"][len(drafts)] += 1
+                 stats["accepted_lengths"][accepted] += 1
+                 stats["rejected_positions"] += rejected
++                stats["forecast_suggestions"] += sum(forecast_positions)
++                stats["accepted_forecast_suggestions"] += sum(forecast_positions[:accepted])
+                 continue
+ 
+         logits = model(token.reshape(1, 1), cache=cache)
+@@ -228,7 +261,8 @@ def decode(model, first_token, cache, max_new_tokens):
+         # Preserve round 0004's submit-successor-before-host-read pipeline.
+         if len(pending) == 2:
+             commit(pending.pop(0).item())
+-            if supported and (state.history[-1],) in state.index:
++            if supported and ((state.history[-1],) in state.forecasts
++                              or (state.history[-1],) in state.index):
+                 for unread in pending:
+                     commit(unread.item())
+                 pending.clear()

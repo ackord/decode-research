@@ -1,0 +1,94 @@
+{
+  "round": "0012",
+  "parent_commit": "6d0db81609244f3a54840e5c3b1590abf86da896",
+  "models": {
+    "research": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "review": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "implementation": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    }
+  },
+  "status": "rejected",
+  "research": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Request-local target-prediction recycling",
+      "idea": "Cache contextual next-token predictions already produced during decoding, including predictions beyond a speculative mismatch. Use this bounded request-local table to draft a single continuation, falling back to existing successor frequencies where no prediction is cached. Verify every proposal through the unchanged singleton verifier.",
+      "cost_removed": "Targets rejected full-model computations and repeated weight traversals by improving draft coverage and acceptance without an additional model call, vocabulary projection, or host read. A verification with k drafts and a accepted drafts computes k+1 positions but emits a+1 tokens. Each avoided rejected position removes 210 body projections, 30 attention evaluations, and one vocabulary projection. Savings are conditional on acceptance; dictionary maintenance adds decode work.",
+      "source_evidence": "candidate/inference.py:170\u2013173 computes every speculative prediction; :201\u2013214 materializes all IDs, commits through the first mismatch, and discards the remaining predictions. Its drafting index contains only prompt and committed-token occurrences. Direct inspection of the pinned checkpoint confirms 210 body matrices occupying 212,336,640 bytes and a BF16 [49152,576] vocabulary matrix occupying 56,623,104 bytes. These are storage counts, not measured traffic. [Token Recycling, Sections 3.3 and 5.2](https://arxiv.org/html/2408.08696v2) supports retaining predictions from rejected positions as drafting information; its top-k trees and cross-request initialization do not establish this experiment\u2019s performance or exactness.",
+      "generalization": "Reusing already-computed predictions can improve speculation without auxiliary training or additional target inference. The mechanism applies to large causal decoders independently of hardware, kernels, and compilers. Its benefit depends on contextual recurrence and prediction usefulness. All cached predictions belong to one request.",
+      "risk": "Predictions conditioned on rejected prefixes may be poor suggestions for the current prefix. Replacing frequency choices with recent model predictions can reduce acceptance, and maintaining suffix entries can outweigh savings. Cached predictions must never authorize emission or reuse rejected KV state. Native numerical parity and throughput still require evaluation.",
+      "history_relation": "Preserves rounds 0004, 0006, and 0008\u2019s pipeline, verifier, and capacity rules. Round 0009 tried avoiding discarded heads; this experiment uses their existing results without additional synchronization. Round 0011 tested branching over observed successor counts, whereas this introduces target-generated drafting information while retaining linear verification. None of the prior rounds tested this signal."
+    },
+    "plan": "1. Modify candidate/ only. Add a fresh ordered forecast dictionary to RequestCache, capped at 4096 entries. Keep existing context limits and drafting-length rules. Initialize forecasts empty during prefill; perform all forecast updates involving generated tokens inside decode.\n\n2. Record each known target prediction under suffixes of the prefix that actually produced it, for lengths 1 through INDEX_CONTEXT. Store one predicted successor per key, refresh its update order, and evict the oldest updated entry when over capacity. During commit, record the emitted token against history before appending it; this also handles scalar outputs in their existing read order.\n\n3. For a verification beginning with committed history H and drafts d0\u2026d(k\u22121), prediction pi belongs to prefix H + drafts[:i]. After finding acceptance length a, record rejected-path predictions for i>a using these original prefixes, then commit accepted drafts and pa normally. Committed predictions therefore take priority over conflicting entries from that block. Never insert hypothetical tokens into committed history or its occurrence counts. Adjacent prediction IDs must not be treated as an observed continuation.\n\n4. At a drained boundary, find the longest suffix present in either table. Extend its entire context using the forecast successor when available, otherwise the existing preferred observed successor; stop when neither exists. Preserve the matched-context length cap, MAX_DRAFTS, remaining-output budget, and cache-capacity limit. Extend the existing inexpensive pipeline lookup check to include forecast keys, then recompute drafting decisions after draining.\n\n5. Preserve _verify, singleton arithmetic, joint prediction materialization, acceptance, and rollback. Track forecast use and accepted lengths without hot-path logging. Freeze the policy before authoritative evaluation.\n\n6. Validate prefix indexing, conflicting entries, eviction, request isolation, pipeline transitions, every acceptance boundary, small budgets, and cache-capacity crossings. An independent in-memory prototype passed 800 synthetic exact-output cases, including active forecast use and eviction; this establishes control-flow checks only. Have the orchestrator run unchanged exact-token evaluation and both throughput confirmations against the current best. Keep only the required improvement, without tuning from benchmark prompts or results.",
+    "reason": "The current implementation discards a potentially useful drafting signal after already paying for its full computation and transfer. Recycling it is practical, preserves the accepted verification mechanism, and could reduce substantial target work. Net throughput remains genuinely uncertain and worth testing."
+  },
+  "review": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Request-local target-prediction recycling",
+      "idea": "Retain contextual next-token predictions already materialized during decoding, including predictions conditioned on rejected speculative prefixes. Use a bounded request-local table to suggest one linear continuation, with the existing successor-frequency index as fallback. Verify every suggestion through the unchanged singleton verifier.",
+      "cost_removed": "Better drafts can reduce evaluated positions and verification blocks per emitted token. A block with k drafts and a accepted drafts evaluates k+1 positions and emits a+1 tokens. Each evaluated position includes 210 body projections, 30 attention evaluations, and one vocabulary projection on this target. Recycling adds no target evaluation or prediction transfer, but adds dictionary maintenance and may change pipeline draining. It cannot recover work already spent on rejected positions.",
+      "source_evidence": "[candidate/inference.py](candidate/inference.py:201) jointly materializes every speculative prediction, then retains only predictions through the first mismatch. Its occurrence index contains prompt and committed tokens. Inspection of the pinned checkpoint confirmed 210 BF16 body matrices totaling 212,336,640 bytes and a tied [49152,576] vocabulary matrix totaling 56,623,104 bytes; these are storage counts, not measured traffic. [harness/bench.py](harness/bench.py:20) times decode through final synchronization. [Token Recycling, Sections 3.3 and 5.2](https://arxiv.org/html/2408.08696v2) supports reusing predictions from rejected positions. Its trees, cross-request initialization, and numerical behavior do not establish this experiment\u2019s exactness or speed.",
+      "generalization": "Previously computed target predictions can supply drafting information without auxiliary training. The mechanism is independent of hardware, kernels, and compilers and can accompany an exact causal verifier on larger decoders. Benefits depend on recurrence, draft quality, and maintenance overhead.",
+      "risk": "Predictions from rejected prefixes may override better observed successors. Longer forecast matches can also terminate quickly, while suffix construction, eviction, and additional pipeline drains may outweigh savings. Forecasts are suggestions only: they must never authorize emission or preserve rejected KV state. Native exact-token parity remains mandatory.",
+      "history_relation": "Preserves the accepted pipeline, singleton verifier, and drafting limits from rounds 0004, 0006, and 0008. It does not reintroduce round 0001\u2019s numerical batching. Round 0009 tried avoiding discarded heads; this uses their existing results. Round 0011 tested trees over observed counts, not target-prediction recycling. Neither failure resolves this mechanism."
+    },
+    "plan": "1. Modify candidate/ only. Add an OrderedDict of contextual forecasts to each RequestCache, capped at 4096 entries. Keep MAX_CONTEXT=16, MAX_DRAFTS=16, and INDEX_CONTEXT=31. Initialize forecasts empty during prefill; prompt ingestion must populate only the existing occurrence index. Record the already-produced first output token only when decode commits it. Retain no request state across requests.\n\n2. A forecast maps a token-tuple context to one integer successor. Record each prediction under suffix lengths 1 through min(INDEX_CONTEXT, prefix length), in ascending length order. Overwrite and refresh each key\u2019s update order; evict the oldest updated key immediately when over capacity. Reads do not refresh order. During commit, record the emitted token against history before appending it. Reuse context tuples from occurrence-index maintenance where practical, and avoid copying full histories for forecast updates.\n\n3. For a drained verification, let H be committed history including the pending token, and let drafts be d0 through d(k-1). Prediction pi belongs to H + drafts[:i], including pk. After the existing joint materialization and acceptance calculation, record only rejected-path predictions i=a+1 through k, in ascending position order, using those original prefixes. Then commit drafts[:a] and pa in their existing order, recording their forecasts through commit. Thus committed predictions overwrite conflicting rejected-path entries from that block. Never append hypothetical tokens to history or occurrence counts, and never interpret adjacent prediction IDs as a generated continuation. A rolling tail of at most 31 tokens suffices for constructing keys.\n\n4. At a drained boundary, choose the longest history suffix of length at most 16 present in either table. At each extension, use its forecast when present, otherwise its preferred observed successor; stop when neither exists. Extend the entire context without suffix backoff or table mutation. Preserve the limit min(MAX_DRAFTS, initial matched-context length, remaining outputs minus one, allocated KV capacity minus current offset minus one), and preserve all existing cache checks. Update comments that currently claim every draft continuation occurred in committed history.\n\n5. Preserve _verify, singleton arithmetic, dependencies, joint prediction materialization, acceptance, and rollback. After accepting a drafts, trim exactly k-a positions; the drained cache must again have offset len(history)-1. Extend the existing inexpensive pipeline drain hint to test singleton membership in either table. Treat that predicate only as a hint, and recompute full matching and capacity checks after draining. Preserve submit-before-read ordering and output-budget accounting. Recycling must use existing host integers without additional tensor reads, logits transfers, model calls, or device synchronization. All updates, eviction, counters, and draining remain inside decode.\n\n6. Validate original-prefix indexing for every k and acceptance boundary, conflicting keys and committed-update precedence, token ID zero, deterministic eviction, request isolation, forecast-only matches, unchanged occurrence counts, scalar read order, small output budgets, and capacity crossings. Exercise forecasts originating beyond mismatches. Keep inexpensive request-local counters for forecast usage and accepted forecast suggestions alongside existing work counters; do not log inside decode or tune policy from benchmark results.\n\n7. Freeze the policy before authoritative validation. Have the orchestrator run unchanged exact-token evaluation, then both throughput confirmations against the current accepted implementation. Retain only an exact result with at least 1.03x improvement in each confirmation.",
+    "reason": "No fundamental flaw was found. Independent in-memory checks passed 608 prefix/update cases and 840 simulated decodes, including active rejected-prediction reuse and eviction. These establish bookkeeping checks only. The reviewed mechanism preserves exact verification while offering a plausible reduction in target work; native parity and net throughput remain for evaluation."
+  },
+  "implementation": {
+    "outcome": "implemented",
+    "summary": "Implemented request-local prediction recycling in candidate/inference.py with 4096-entry eviction, rejected-prefix indexing, forecast-first drafting, and usage counters. Preserved verifier arithmetic, materialization, pipeline ordering, and rollback. Synthetic boundary checks and 1,200 simulated decode cases passed; git diff checks passed. Authoritative correctness and throughput validation remain with the orchestrator."
+  },
+  "eval": {
+    "correct": true,
+    "cases": [
+      {
+        "prompt": "Explain why the sky is blue.",
+        "correct": true
+      },
+      {
+        "prompt": "Write a short Python function that reverses a list.",
+        "correct": true
+      },
+      {
+        "prompt": "What are the main causes of inflation?",
+        "correct": true
+      },
+      {
+        "prompt": "Describe how photosynthesis works.",
+        "correct": true
+      },
+      {
+        "prompt": "Continue this story: The door opened and nobody was there.",
+        "correct": true
+      },
+      {
+        "prompt": "<benchmark>",
+        "correct": true
+      }
+    ]
+  },
+  "confirmations": [
+    {
+      "baseline_relative_decode_speed": 1.5022495147993102,
+      "candidate_relative_decode_speed": 1.4818435748794765,
+      "gain": 0.9864164110430351
+    },
+    {
+      "baseline_relative_decode_speed": 1.5016616475416327,
+      "candidate_relative_decode_speed": 1.494735956214707,
+      "gain": 0.9953879814815383
+    }
+  ],
+  "confirmed_gain": 0.9864164110430351,
+  "reason": "decode gain was not >= 1.03x twice"
+}
