@@ -1,0 +1,94 @@
+{
+  "round": "0020",
+  "parent_commit": "61a9d9f68bf201f07b4877ba194a46ef267d5d61",
+  "models": {
+    "research": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "review": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "implementation": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    }
+  },
+  "status": "rejected",
+  "research": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Grouped verification for one-token drafts",
+      "idea": "Extend the accepted complete grouped verifier to eligible two-position blocks: the pending token plus one draft. Reuse its grouped projections, row operations, rotary embeddings, and bulk KV append while preserving singleton causal attention and existing draft choices.",
+      "cost_removed": "Each affected block reduces projection calls from 422 to 211, rotary calls from 120 to 60, row-operation calls from 302 to 151, and KV slice assignments from 120 to 60. Attention remains 60 singleton calls. The grouped path adds 31 embedding/attention concatenations containing 71,424 bytes of BF16 payload, plus corresponding reads and writes. Arithmetic remains unchanged; reduced weight traffic is not assumed.",
+      "source_evidence": "candidate/inference.py:219 rejects count<3 in _bulk_start. Because subsequent batching, projection grouping, and rotary grouping require that result, every one-token draft uses the original singleton path throughout all 30 layers. _draft can produce one-token drafts through context, continuation, capacity, or output-budget limits. The grouped path already removes projection-output packing and uses KV transpose views. The inspected [GatherMM dispatch](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/matmul.cpp) preserves its M=1 reduction geometry independently of the number of gathered positions. [RMSNorm dispatch](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/normalization.cpp) likewise chooses per-row geometry by feature width. These support extending eligibility to two positions; native parity still requires validation.",
+      "generalization": "Coalescing short verification blocks removes repeated invocation, allocation, and cache-update work across frameworks without custom kernels or compiler changes. It applies to short or budget-limited speculation in deep decoders and tensor-parallel shards. Benefits diminish when weight bandwidth dominates or implementations already group these blocks.",
+      "risk": "Two-position grouping may not amortize gathering and packing costs, and existing one-token drafts may represent too little decode work for an overall improvement. Current differential tests deliberately exclude this length. Numerical parity, buffer lifetimes, and fallback behavior must be established before activation.",
+      "history_relation": "Round 0013 justified its three-position minimum using two added KV concatenations per layer. Round 0018 subsequently removed those concatenations, while rounds 0016\u20130017 supplied contiguous grouped computation. The inherited threshold therefore protects a cost structure that has changed. No supplied round tested the complete grouped path at two positions. This preserves the singleton attention implicated by round 0001 and introduces none of round 0019's masking or head-packing overhead."
+    },
+    "plan": "1. Modify candidate/ only. Broaden eligibility to m=2 when all existing BF16 grouped-projection, grouped-rotary, layout, offset, and capacity checks pass. Resolve eligibility before cache mutation. Preserve the original two-position fallback when any check fails, and retain existing behavior for larger blocks.\n\n2. Execute the existing grouped path without arithmetic rewrites: indices [0,1] and [0,0], rotary offsets [C,C+1], one bulk append per layer, and singleton attentions over prefixes ending at C+1 and C+2. Keep current drafting, scalar pipelining, full prediction materialization, and acceptance. For acceptance a in {0,1}, trim 1-a entries and leave offset C+1+a.\n\n3. Extend candidate/checks.py to cover m=2 in projection, rotary, intermediate-state, full-logit, and valid-KV comparisons. Compare against both the original two-position verifier and actual scalar reference calls. Update tests that currently require two-position fallback. Exercise rejection, full acceptance, consecutive one-token drafts, traced/untraced execution, exact-capacity endings, stale-tail overwrite, subsequent scalar growth, small output budgets, and unsupported-path fallback.\n\n4. Add a request-local activation counter and assert 211 grouped projections, 60 grouped rotary calls, and 30 bulk updates per optimized block. Keep all generated-token work inside decode. Freeze eligibility independently of benchmark prompts and results.\n\n5. Have the orchestrator run native differential validation, unchanged exact-token evaluation, and both throughput confirmations against the current best. Retain only exact output and at least 1.03x incremental gain twice.",
+    "reason": "An inherited eligibility boundary leaves substantial, directly counted repeated work after later changes removed its original packing justification. This is a small, sound experiment with genuinely uncertain throughput. Native parity and performance remain unmeasured; no files were edited."
+  },
+  "review": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Grouped verification for one-token drafts",
+      "idea": "Extend the existing complete grouped verifier to eligible two-position blocks containing the pending token and one draft. Reuse grouped projections, row operations, rotary embeddings, and bulk KV insertion while preserving singleton causal attention, drafting, acceptance, and scalar pipelining.",
+      "cost_removed": "Per optimized block, projection calls fall from 422 to 211, rotary calls from 120 to 60, row-operation calls from 302 to 151, and KV updates from 60 to 30, reducing KV slice assignments from 120 to 60. Attention remains 60 singleton calls. The untraced path adds 31 concatenations carrying 71,424 bytes of BF16 payload and 31 split calls. The inspected concatenation implementation performs 62 input copies, adding corresponding reads and writes. Index construction, views, gathering, and buffer lifetimes also cost work. FLOPs and reduced weight traffic are not claimed. [Concatenation source](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/slicing.cpp).",
+      "source_evidence": "Verified that candidate/inference.py:219\u2013260 excludes count<3 before every subsequent grouping decision. The actual _draft produces single drafts through context length, continuation exhaustion, capacity, and output-budget limits. candidate/checks.py excludes m=2 from projection, rotary, and full-verifier comparisons and explicitly expects its fallback. Installed versions match MLX 0.32.3 and mlx-lm 0.32.0. [GatherMM dispatch](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/matmul.cpp) retains M=1 with unsorted explicit indices; gathered batch count does not select its reduction geometry. [RMSNorm dispatch](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/normalization.cpp) likewise selects row geometry by feature width. [RoPE arithmetic](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/kernels/rope.metal) supports the existing singleton-offset mapping at m=2. These support numerical eligibility, not established native parity.",
+      "generalization": "Coalescing independent verification tasks and cache updates removes repeated invocation, scheduling, and allocation work across frameworks. The mechanism requires no custom kernels, compiler changes, or target changes. It can matter for short speculation in deep decoders and tensor-parallel shards, although weight-dominated workloads and engines already grouping these operations may gain little.",
+      "risk": "Two positions may not amortize gathering, packing, and additional views, or may represent too little decode work for an overall gain. Merely lowering the cutoff also activates partial optimization paths outside this experiment. Different numerical entrypoints and buffer lifetimes require native validation even when source arithmetic agrees.",
+      "history_relation": "Round 0013 selected the three-position minimum when bulk insertion added two KV concatenations per layer. Rounds 0017\u20130018 subsequently removed projection-output packing and those KV concatenations. Saved patches retain the old cutoff, and no supplied round tested the complete grouped path at m=2. This preserves the accepted singleton attention; round 0019's attention-grouping result does not resolve this experiment."
+    },
+    "plan": "1. Modify candidate/ only. Admit m=2 provisionally to the existing capacity check, then compute the existing batching, projection, and rotary eligibility flags. Before counters, tensor construction, or cache mutation, require the complete path for m=2. If its final rotary eligibility is false, reset start=None and all three local optimization flags to false, recovering the original fully singleton verifier. Preserve cached model-eligibility flags and all existing behavior for other lengths. Require drained history, common offset C, capacity at least C+2 in every layer, existing BF16/class/layout guards, and 0<=C with C+1<=INT32_MAX.\n\n2. Reuse the existing grouped computation without arithmetic rewrites. Construct shared uint32 indices [0,1] and [0,0], retain sorted_indices=False, and construct int32 rotary offsets [C,C+1] without floating-point arithmetic. Preserve contiguous activation blocks, the unchanged weight-transpose views, original normalization/SwiGLU/residual boundaries, and projection-phase dependencies. Do not substitute ordinary two-token matrix multiplication or attention.\n\n3. Append both positions' KV once per layer using the existing transpose views. Run the original singleton attentions sequentially against allocated-buffer prefixes ending at C+1 and C+2, including the existing full-capacity branch. Each attention must depend on completed KV writes and its preceding attention. Materialize both predictions before acceptance or mutation. For acceptance a in {0,1}, emit accepted drafts followed by prediction[a], trim 1-a entries, and leave offset C+1+a with the final emitted token pending.\n\n4. Extend candidate/checks.py to include m=2 in native projection, rotary, intermediate-state, complete-logit, prediction, and valid-KV comparisons. Compare against the original fully singleton two-position verifier, obtainable by forcing bulk eligibility off in the test, and independent teacher-forced singleton model calls evaluated after each position. Update the existing comparison that disables only rotary grouping: its m=2 baseline must now have zero bulk, batching, and grouping activations. Preserve existing m>=3 comparisons. Include independent BF16 cancellation, magnitude, rounding-boundary, and rotary-offset cases; check traced and untraced execution and assert comparison lengths.\n\n5. Exercise rejection and full acceptance, consecutive one-token drafts, scalar/speculative transitions, exact C+2 capacity, insufficient capacity, stale-tail overwrite, subsequent scalar growth, and output limits 0,1,2,3 and larger. Check actual single-draft production from each limiting condition. Update assertions currently requiring two-position fallback and the forced-budget threshold currently set at four output tokens. Force each eligibility guard off to verify complete m=2 fallback, while retaining partial fallbacks for larger blocks. Check fresh-request isolation.\n\n6. Add one inexpensive request-local counter for optimized two-position blocks. In checks, assert per-block deltas of 211 grouped projections, 60 grouped rotary calls, and 30 bulk updates; fallback must activate none of them. Keep prefill unchanged. Eligibility, indices, packing, verification, transfers, counters, rollback, and cleanup remain inside decode, with no cross-request derived state or validation recomputation in production.\n\n7. Freeze eligibility independently of benchmark prompts and results. Have the orchestrator run native differential validation, unchanged exact-token evaluation, and both throughput confirmations against the current accepted candidate. Confirm actual two-position activation separately from correctness. Retain only exact output and at least 1.03x incremental gain in each confirmation; report environment limitations separately from experiment results.",
+    "reason": "No fundamental flaw was found. Review makes two-position activation all-or-nothing, corrects packing accounting, and repairs baseline-test expectations. Independent in-memory checks passed 643 eligibility cases, four drafting cases, and 66 cache configurations covering 132 causal views and 319 scalar continuation steps. These establish bookkeeping only. Native MLX execution was unavailable because no Metal device was accessible; numerical parity and throughput remain for authoritative validation. No files were edited."
+  },
+  "implementation": {
+    "outcome": "implemented",
+    "summary": "Implemented guarded two-position grouped verification and a request-local counter in candidate/inference.py. Extended native checks for numerical parity, fallback guards, acceptance, rollback, transitions, draft limits, and request isolation. Syntax and diff checks pass. Native execution was unavailable because MLX could not access a Metal device; authoritative evaluation and benchmarking remain with the orchestrator."
+  },
+  "eval": {
+    "correct": true,
+    "cases": [
+      {
+        "prompt": "Explain why the sky is blue.",
+        "correct": true
+      },
+      {
+        "prompt": "Write a short Python function that reverses a list.",
+        "correct": true
+      },
+      {
+        "prompt": "What are the main causes of inflation?",
+        "correct": true
+      },
+      {
+        "prompt": "Describe how photosynthesis works.",
+        "correct": true
+      },
+      {
+        "prompt": "Continue this story: The door opened and nobody was there.",
+        "correct": true
+      },
+      {
+        "prompt": "<benchmark>",
+        "correct": true
+      }
+    ]
+  },
+  "confirmations": [
+    {
+      "baseline_relative_decode_speed": 2.2150077562547894,
+      "candidate_relative_decode_speed": 2.2140113604069676,
+      "gain": 0.999550161463314
+    },
+    {
+      "baseline_relative_decode_speed": 2.2204097714947,
+      "candidate_relative_decode_speed": 2.228833969772409,
+      "gain": 1.0037939836087273
+    }
+  ],
+  "confirmed_gain": 0.999550161463314,
+  "reason": "decode gain was not >= 1.03x twice"
+}

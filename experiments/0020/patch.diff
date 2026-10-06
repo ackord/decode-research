@@ -1,0 +1,368 @@
+diff --git a/candidate/checks.py b/candidate/checks.py
+index 98e5de8..7391abe 100644
+--- a/candidate/checks.py
++++ b/candidate/checks.py
+@@ -28,6 +28,14 @@ def _prefixes(a, b, label):
+                    getattr(kb, name)[..., :kb.offset, :], f"{label}/layer{i}/{name}")
+ 
+ 
++def _no_grouping(cache):
++    for name in ("two_position_blocks", "bulk_verifications", "bulk_updates",
++                 "batched_blocks", "batched_positions", "grouped_blocks",
++                 "grouped_positions", "grouped_projection_calls",
++                 "rotary_blocks", "grouped_rotary_calls"):
++        assert cache.stats[name] == 0, (name, cache.stats[name])
++
++
+ def _clone(model, cache, capacity=None):
+     copies = make_prompt_cache(model)
+     assert len(cache) == len(copies)
+@@ -57,7 +65,7 @@ def _projection_checks(model):
+         cancellation = ((j // 2 % 7 - 3)[None] + (row % 5) * 0.125).astype(mx.bfloat16)
+         boundary = (1 + ((row + j[None]) % 5 - 2) / 256
+                     + ((row + j[None]) % 3 - 1) / 262144).astype(mx.bfloat16)
+-        for m in range(3, 18):
++        for m in range(2, 18):
+             lhs = mx.arange(m, dtype=mx.uint32)
+             rhs = mx.zeros((m,), dtype=mx.uint32)
+             r = mx.arange(m, dtype=mx.float32)[:, None]
+@@ -74,7 +82,9 @@ def _projection_checks(model):
+                 for phase in range(2):
+                     grouped = ci._grouped_project(weight, x, deps, lhs, rhs)
+                     single = ci._project(lambda t: t @ weight.T, ci._rows(x), deps)
+-                    for i, output in enumerate(ci._rows(grouped)):
++                    outputs = ci._rows(grouped)
++                    assert len(outputs) == len(single) == m
++                    for i, output in enumerate(outputs):
+                         _equal(output, single[i], f"projection/{n}x{k}/m{m}/case{case}/phase{phase}/row{i}")
+                     deps = [grouped]
+ 
+@@ -82,7 +92,7 @@ def _projection_checks(model):
+ def _rotary_checks(model):
+     """Isolate vector dispatch from the verifier, including int32 endpoints."""
+     rope = model.layers[0].self_attn.rope
+-    for m in range(3, 18):
++    for m in range(2, 18):
+         starts = (0, 1, 255, 4095, 2**24 - m, 2**24 - 1,
+                   2**24, 2**24 + 1, 2**30 - 1, 2**31 - m)
+         for heads in (3, 9):
+@@ -167,6 +177,8 @@ def _reference_trace(model, cache, tokens):
+         logits = []
+         for token in tokens:
+             logits.append(model(token, cache=cache))
++            # Materialize each independent singleton before the next KV write.
++            mx.eval(logits[-1], *[x for arrays in captured.values() for x in arrays])
+         captured[(len(model.layers), "logits")] = logits
+         mx.eval(*logits)
+     return captured
+@@ -185,7 +197,7 @@ def _trace_dict(trace):
+ 
+ 
+ def _verification_checks(model, base, pending):
+-    for m in range(3, 18):
++    for m in range(2, 18):
+         # Unrelated forced tokens exercise rejected tails, not sampled matches.
+         tokens = [pending.reshape(1, 1)] + [mx.array([[31 + 13 * i]]) for i in range(m - 1)]
+         for capacity in (base[0].keys.shape[2], base[0].offset + m):
+@@ -211,14 +223,29 @@ def _verification_checks(model, base, pending):
+             assert len(offsets) == 30 and all(n == 2 for n in offsets.values())
+             assert grouped.stats["rotary_blocks"] == 1
+             assert grouped.stats["grouped_rotary_calls"] == 60
+-            pp = ci._verify(model, previous, tokens, _trace=pt)
++            # At m=2 the old verifier was fully singleton, including KV writes.
++            with ExitStack() as stack:
++                if m == 2:
++                    stack.enter_context(patch.object(ci, "_bulk_start", return_value=None))
++                pp = ci._verify(model, previous, tokens, _trace=pt)
+             mx.eval(*gp, *pp)
++            assert len(gp) == len(pp) == m
++            assert grouped.stats["bulk_updates"] == 30
++            assert grouped.stats["two_position_blocks"] == int(m == 2)
+             assert grouped.stats["grouped_projection_calls"] == 211
+-            assert previous.stats["grouped_projection_calls"] == 211
++            assert previous.stats["grouped_projection_calls"] == (0 if m == 2 else 211)
++            if m == 2:
++                _no_grouping(previous)
+             assert previous.stats["rotary_blocks"] == 0
+             assert previous.stats["grouped_rotary_calls"] == 0
+             gd, pd = _trace_dict(gt), _trace_dict(pt)
+             rd = _reference_trace(model, reference, tokens)
++            ref_predictions = [mx.argmax(x[:, -1, :], axis=-1)
++                               for x in rd[(len(model.layers), "logits")]]
++            assert len(ref_predictions) == m
++            for i in range(m):
++                _equal(gp[i], pp[i], f"predictions/m{m}/previous/row{i}")
++                _equal(gp[i], ref_predictions[i], f"predictions/m{m}/reference/row{i}")
+             assert gd.keys() == pd.keys() == rd.keys()
+             for key in gd:
+                 assert len(gd[key]) == len(pd[key]) == len(rd[key]) == m, key
+@@ -250,6 +277,9 @@ def _verification_checks(model, base, pending):
+                        f"untraced logits/m{m}/row{i}")
+             _prefixes(untraced, grouped, f"untraced/m{m}")
+             assert untraced.stats["grouped_rotary_calls"] == 60
++            assert untraced.stats["grouped_projection_calls"] == 211
++            assert untraced.stats["bulk_updates"] == 30
++            assert untraced.stats["two_position_blocks"] == int(m == 2)
+             # Rollback each possible acceptance length, then overwrite stale
+             # tails and grow past capacity through actual scalar forwards.
+             for accepted in range(m):
+@@ -257,6 +287,7 @@ def _verification_checks(model, base, pending):
+                 r = _clone(model, reference, base[0].offset + m)
+                 for kv in [*g, *r]:
+                     kv.trim(m - 1 - accepted)
++                assert all(kv.offset == base[0].offset + 1 + accepted for kv in [*g, *r])
+                 token = gp[accepted].reshape(1, 1)
+                 for step in range(m + 1 - accepted):
+                     gl, rl = model(token, cache=g), model(token, cache=r)
+@@ -317,6 +348,63 @@ def _decode_checks(model, base, pending):
+     assert cache.stats["grouped_rotary_calls"] == 120
+     _prefixes(cache, oracle_cache, "consecutive blocks then scalar growth")
+ 
++    # Single drafts: rejection/full acceptance, consecutive blocks, scalar
++    # transitions and exact-capacity insertion followed by scalar growth.
++    for accepted in (0, 1):
++        cache = _clone(model, base, base[0].offset + 2)
++        calls = []
++
++        def single_draft(state, remaining):
++            if calls:
++                return []
++            calls.append(True)
++            return [oracle[1] if accepted else (oracle[1] + 1) % 49152]
++
++        with patch.object(ci, "_draft", single_draft):
++            assert ci.decode(model, pending, cache, 24) == oracle
++        assert cache.stats["accepted_lengths"][accepted] == 1
++        assert cache.stats["two_position_blocks"] == 1
++        assert cache.stats["grouped_projection_calls"] == 211
++        assert cache.stats["grouped_rotary_calls"] == 60
++        assert cache.stats["bulk_updates"] == 30
++        _prefixes(cache, oracle_cache, f"single draft/accept{accepted}")
++
++    cache = _clone(model, base, base[0].offset + 5)
++    blocks = []
++
++    def consecutive_single(state, remaining):
++        if len(blocks) == 2:
++            return []
++        index = len(state.history) - len(base.history)
++        blocks.append(index)
++        return [oracle[index]]
++
++    with patch.object(ci, "_draft", consecutive_single):
++        assert ci.decode(model, pending, cache, 24) == oracle
++    assert blocks == [1, 3]
++    assert cache.stats["two_position_blocks"] == 2
++    assert cache.stats["grouped_projection_calls"] == 422
++    assert cache.stats["grouped_rotary_calls"] == 120
++    assert cache.stats["bulk_updates"] == 60
++    _prefixes(cache, oracle_cache, "consecutive single drafts then scalar growth")
++
++    # Enter speculation after real scalar steps; this also checks drained history.
++    cache = _clone(model, base)
++    blocks = []
++
++    def after_scalar(state, remaining):
++        if state.stats["scalar_steps"] < 2 or blocks:
++            return []
++        index = len(state.history) - len(base.history)
++        assert state[0].offset == len(state.history) - 1
++        blocks.append(index)
++        return [oracle[index]]
++
++    with patch.object(ci, "_draft", after_scalar):
++        assert ci.decode(model, pending, cache, 24) == oracle
++    assert len(blocks) == 1 and cache.stats["two_position_blocks"] == 1
++    _prefixes(cache, oracle_cache, "scalar to single draft to scalar")
++
+     # A rotary-only gate failure must leave accepted projection grouping on.
+     g, r = _clone(model, base), _clone(model, base)
+     g.append_token(pending.item())
+@@ -324,7 +412,7 @@ def _decode_checks(model, base, pending):
+     trace = []
+     with patch.object(ci, "_rotary_supported", return_value=False):
+         predictions = ci._verify(model, g, tokens, _trace=trace)
+-    ref = [model(t, cache=r) for t in tokens]
++    ref = _reference_trace(model, r, tokens)[(len(model.layers), "logits")]
+     mx.eval(*predictions)
+     logits = dict(trace)["logits"]
+     assert len(logits) == len(ref) == 3
+@@ -352,10 +440,11 @@ def _decode_checks(model, base, pending):
+             output = ci.decode(model, pending, cache, limit)
+         assert output == oracle[:limit]
+         assert all(kv.offset == base[0].offset + limit - 1 for kv in cache)
+-        assert cache.stats["grouped_blocks"] == int(limit >= 4)
++        assert cache.stats["grouped_blocks"] == 1
++        assert cache.stats["two_position_blocks"] == int(limit == 3)
+     # Capacity failure, too-short blocks, and explicitly unsupported metadata
+     # all preserve the original verifier, including eligible batched rows.
+-    for m, capacity, disable in ((2, base[0].offset + 2, False),
++    for m, capacity, disable in ((2, base[0].offset + 1, False),
+                                  (3, base[0].offset + 2, False),
+                                  (3, base[0].offset + 3, True),
+                                  (18, base[0].offset + 18, False)):
+@@ -366,7 +455,7 @@ def _decode_checks(model, base, pending):
+         tokens = [pending.reshape(1, 1)] * m
+         trace = []
+         predictions = ci._verify(model, g, tokens, _trace=trace)
+-        ref = [model(t, cache=r) for t in tokens]
++        ref = _reference_trace(model, r, tokens)[(len(model.layers), "logits")]
+         logits = dict(trace)["logits"]
+         mx.eval(*predictions)
+         assert len(logits) == len(ref) == m
+@@ -375,9 +464,104 @@ def _decode_checks(model, base, pending):
+         assert g.stats["grouped_blocks"] == 0
+         if disable:
+             assert g.stats["batched_blocks"] == 1
++        if m == 2:
++            _no_grouping(g)
+         _prefixes(g, r, "fallback")
+ 
+ 
++def _single_draft_checks(model, base, pending):
++    # Each real drafting limit independently leaves exactly one draft.
++    c = base[0].offset
++    draft = (pending.item() + 1) % 49152
++    for reason in ("context", "exhaustion", "capacity", "budget"):
++        cache = _clone(model, base, c + (2 if reason == "capacity" else 8))
++        cache.append_token(pending.item())
++        context = tuple(cache.history[-(1 if reason == "context" else 2):])
++        cache.index = {context: ci._Successors(draft)}
++        if reason != "exhaustion":
++            cache.index[context + (draft,)] = ci._Successors((draft + 1) % 49152)
++        history = list(cache.history)
++        assert cache.match() == context
++        assert ci._draft(cache, 2 if reason == "budget" else 8) == [draft], reason
++        assert ci._draft(cache, 1) == []
++        assert cache.history == history and cache[0].offset == c
++
++    # Cached/model gates and capacity/history failure all recover singleton math.
++    for guard in ("batch", "grouped", "rotary", "history", "capacity",
++                  "batch_model", "grouped_model", "rotary_model",
++                  "negative", "overflow"):
++        capacity = c + (1 if guard == "capacity" else 2)
++        g, r = _clone(model, base, capacity), _clone(model, base, capacity)
++        if guard != "history":
++            g.append_token(pending.item())
++        tokens = [pending.reshape(1, 1)] * 2
++        trace = []
++        with ExitStack() as stack:
++            if guard in ("batch", "grouped", "rotary"):
++                setattr(g, {"batch": "batch_rows_eligible", "grouped": "grouped_eligible",
++                            "rotary": "rotary_eligible"}[guard], False)
++            elif guard.endswith("_model"):
++                fn = {"batch_model": "_batch_supported", "grouped_model": "_grouped_supported",
++                      "rotary_model": "_rotary_supported"}[guard]
++                stack.enter_context(patch.object(ci, fn, return_value=False))
++            elif guard in ("negative", "overflow"):
++                stack.enter_context(patch.object(ci, "_bulk_start",
++                    return_value=-1 if guard == "negative" else 2147483647))
++            predictions = ci._verify(model, g, tokens, _trace=trace)
++        ref = _reference_trace(model, r, tokens)[(len(model.layers), "logits")]
++        mx.eval(*predictions)
++        logits = dict(trace)["logits"]
++        assert len(predictions) == len(logits) == len(ref) == 2
++        for i in range(2):
++            _equal(logits[i], ref[i], f"single draft fallback/{guard}/row{i}")
++        _no_grouping(g)
++        _prefixes(g, r, f"single draft fallback/{guard}")
++
++    # Malformed layouts are gate-only cases: stop at embedding, before running
++    # native math on intentionally incompatible cache storage or token shapes.
++    class StopAtEmbedding(Exception):
++        pass
++
++    for guard in ("token_shape", "key_dtype", "value_dtype", "key_heads",
++                  "value_heads", "key_ndim", "value_ndim", "key_width",
++                  "value_width", "offset", "layer_capacity", "missing_keys",
++                  "missing_values"):
++        cache = _clone(model, base, c + 2)
++        cache.append_token(pending.item())
++        cache.batch_rows_eligible = cache.grouped_eligible = cache.rotary_eligible = True
++        tokens = [pending.reshape(1, 1)] * 2
++        kv = cache[-1]
++        if guard == "token_shape":
++            tokens[1] = pending.reshape(1)
++        elif guard == "offset":
++            kv.offset -= 1
++        elif guard == "layer_capacity":
++            kv.values = kv.values[..., :c + 1, :]
++        elif guard.startswith("missing_"):
++            setattr(kv, guard.removeprefix("missing_"), None)
++        else:
++            name = "keys" if guard.startswith("key_") else "values"
++            array = getattr(kv, name)
++            if guard.endswith("dtype"):
++                array = array.astype(mx.float32)
++            elif guard.endswith("heads"):
++                array = array[:, :2]
++            elif guard.endswith("ndim"):
++                array = array[..., 0]
++            elif guard.endswith("width"):
++                array = array[..., :32]
++            setattr(kv, name, array)
++        with patch.object(nn.Embedding, "__call__", side_effect=StopAtEmbedding):
++            try:
++                ci._verify(model, cache, tokens)
++            except StopAtEmbedding:
++                pass
++            else:
++                raise AssertionError("Gate check did not reach embedding")
++        _no_grouping(cache)
++        assert cache.batch_rows_eligible and cache.grouped_eligible and cache.rotary_eligible
++
++
+ def check_grouped(model):
+     """Fail at the first numerical discrepancy; never certify throughput."""
+     prompt = [1] + [41 + (i * 17) % 311 for i in range(23)]
+@@ -395,12 +579,14 @@ def check_grouped(model):
+     _projection_checks(model)
+     _verification_checks(model, base, pending)
+     _decode_checks(model, base, pending)
++    _single_draft_checks(model, base, pending)
+     # A fresh prefill must recreate all request state, including counters.
+     second_pending, second = ci.prefill(model, prompt)
+     _equal(pending, second_pending, "independent request")
+     assert second.stats["grouped_blocks"] == second.stats["grouped_projection_calls"] == 0
+     assert second.grouped_eligible is None and second.rotary_eligible is None
+     assert second.stats["rotary_blocks"] == second.stats["grouped_rotary_calls"] == 0
++    assert second.stats["two_position_blocks"] == 0
+     assert second.index is not base.index and second.history is not base.history
+     _prefixes(base, second, "independent request")
+     print("Native grouped rotary/projections, intermediates, logits, KV and transitions passed.")
+diff --git a/candidate/inference.py b/candidate/inference.py
+index 0239cf2..67d1d32 100644
+--- a/candidate/inference.py
++++ b/candidate/inference.py
+@@ -40,6 +40,7 @@ class RequestCache(list):
+             "verifications": 0,
+             "bulk_verifications": 0,
+             "bulk_updates": 0,
++            "two_position_blocks": 0,
+             "batched_blocks": 0,
+             "batched_positions": 0,
+             "grouped_blocks": 0,
+@@ -218,7 +219,7 @@ def _project(projection, inputs, dependencies):
+ 
+ def _bulk_start(cache, count):
+     """Choose bulk insertion only with drained history and existing capacity."""
+-    if count < 3 or not isinstance(cache, RequestCache) or not cache:
++    if count < 2 or not isinstance(cache, RequestCache) or not cache:
+         return None
+     start = cache[0].offset
+     if start != len(cache.history) - 1:
+@@ -258,6 +259,14 @@ def _verify(model, cache, tokens, *, _trace=None):
+         cache.rotary_eligible = _rotary_supported(model) if grouped else None
+     rotary = (grouped and cache.rotary_eligible and 0 <= start
+               and start + len(tokens) - 1 <= 2147483647)
++    # A one-token draft is eligible only for the complete grouped path.
++    # Resolve this before constructing tensors, counting work or writing KV.
++    if len(tokens) == 2:
++        if rotary:
++            cache.stats["two_position_blocks"] += 1
++        else:
++            start = None
++            batched = grouped = rotary = False
+     if rotary:
+         rotary_offsets = _rotary_offsets(start, len(tokens))
+         cache.stats["rotary_blocks"] += 1
