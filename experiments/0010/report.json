@@ -1,0 +1,94 @@
+{
+  "round": "0010",
+  "parent_commit": "3d966e3efa91f3fb0ff1d8a2a9d0d51c52d91b22",
+  "models": {
+    "research": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "review": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "implementation": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    }
+  },
+  "status": "rejected",
+  "research": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Two-stage speculative verification",
+      "idea": "For drafts containing at least three tokens, first run the existing scalar verifier on only [pending, d0]. Compute the remaining positions only if both predictions match d0 and d1. Otherwise emit the matching prefix and correction immediately. Keep shorter drafts on the current path.",
+      "cost_removed": "An early rejection skips k-1 complete target positions for a k-token draft. At k=16, this removes 3,150 body projections, 450 attention evaluations, and 15 vocabulary projections. When both initial comparisons succeed, arithmetic is unchanged and one additional verification boundary is incurred.",
+      "source_evidence": "candidate/inference.py:198\u2013213 submits all k+1 positions and materializes every prediction before checking acceptance. _verify executes seven projections and one attention evaluation per layer per position, followed by a full vocabulary head. Direct checkpoint inspection confirms 30 layers, 210 body projection matrices occupying 212,336,640 bytes, and a tied BF16 [49152,576] head occupying 56,623,104 bytes; these are storage sizes, not measured traffic. Causal verification makes predictions after the first mismatch unnecessary, following the acceptance rule in [speculative decoding, Section 2](https://arxiv.org/html/2211.17192v2).",
+      "generalization": "Conditional omission of rejected transformer positions reduces arithmetic and cache work independently of hardware or kernels. It applies to causal speculative decoders with reversible caches and can matter for frontier models where rejected positions incur substantial transformer and attention work.",
+      "risk": "If the first two drafts usually match, extra synchronization and a second traversal of model weights can outweigh savings. Splitting also reduces weight reuse across positions. Exactness requires retaining the accepted singleton operations, causal cache views, allocation layout, and correct rollback accounting.",
+      "history_relation": "Preserves rounds 0004, 0006, and 0008. Round 0009 tested conditional heads after computing every transformer position and achieved 0.989x. This experiment can omit entire transformer positions and introduces at most one additional result-read boundary per block. It does not repeat round 0001\u2019s numerical batching."
+    },
+    "plan": "1. Implement only inside candidate/. Preserve prefill, drafting policy, support checks, scalar pipeline, _project, and _verify. Freeze a two-position first stage for k>=3; retain the current eager path for k<=2. Use no benchmark-derived tuning.\n\n2. At a drained boundary with cache offset C, run _verify on [pending,d0]. Materialize its two predictions p0,p1 together, completing both positions and their cache writes. Do not construct or submit the remaining verifier graph beforehand.\n\n3. If p0=d0 and p1=d1, run the unchanged _verify on [d1,...,d(k-1)] using the resulting cache at C+2. This yields p2,...,pk. Otherwise skip that suffix entirely. Keep the original draft snapshot and defer history updates until acceptance is resolved.\n\n4. Let M be the number of positions actually executed: two on early rejection, otherwise k+1. Let a be the matching draft-prefix length. Commit d0 through d(a-1), followed by pa; retain its native prediction tensor as pending. Trim M-a-1 positions, leaving every cache at C+a+1. Preserve allocation, output budgets, fixed-length generation, and request isolation.\n\n5. Add request-local counters for stages and omitted positions. Compare emitted tokens, consumed logits, retained KV values, offsets, allocation shapes, and subsequent greedy continuation against the eager verifier and scalar reference. Exercise every draft and acceptance length, both first-stage rejection cases, full acceptance, capacity boundaries, and scalar transitions. An independent in-memory causal simulation passed 4,712 scheduling cases during research; native BF16 parity remains untested.\n\n6. Have the orchestrator run unchanged exact-token evaluation and both throughput confirmations against the current best. Include all staging, synchronization, indexing, and rollback costs. Retain only the required >=1.03x improvement in both confirmations.",
+    "reason": "This is a small, sound change that can remove substantial whole-model work while reusing the accepted numerical path. Early-rejection savings versus additional synchronization and weight traversal remain a genuine benchmark question."
+  },
+  "review": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Two-stage speculative verification",
+      "idea": "For k>=3 draft tokens, run the unchanged singleton verifier on [pending,d0] and jointly read predictions p0,p1. Verify [d1,...,d(k-1)] only if p0=d0 and p1=d1. Otherwise immediately resolve acceptance and rollback. Keep k<=2 on the existing eager path.",
+      "cost_removed": "Rejection within the first two comparisons skips k-1 complete target positions. At k=16, this removes 3,150 body projections, 450 attention evaluations, and 15 vocabulary projections, plus their normalization and cache work. Immediate rejection still computes one unused position. Passing the gate removes no arithmetic and incurs one additional joint result-read boundary.",
+      "source_evidence": "Verified candidate/inference.py:128\u2013173 performs seven singleton projections and one attention evaluation per layer and position, followed by a vocabulary head; lines 198\u2013219 compute every prediction before acceptance checking. Lines 99\u2013105 constrain the entire block to existing cache capacity. Installed KVCache returns offset-bounded views and trims offsets without shrinking allocation. The pinned checkpoint confirms 30 layers, 210 BF16 body projection matrices occupying 212,336,640 bytes, and a tied BF16 [49152,576] head occupying 56,623,104 bytes; these are storage sizes. harness/bench.py:20\u201329 synchronizes before timing and after decode. Prefix acceptance and correction follow [speculative decoding, Section 2](https://arxiv.org/html/2211.17192v2); conditional omission is an inference from causality, not published validation of this schedule.",
+      "generalization": "Omitting rejected transformer positions reduces arithmetic and cache work independently of hardware, compiler, or kernels. The mechanism applies to causal speculative decoders with reversible caches. Frontier-scale benefit depends on early rejection frequency and the cost of additional weight traversal and synchronization.",
+      "risk": "Frequent gate acceptance can make extra synchronization and reduced weight reuse outweigh savings. Splitting must preserve singleton arithmetic, causal attention views, positional offsets, allocation layout, and retained KV values. Matching immediate token IDs alone does not establish subsequent reference parity.",
+      "history_relation": "Preserves accepted rounds 0004, 0006, and 0008. Round 0009 passed exactness but achieved 0.989x while omitting only vocabulary heads after all transformer positions executed. Its overhead is relevant evidence; whole-position omission with one additional boundary remains untested. Round 0001's undiagnosed exactness failure reinforces preserving the accepted singleton numerical path."
+    },
+    "plan": "1. Modify candidate/ only. Preserve prefill, public interfaces, shared model parameters and bindings, support checks, _project, _verify, drafting policy, capacity restrictions, and scalar pipeline. Freeze the two-position gate for k>=3 before evaluation; use no benchmark-derived tuning.\n\n2. Start only at a drained scalar boundary. Let committed history be H, pending token t=H[-1], and every cache represent H[:-1] at offset C. Use the unchanged _draft result, including its output-budget and allocation-capacity limits. Preserve the original draft snapshot and defer history/index updates until the block is resolved.\n\n3. For k>=3, construct native singleton inputs [t,d0] with the existing token dtype and shape. Call _verify, submit its two predictions, and jointly materialize both IDs. The unchanged verifier dependencies must complete both positions and their cache writes before further verification or rollback. Do not construct or submit the suffix verifier graph before the decision.\n\n4. If p0=d0 and p1=d1, call the unchanged _verify on [d1,...,d(k-1)] at offset C+2 and jointly materialize its predictions p2,...,pk. Do not process d0 again. Otherwise stop verification: acceptance is zero if p0 differs, or one if only p1 differs. For k<=2, retain the current eager verification and joint read.\n\n5. Let M be the number of positions actually executed: two on early rejection, otherwise k+1. Let a be the consecutive matching draft count. Commit d0 through d(a-1), then pa, exactly once; retain the native prediction tensor pa as pending. Trim M-a-1 positions from each cache, leaving offset C+a+1 and history length C+a+2. Using the old k-a trim on early rejection is incorrect. Preserve allocation, exclude stale slots through offsets, and release unused stage references after submitted work completes.\n\n6. Preserve fixed-length generation, including after EOS, empty and one-token budgets, and termination without processing the final pending token. Keep graph construction, stage reads, indexing, rollback, counters, and cleanup inside decode. Retain request isolation. Record stage calls, executed positions M, omitted positions k+1-M, and trimmed positions M-a-1 without hot-path logging. Keep draft/acceptance histograms per original block; document that the existing k-a rejection count includes omitted drafts. Check trimmed+omitted=k-a.\n\n7. Validate draft lengths 1\u201316 and every acceptance length, including accidental later matches after an earlier mismatch. Exercise budgets, capacity edges, subsequent scalar growth, scalar/speculative transitions, and request isolation. Confirm early rejection never constructs the suffix verifier. On independent native inputs, compare consumed logits and retained KV prefixes bitwise against the eager verifier and teacher-forced scalar execution from separate equivalent caches; compare offsets, allocation shapes, emitted tokens, and greedy continuation after rollback. Investigate discrepancies; logical simulations do not establish BF16 parity.\n\n8. Have the orchestrator run unchanged exact-token evaluation, including the complete benchmark workload, then both throughput confirmations against the accepted round-0008 candidate. Include all staging costs, report activation and omitted-position counts, and retain only an incremental gain of at least 1.03x in each confirmation.",
+    "reason": "No fundamental flaw was found. Review sharpens stage indexing, completion barriers, rollback, and work accounting. Independent causal simulations passed 11,856 scheduling cases, and the existing drafting code passed 4,400 capacity checks. Native BF16 parity and net throughput remain for evaluation and benchmarking."
+  },
+  "implementation": {
+    "outcome": "implemented",
+    "summary": "Implemented two-stage verification in candidate/inference.py with executed-position rollback and stage counters. Preserved verifier arithmetic, drafting, and scalar pipeline. Control-flow checks passed for all draft lengths and acceptance lengths. Native BF16 parity and benchmarking remain for the orchestrator; local MLX initialization fails because no Metal device is available."
+  },
+  "eval": {
+    "correct": true,
+    "cases": [
+      {
+        "prompt": "Explain why the sky is blue.",
+        "correct": true
+      },
+      {
+        "prompt": "Write a short Python function that reverses a list.",
+        "correct": true
+      },
+      {
+        "prompt": "What are the main causes of inflation?",
+        "correct": true
+      },
+      {
+        "prompt": "Describe how photosynthesis works.",
+        "correct": true
+      },
+      {
+        "prompt": "Continue this story: The door opened and nobody was there.",
+        "correct": true
+      },
+      {
+        "prompt": "<benchmark>",
+        "correct": true
+      }
+    ]
+  },
+  "confirmations": [
+    {
+      "baseline_relative_decode_speed": 1.5549414472768148,
+      "candidate_relative_decode_speed": 1.5010815334073395,
+      "gain": 0.965362095168406
+    },
+    {
+      "baseline_relative_decode_speed": 1.554166994760965,
+      "candidate_relative_decode_speed": 1.504198344264931,
+      "gain": 0.9678485962805307
+    }
+  ],
+  "confirmed_gain": 0.965362095168406,
+  "reason": "decode gain was not >= 1.03x twice"
+}

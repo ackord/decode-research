@@ -1,0 +1,70 @@
+diff --git a/candidate/inference.py b/candidate/inference.py
+index 2ff26c4..b83915e 100644
+--- a/candidate/inference.py
++++ b/candidate/inference.py
+@@ -35,8 +35,14 @@ class RequestCache(list):
+         self.stats = {
+             "scalar_steps": 0,
+             "verifications": 0,
++            "two_stage_verifications": 0,
++            "stage_calls": 0,
++            "executed_positions": 0,
++            "omitted_positions": 0,
++            "trimmed_positions": 0,
+             "draft_lengths": [0] * (MAX_DRAFTS + 1),
+             "accepted_lengths": [0] * (MAX_DRAFTS + 1),
++            # Includes drafts omitted by the gate, not just cache rollback.
+             "rejected_positions": 0,
+         }
+         for token in token_ids:
+@@ -195,12 +201,27 @@ def decode(model, first_token, cache, max_new_tokens):
+         if supported and not pending:
+             drafts = _draft(state, max_new_tokens - len(output))
+             if drafts:
++                staged = len(drafts) >= 3
++                stage_calls = 1
+                 inputs = [token.reshape(1, 1)] + [
+-                    mx.array([[d]], dtype=token.dtype) for d in drafts
++                    mx.array([[d]], dtype=token.dtype)
++                    for d in (drafts[:1] if staged else drafts)
+                 ]
+                 predictions = _verify(model, cache, inputs)
+                 mx.async_eval(*predictions)
+                 ids = mx.stack(predictions).tolist()
++                # The joint read completes both gate positions and cache writes.
++                # Construct no suffix graph until both comparisons pass.
++                del inputs
++                if staged and ids[0][0] == drafts[0] and ids[1][0] == drafts[1]:
++                    inputs = [mx.array([[d]], dtype=token.dtype) for d in drafts[1:]]
++                    suffix = _verify(model, cache, inputs)
++                    mx.async_eval(*suffix)
++                    ids.extend(mx.stack(suffix).tolist())
++                    predictions.extend(suffix)
++                    stage_calls += 1
++                    del inputs, suffix
++                executed = len(predictions)
+                 accepted = 0
+                 while accepted < len(drafts) and drafts[accepted] == ids[accepted][0]:
+                     accepted += 1
+@@ -209,11 +230,19 @@ def decode(model, first_token, cache, max_new_tokens):
+                 commit(ids[accepted][0])
+                 token = predictions[accepted]
+                 rejected = len(drafts) - accepted
++                omitted = len(drafts) + 1 - executed
++                trimmed = executed - accepted - 1
++                # trimmed + omitted == rejected, including early gate rejection.
+                 for kv in cache:
+-                    kv.trim(rejected)
+-                del inputs, predictions, ids
++                    kv.trim(trimmed)
++                del predictions, ids
+                 stats = state.stats
+                 stats["verifications"] += 1
++                stats["two_stage_verifications"] += int(staged)
++                stats["stage_calls"] += stage_calls
++                stats["executed_positions"] += executed
++                stats["omitted_positions"] += omitted
++                stats["trimmed_positions"] += trimmed
+                 stats["draft_lengths"][len(drafts)] += 1
+                 stats["accepted_lengths"][accepted] += 1
+                 stats["rejected_positions"] += rejected
