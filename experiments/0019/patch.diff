@@ -1,0 +1,568 @@
+diff --git a/candidate/checks.py b/candidate/checks.py
+index 98e5de8..8f71c1f 100644
+--- a/candidate/checks.py
++++ b/candidate/checks.py
+@@ -1,11 +1,12 @@
+ """Native checks invoked by inference.check_grouped; no benchmark inputs."""
++import ctypes
+ from contextlib import ExitStack
+ from unittest.mock import patch
+ 
+ import mlx.core as mx
+ import mlx.nn as nn
+ from mlx_lm.models import llama
+-from mlx_lm.models.cache import make_prompt_cache
++from mlx_lm.models.cache import KVCache, make_prompt_cache
+ 
+ from . import inference as ci
+ 
+@@ -36,14 +37,173 @@ def _clone(model, cache, capacity=None):
+         for name in ("keys", "values"):
+             array = mx.asarray(getattr(source, name), copy=True)
+             if capacity is not None:
++                size = (capacity[("keys", "values").index(name)]
++                        if isinstance(capacity, tuple) else capacity)
+                 array = mx.concatenate([array[..., :source.offset, :],
+-                    mx.zeros((*array.shape[:2], capacity - source.offset, array.shape[3]),
++                    mx.zeros((*array.shape[:2], size - source.offset, array.shape[3]),
+                              dtype=array.dtype)], axis=2)
+             setattr(target, name, array)
+     result = ci.RequestCache(copies, cache.history)
+     return result
+ 
+ 
++def _attention_boundary_checks():
++    for m in range(3, 18):
++        for start in (0, 1005, 1015, 1020, 1023, 1024,
++                      4077, 4087, 4092, 4095, 4096, 8192):
++            fragments = ci._attention_fragments(start, m)
++            assert [i for lo, hi in fragments for i in range(lo, hi)] == list(range(m))
++            for lo, hi in fragments:
++                regions = {(start + i + 1 >= 1024, start + i + 1 >= 4096)
++                           for i in range(lo, hi)}
++                assert len(regions) == 1, (start, m, fragments)
++        assert ci._attention_fragments(-1, m) is None
++        assert ci._attention_fragments(2**31 - m, m) is None
++        assert ci._attention_fragments((2**31 - 1) // (3 * m) - m, m) is not None
++        if m > 3:
++            assert ci._attention_fragments((2**31 - 1) // (3 * m) - m + 1, m) is None
++
++
++def _attention_counts(cache, start, m, layers=1):
++    fragments = ci._attention_fragments(start, m)
++    grouped = sum(3 for lo, hi in fragments if hi - lo > 3)
++    scalar = sum(hi - lo for lo, hi in fragments if hi - lo <= 3)
++    assert cache.stats["grouped_attention_calls"] == layers * grouped
++    assert cache.stats["singleton_attention_calls"] == layers * scalar
++    if hasattr(cache, "attention_eligible"):
++        assert cache.stats["attention_blocks"] == int(grouped > 0)
++
++
++def _layout(array):
++    """Inspect shared native storage through a no-copy DLPack capsule."""
++    class Device(ctypes.Structure):
++        _fields_ = [("type", ctypes.c_int), ("id", ctypes.c_int)]
++
++    class Dtype(ctypes.Structure):
++        _fields_ = [("code", ctypes.c_uint8), ("bits", ctypes.c_uint8),
++                    ("lanes", ctypes.c_uint16)]
++
++    class Tensor(ctypes.Structure):
++        _fields_ = [("data", ctypes.c_void_p), ("device", Device),
++                    ("ndim", ctypes.c_int), ("dtype", Dtype),
++                    ("shape", ctypes.POINTER(ctypes.c_int64)),
++                    ("strides", ctypes.POINTER(ctypes.c_int64)),
++                    ("offset", ctypes.c_uint64)]
++
++    capsule = array.__dlpack__(copy=False)
++    pointer = ctypes.pythonapi.PyCapsule_GetPointer
++    pointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
++    pointer.restype = ctypes.c_void_p
++    tensor = ctypes.cast(pointer(capsule, b"dltensor"), ctypes.POINTER(Tensor)).contents
++    shape = tuple(tensor.shape[i] for i in range(tensor.ndim))
++    if tensor.strides:
++        strides = tuple(tensor.strides[i] for i in range(tensor.ndim))
++    else:
++        stride, reverse = 1, []
++        for dim in reversed(shape):
++            reverse.append(stride)
++            stride *= dim
++        strides = tuple(reversed(reverse))
++    return tensor.data + tensor.offset, shape, strides
++
++
++def _attention_storage_check(q, kv, scale, start, fragments):
++    """Check views and bound backend allocation below even one tiled KV pair."""
++    lo, hi, mask = next(f for f in fragments if f[1] - f[0] > 3)
++    r, n = hi - lo, start + hi
++    query = mx.contiguous(q[lo:hi, :3])
++    keys = mx.broadcast_to(kv.keys[:, :1, :n], (r, 1, n, 64))
++    values = mx.broadcast_to(kv.values[:, :1, :n], (r, 1, n, 64))
++    mx.eval(query, keys, values, mask)
++    for source, view in ((kv.keys, keys), (kv.values, values)):
++        original, _, _ = _layout(source)
++        address, shape, strides = _layout(view)
++        assert address == original and shape == (r, 1, n, 64)
++        assert strides[0] == 0 and strides[2:] == (64, 1), strides
++    _, _, strides = _layout(mask)
++    assert strides == (3 * n, n, n, 1), strides
++    mx.reset_peak_memory()
++    before = mx.get_active_memory()
++    out = llama.scaled_dot_product_attention(query, keys, values, cache=kv,
++                                             scale=scale, mask=mask)
++    mx.eval(out)
++    extra = mx.get_peak_memory() - before
++    # At GQA=3 audited dispatch uses <=128 partitions on all native devices.
++    # Allow output, scratch, and allocation rounding, but no repeated KV.
++    scratch = r * 3 * 128 * (64 * 2 + 8)
++    assert extra <= scratch + 2 * query.nbytes + 1024 * 1024, extra
++    assert extra < 2 * r * n * 64 * 2, ("possible hidden KV expansion", extra)
++
++
++def _attention_checks(model):
++    scale = model.layers[0].self_attn.scale
++    starts = (0, 1, 1005, 1015, 1020, 1023, 1024,
++              4077, 4087, 4092, 4095, 4096, 8191, 8192, 8201, 16385)
++    for m in range(3, 18):
++        for start in starts:
++            n = start + m
++            j = mx.arange(n * 3 * 64, dtype=mx.float32).reshape(1, 3, n, 64)
++            t = mx.arange(m * 9 * 64, dtype=mx.float32).reshape(m, 9, 1, 64)
++            masks = ci._attention_masks(start, ci._attention_fragments(start, m))
++            for case in range(5):
++                if case == 0:
++                    q = mx.random.normal(t.shape, key=mx.random.key(m + 101))
++                    k = mx.random.normal(j.shape, key=mx.random.key(n + 103))
++                    v = mx.random.normal(j.shape, key=mx.random.key(n + 107))
++                elif case == 1:
++                    q = (t % 2 * 2 - 1) * (1 + (t // 64 % 9) / 16)
++                    k = (j % 2 * 2 - 1) * (j // 64 % 11 - 5)
++                    v = (j % 2 * 2 - 1) * (1 + j // 64 % 7 / 32)
++                elif case == 2:
++                    q = 1 + (t % 5 - 2) / 256 + (t % 3 - 1) / 262144
++                    k = 1 + (j % 7 - 3) / 256 + (j % 3 - 1) / 262144
++                    v = 1 + (j % 5 - 2) / 256 + (j % 3 - 1) / 262144
++                else:
++                    magnitude = 1e15 if case == 3 else 1e-30
++                    q = (t % 13 - 6) * magnitude
++                    k = (j % 17 - 8) * magnitude
++                    v = (j % 19 - 9) * (1e30 if case == 3 else 1e-30)
++                q, k, v = [mx.contiguous(a.astype(mx.bfloat16)) for a in (q, k, v)]
++                # Differing allocation pitches and poisoned spare capacity.
++                for spare in (0, 7):
++                    kv = KVCache()
++                    kv.offset = n
++                    kv.keys = mx.concatenate([k, mx.full((1, 3, spare, 64), float("nan"), mx.bfloat16)], axis=2)
++                    kv.values = mx.concatenate([v, mx.full((1, 3, spare * 2, 64), float("nan"), mx.bfloat16)], axis=2)
++                    stats = {"grouped_attention_calls": 0, "singleton_attention_calls": 0}
++                    out = ci._shared_attention(q, kv, scale, start, masks, stats)
++                    rows = ci._rows(out)
++                    for i in range(m):
++                        end = start + i + 1
++                        single = llama.scaled_dot_product_attention(q[i:i + 1],
++                            kv.keys[..., :end, :], kv.values[..., :end, :],
++                            cache=kv, scale=scale, mask=None)
++                        _equal(rows[i], single.reshape(1, 1, 576),
++                               f"attention/m{m}/C{start}/case{case}/spare{spare}/row{i}")
++                    holder = type("Counters", (), {"stats": stats})()
++                    _attention_counts(holder, start, m)
++                # Poison keys that are masked for the first row of each grouped
++                # fragment. Compare only that row: its entire valid prefix is finite.
++                if case == 0:
++                    for lo, hi, mask in masks:
++                        if mask is None:
++                            continue
++                        end = start + lo + 1
++                        kv.keys = mx.concatenate([k[..., :end, :],
++                            mx.full((1, 3, n - end, 64), float("nan"), mx.bfloat16)], axis=2)
++                        kv.values = mx.concatenate([v[..., :end, :],
++                            mx.full((1, 3, n - end, 64), float("inf"), mx.bfloat16)], axis=2)
++                        stats = {"grouped_attention_calls": 0, "singleton_attention_calls": 0}
++                        out = ci._shared_attention(q, kv, scale, start, [(lo, hi, mask)], stats)
++                        single = llama.scaled_dot_product_attention(q[lo:lo + 1],
++                            k[..., :end, :], v[..., :end, :], cache=kv, scale=scale, mask=None)
++                        _equal(out[:, :1], single.reshape(1, 1, 576),
++                               f"masked poison/m{m}/C{start}/lo{lo}")
++            if m == 17 and start == 16385:
++                kv.keys, kv.values = k, v
++                _attention_storage_check(q, kv, scale, start, masks)
++
++
+ def _projection_checks(model):
+     a, f = model.layers[0].self_attn, model.layers[0].mlp
+     weights = (a.q_proj.weight, a.k_proj.weight, f.gate_proj.weight,
+@@ -184,15 +344,17 @@ def _trace_dict(trace):
+     return result
+ 
+ 
+-def _verification_checks(model, base, pending):
+-    for m in range(3, 18):
++def _verification_checks(model, base, pending, lengths=range(3, 18)):
++    for m in lengths:
+         # Unrelated forced tokens exercise rejected tails, not sampled matches.
+         tokens = [pending.reshape(1, 1)] + [mx.array([[31 + 13 * i]]) for i in range(m - 1)]
+-        for capacity in (base[0].keys.shape[2], base[0].offset + m):
++        for capacity in (max(base[0].keys.shape[2], base[0].offset + m),
++                         base[0].offset + m,
++                         (base[0].offset + m + 7, base[0].offset + m + 19)):
+             grouped, previous, reference = [_clone(model, base, capacity) for _ in range(3)]
+             grouped.append_token(pending.item())
+             previous.append_token(pending.item())
+-            previous.rotary_eligible = False
++            previous.attention_eligible = False
+             gt, pt = [], []
+             rope_call = nn.RoPE.__call__
+             offsets = {}
+@@ -206,8 +368,24 @@ def _verification_checks(model, base, pending):
+                 offsets[id(module)] = i + 1
+                 return rope_call(module, x, offset=offset)
+ 
+-            with patch.object(nn.RoPE, "__call__", grouped_rope):
++            attention_call = llama.scaled_dot_product_attention
++            mask_uses = {}
++
++            def inspect_attention(q, k, v, **kwargs):
++                mask = kwargs["mask"]
++                if mask is not None:
++                    assert q.shape[1:] == (3, 1, 64)
++                    assert k.shape[:2] == v.shape[:2] == (q.shape[0], 1)
++                    assert mask.dtype == mx.bool_ and mask.shape == (*q.shape[:3], k.shape[2])
++                    mask_uses[id(mask)] = mask_uses.get(id(mask), 0) + 1
++                return attention_call(q, k, v, **kwargs)
++
++            with patch.object(nn.RoPE, "__call__", grouped_rope), \
++                    patch.object(llama, "scaled_dot_product_attention", inspect_attention):
+                 gp = ci._verify(model, grouped, tokens, _trace=gt)
++            grouped_fragments = sum(hi - lo > 3 for lo, hi in ci._attention_fragments(base[0].offset, m))
++            assert len(mask_uses) == grouped_fragments
++            assert all(uses == 90 for uses in mask_uses.values())
+             assert len(offsets) == 30 and all(n == 2 for n in offsets.values())
+             assert grouped.stats["rotary_blocks"] == 1
+             assert grouped.stats["grouped_rotary_calls"] == 60
+@@ -215,8 +393,11 @@ def _verification_checks(model, base, pending):
+             mx.eval(*gp, *pp)
+             assert grouped.stats["grouped_projection_calls"] == 211
+             assert previous.stats["grouped_projection_calls"] == 211
+-            assert previous.stats["rotary_blocks"] == 0
+-            assert previous.stats["grouped_rotary_calls"] == 0
++            assert previous.stats["rotary_blocks"] == 1
++            assert previous.stats["grouped_rotary_calls"] == 60
++            _attention_counts(grouped, base[0].offset, m, layers=30)
++            assert previous.stats["grouped_attention_calls"] == 0
++            assert previous.stats["singleton_attention_calls"] == 30 * m
+             gd, pd = _trace_dict(gt), _trace_dict(pt)
+             rd = _reference_trace(model, reference, tokens)
+             assert gd.keys() == pd.keys() == rd.keys()
+@@ -250,6 +431,7 @@ def _verification_checks(model, base, pending):
+                        f"untraced logits/m{m}/row{i}")
+             _prefixes(untraced, grouped, f"untraced/m{m}")
+             assert untraced.stats["grouped_rotary_calls"] == 60
++            _attention_counts(untraced, base[0].offset, m, layers=30)
+             # Rollback each possible acceptance length, then overwrite stale
+             # tails and grow past capacity through actual scalar forwards.
+             for accepted in range(m):
+@@ -297,10 +479,11 @@ def _decode_checks(model, base, pending):
+         assert cache.stats["grouped_projection_calls"] == 211
+         assert cache.stats["rotary_blocks"] == 1
+         assert cache.stats["grouped_rotary_calls"] == 60
++        _attention_counts(cache, base[0].offset, 17, layers=30)
+         assert all(kv.offset == base[0].offset + 23 for kv in cache)
+         _prefixes(cache, oracle_cache, f"decode/accept{accepted}")
+     # Two consecutive fully accepted blocks, then the scalar pipeline.
+-    cache = _clone(model, base, base[0].offset + 7)
++    cache = _clone(model, base, base[0].offset + 11)
+     blocks = []
+ 
+     def consecutive_draft(state, remaining):
+@@ -308,31 +491,38 @@ def _decode_checks(model, base, pending):
+             return []
+         index = len(state.history) - len(base.history)
+         blocks.append(index)
+-        return oracle[index:index + 2]
++        return oracle[index:index + 4]
+ 
+     with patch.object(ci, "_draft", consecutive_draft):
+         assert ci.decode(model, pending, cache, 24) == oracle
+-    assert blocks == [1, 4]
++    assert blocks == [1, 6]
++    assert cache.stats["attention_blocks"] == 2
++    assert cache.stats["grouped_attention_calls"] == 180
++    assert cache.stats["singleton_attention_calls"] == 0
+     assert cache.stats["rotary_blocks"] == 2
+     assert cache.stats["grouped_rotary_calls"] == 120
+     _prefixes(cache, oracle_cache, "consecutive blocks then scalar growth")
+ 
+-    # A rotary-only gate failure must leave accepted projection grouping on.
+-    g, r = _clone(model, base), _clone(model, base)
+-    g.append_token(pending.item())
+-    tokens = [pending.reshape(1, 1)] * 3
+-    trace = []
+-    with patch.object(ci, "_rotary_supported", return_value=False):
+-        predictions = ci._verify(model, g, tokens, _trace=trace)
+-    ref = [model(t, cache=r) for t in tokens]
+-    mx.eval(*predictions)
+-    logits = dict(trace)["logits"]
+-    assert len(logits) == len(ref) == 3
+-    for i in range(3):
+-        _equal(logits[i], ref[i], f"rotary-only fallback/row{i}")
+-    assert g.stats["grouped_projection_calls"] == 211
+-    assert g.stats["rotary_blocks"] == g.stats["grouped_rotary_calls"] == 0
+-    _prefixes(g, r, "rotary-only fallback")
++    # Each independent gate failure preserves previously accepted grouping.
++    for gate in ("_rotary_supported", "_attention_supported"):
++        g, r = _clone(model, base), _clone(model, base)
++        g.append_token(pending.item())
++        tokens = [pending.reshape(1, 1)] * 5
++        trace = []
++        with patch.object(ci, gate, return_value=False):
++            predictions = ci._verify(model, g, tokens, _trace=trace)
++        ref = [model(t, cache=r) for t in tokens]
++        mx.eval(*predictions)
++        logits = dict(trace)["logits"]
++        assert len(logits) == len(ref) == 5
++        for i in range(5):
++            _equal(logits[i], ref[i], f"{gate} fallback/row{i}")
++        assert g.stats["grouped_projection_calls"] == 211
++        assert g.stats["grouped_attention_calls"] == 0
++        assert g.stats["singleton_attention_calls"] == 150
++        assert g.stats["rotary_blocks"] == int(gate == "_attention_supported")
++        assert g.stats["grouped_rotary_calls"] == 60 * int(gate == "_attention_supported")
++        _prefixes(g, r, f"{gate} fallback")
+ 
+     for limit in (0, 1, 2, 3, 5):
+         cache = _clone(model, base)
+@@ -391,16 +581,25 @@ def check_grouped(model):
+         with patch.object(rope, name, unsupported):
+             assert not ci._rotary_supported(model), name
+             assert ci._grouped_supported(model, base), name
++    assert ci._attention_supported(model, base), "Attention backend is outside the audited gate"
++    _attention_boundary_checks()
++    _attention_checks(model)
+     _rotary_checks(model)
+     _projection_checks(model)
+     _verification_checks(model, base, pending)
+     _decode_checks(model, base, pending)
++    for context in (1015, 1023, 1024, 4087, 4095, 4096, 8201):
++        long_prompt = [1] + [41 + (i * 17) % 311 for i in range(context - 1)]
++        long_pending, long_base = ci.prefill(model, long_prompt)
++        _verification_checks(model, long_base, long_pending, lengths=(17,))
+     # A fresh prefill must recreate all request state, including counters.
+     second_pending, second = ci.prefill(model, prompt)
+     _equal(pending, second_pending, "independent request")
+     assert second.stats["grouped_blocks"] == second.stats["grouped_projection_calls"] == 0
+     assert second.grouped_eligible is None and second.rotary_eligible is None
++    assert second.attention_eligible is None
++    assert second.stats["attention_blocks"] == second.stats["grouped_attention_calls"] == 0
+     assert second.stats["rotary_blocks"] == second.stats["grouped_rotary_calls"] == 0
+     assert second.index is not base.index and second.history is not base.history
+     _prefixes(base, second, "independent request")
+-    print("Native grouped rotary/projections, intermediates, logits, KV and transitions passed.")
++    print("Native grouped attention/rotary/projections, intermediates, logits, KV and transitions passed.")
+diff --git a/candidate/inference.py b/candidate/inference.py
+index 0239cf2..9b89662 100644
+--- a/candidate/inference.py
++++ b/candidate/inference.py
+@@ -1,3 +1,5 @@
++from importlib.metadata import version
++
+ import mlx.core as mx
+ import mlx.nn as nn
+ from mlx_lm.models.cache import KVCache, make_prompt_cache
+@@ -35,6 +37,7 @@ class RequestCache(list):
+         self.batch_rows_eligible = None
+         self.grouped_eligible = None
+         self.rotary_eligible = None
++        self.attention_eligible = None
+         self.stats = {
+             "scalar_steps": 0,
+             "verifications": 0,
+@@ -45,6 +48,9 @@ class RequestCache(list):
+             "grouped_blocks": 0,
+             "grouped_positions": 0,
+             "grouped_projection_calls": 0,
++            "attention_blocks": 0,
++            "grouped_attention_calls": 0,
++            "singleton_attention_calls": 0,
+             "rotary_blocks": 0,
+             "grouped_rotary_calls": 0,
+             "draft_lengths": [0] * (MAX_DRAFTS + 1),
+@@ -181,6 +187,80 @@ def _rotary_supported(model):
+                for a in (layer.self_attn for layer in model.layers))
+ 
+ 
++def _attention_supported(model, cache):
++    """Independent gate for the audited BF16 singleton attention entrypoints."""
++    return (version("mlx") == "0.32.3" and version("mlx-lm") == "0.32.0"
++            and mx.default_device() == mx.gpu
++            and _grouped_supported(model, cache) and _rotary_supported(model)
++            and all(type(kv) is KVCache for kv in cache)
++            and all(not layer.use_sliding and layer.self_attn.head_dim == 64
++                    and getattr(layer.self_attn, "sinks", None) is None
++                    for layer in model.layers))
++
++
++def _attention_fragments(start, count):
++    """Preserve scalar dispatch regions and signed mask-index arithmetic."""
++    if start < 0 or start + count > 2147483647:
++        return None
++    cuts = {0, count}
++    for boundary in (1024, 4096):
++        # First position whose inclusive prefix is at least boundary.
++        cuts.add(max(0, min(count, boundary - start - 1)))
++    cuts = sorted(cuts)
++    fragments = list(zip(cuts, cuts[1:]))
++    if any(3 * (hi - lo) * (start + hi) > 2147483647
++           for lo, hi in fragments if hi - lo > 3):
++        return None
++    return fragments
++
++
++def _attention_masks(start, fragments):
++    masks = []
++    for lo, hi in fragments:
++        r, n = hi - lo, start + hi
++        if r > 3:
++            ends = (mx.arange(r, dtype=mx.int32) + start + lo + 1)
++            positions = mx.arange(n, dtype=mx.int32)[None, None, None, :]
++            valid = positions < ends[:, None, None, None]
++            # Materialize head expansion once, reused across heads and layers.
++            mask = mx.contiguous(mx.broadcast_to(valid, (r, 3, 1, n)))
++        else:
++            mask = None
++        masks.append((lo, hi, mask))
++    return masks
++
++
++def _shared_attention(q, kv, scale, start, fragments, stats):
++    """Pack only queries; K/V stay immutable broadcast views of allocated KV."""
++    outputs = []
++    buffers = [kv.keys, kv.values]
++    for lo, hi, mask in fragments:
++        r, n = hi - lo, start + hi
++        if mask is None:
++            for i in range(lo, hi):
++                deps = buffers + outputs[-1:]
++                out = llama.scaled_dot_product_attention(
++                    mx.depends(q[i:i + 1], deps),
++                    kv.keys[..., :start + i + 1, :],
++                    kv.values[..., :start + i + 1, :],
++                    cache=kv, scale=scale, mask=None)
++                outputs.append(out.transpose(0, 2, 1, 3).reshape(1, 1, 576))
++                stats["singleton_attention_calls"] += 1
++        else:
++            heads = []
++            for h in range(3):
++                queries = mx.contiguous(q[lo:hi, 3 * h:3 * h + 3])
++                keys = mx.broadcast_to(kv.keys[:, h:h + 1, :n, :], (r, 1, n, 64))
++                values = mx.broadcast_to(kv.values[:, h:h + 1, :n, :], (r, 1, n, 64))
++                out = llama.scaled_dot_product_attention(
++                    mx.depends(queries, buffers + outputs[-1:] + heads[-1:]),
++                    keys, values, cache=kv, scale=scale, mask=mask)
++                heads.append(out)
++                stats["grouped_attention_calls"] += 1
++            outputs.append(mx.concatenate(heads, axis=1).reshape(1, r, 576))
++    return mx.concatenate(outputs, axis=1)
++
++
+ def _rotary_offsets(start, count):
+     # Avoid a float position conversion and an overflowing exclusive endpoint.
+     return mx.arange(count, dtype=mx.int32) + mx.array(start, dtype=mx.int32)
+@@ -231,12 +311,11 @@ def _bulk_start(cache, count):
+ 
+ 
+ def _verify(model, cache, tokens, *, _trace=None):
+-    """Teacher-forced singleton forwards with grouped projections and rotary.
++    """Teacher-forced singleton reductions with grouped read-only attention.
+ 
+     tokens contains pending followed by drafts, each with native shape (1, 1).
+-    Each attention reads its own native causal prefix. Eligible blocks append
+-    all singleton K/V results before the read-only attention phase; shorter
+-    blocks retain dependencies protecting reads from subsequent cache writes.
++    Eligible blocks append all K/V before attention. Shared KV views and boolean
++    masks expose each query's exact prefix; fallback reads singleton prefixes.
+     """
+     start = _bulk_start(cache, len(tokens))
+     if isinstance(cache, RequestCache) and cache.batch_rows_eligible is None:
+@@ -258,6 +337,15 @@ def _verify(model, cache, tokens, *, _trace=None):
+         cache.rotary_eligible = _rotary_supported(model) if grouped else None
+     rotary = (grouped and cache.rotary_eligible and 0 <= start
+               and start + len(tokens) - 1 <= 2147483647)
++    if isinstance(cache, RequestCache) and cache.attention_eligible is None:
++        cache.attention_eligible = _attention_supported(model, cache) if rotary else None
++    fragments = (_attention_fragments(start, len(tokens))
++                 if rotary and cache.attention_eligible else None)
++    shared_attention = (fragments is not None
++                        and any(hi - lo > 3 for lo, hi in fragments))
++    if shared_attention:
++        fragments = _attention_masks(start, fragments)
++        cache.stats["attention_blocks"] += 1
+     if rotary:
+         rotary_offsets = _rotary_offsets(start, len(tokens))
+         cache.stats["rotary_blocks"] += 1
+@@ -317,7 +405,8 @@ def _verify(model, cache, tokens, *, _trace=None):
+                 k = attn.rope(k.reshape(len(tokens), 3, 1, 64),
+                               offset=rotary_offsets)
+                 cache.stats["grouped_rotary_calls"] += 2
+-                rotated_qs = mx.split(mx.contiguous(q), len(tokens), axis=0)
++                if not shared_attention or _trace is not None:
++                    rotated_qs = mx.split(mx.contiguous(q), len(tokens), axis=0)
+                 if _trace is not None:
+                     trace("rope_q", rotated_qs)
+                     trace("rope_k", mx.split(k, len(tokens), axis=0))
+@@ -339,19 +428,26 @@ def _verify(model, cache, tokens, *, _trace=None):
+                 kv.update_and_fetch(mx.concatenate(rotated_ks, axis=2),
+                                     mx.concatenate(reshaped_vs, axis=2))
+             cache.stats["bulk_updates"] += 1
+-            for i, q in enumerate(rotated_qs):
+-                end = start + i + 1
+-                if end < kv.keys.shape[2]:
+-                    k, v = kv.keys[..., :end, :], kv.values[..., :end, :]
+-                else:
+-                    k, v = kv.keys, kv.values
+-                deps = [kv.keys, kv.values]
+-                if attention:
+-                    deps.append(attention[-1])
+-                out = llama.scaled_dot_product_attention(
+-                    mx.depends(q, deps), k, v, cache=kv, scale=attn.scale, mask=None
+-                )
+-                attention.append(out.transpose(0, 2, 1, 3).reshape(1, 1, -1))
++            if shared_attention:
++                attention_block = _shared_attention(q, kv, attn.scale, start,
++                                                    fragments, cache.stats)
++                if _trace is not None:
++                    attention = _rows(attention_block)
++            else:
++                for i, q in enumerate(rotated_qs):
++                    end = start + i + 1
++                    if end < kv.keys.shape[2]:
++                        k, v = kv.keys[..., :end, :], kv.values[..., :end, :]
++                    else:
++                        k, v = kv.keys, kv.values
++                    deps = [kv.keys, kv.values]
++                    if attention:
++                        deps.append(attention[-1])
++                    out = llama.scaled_dot_product_attention(
++                        mx.depends(q, deps), k, v, cache=kv, scale=attn.scale, mask=None
++                    )
++                    cache.stats["singleton_attention_calls"] += 1
++                    attention.append(out.transpose(0, 2, 1, 3).reshape(1, 1, -1))
+         else:
+             for i in range(len(xs)):
+                 deps = vs if not attention else [*vs, attention[-1]]
+@@ -369,12 +465,14 @@ def _verify(model, cache, tokens, *, _trace=None):
+                 out = llama.scaled_dot_product_attention(
+                     q, k, v, cache=kv, scale=attn.scale, mask=None
+                 )
++                cache.stats["singleton_attention_calls"] += 1
+                 attention.append(out.transpose(0, 2, 1, 3).reshape(1, 1, -1))
+         if _trace is not None:
+             trace("attention", attention)
+         if grouped:
+-            projected_block = group(attn.o_proj.weight,
+-                                    mx.concatenate(attention, axis=1), attention)
++            if not shared_attention:
++                attention_block = mx.concatenate(attention, axis=1)
++            projected_block = group(attn.o_proj.weight, attention_block, [attention_block])
+             h_block = x_block + projected_block
+             norm_block = layer.post_attention_layernorm(h_block)
+             gate_block = group(layer.mlp.gate_proj.weight, norm_block, [projected_block])

@@ -1,0 +1,94 @@
+{
+  "round": "0019",
+  "parent_commit": "a6980f819ecb58f8c3a07cdccfbf44a1f2d3cb71",
+  "models": {
+    "research": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "review": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "implementation": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    }
+  },
+  "status": "rejected",
+  "research": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Grouped singleton attention with shared KV views",
+      "idea": "Batch speculative singleton queries separately for each KV head. Each batch shares that head\u2019s existing cache through broadcast views and uses boolean masks to expose each position\u2019s exact causal prefix. Preserve query length one, the original GQA ratio, and per-query reduction arithmetic.",
+      "cost_removed": "For an unsplit m-position block, replace 30m attention calls with 90 when m>3: at m=17, remove 420 of 510 calls and their scheduling stages. KV storage is shared without replication. Attention arithmetic and logical KV reads remain; query packing, masks, and output assembly add work. Maximum-block query packing adds 587,520 bytes of BF16 payload across 30 layers.",
+      "source_evidence": "candidate/inference.py:315 already produces rotated Q shaped [m,9,1,64]. Lines 342\u2013354 subsequently execute m separate attentions per layer, and line 377 packs their outputs. Installed MLX is 0.32.3. Its [attention dispatch](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/scaled_dot_product_attention.cpp) accepts zero-batch-stride KV views when the KV-head dimension is one. Changing [1,9,1,64] into batches of [r,3,1,64] preserves singleton queries and GQA=3. The [vector attention implementation](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/kernels/sdpa_vector.h) skips boolean-masked keys before accumulator updates. Preserving dispatch partitions therefore gives the same ordered arithmetic on valid keys. This is a source-level equivalence argument; native bitwise parity remains untested.",
+      "generalization": "Batching independent attention tasks while sharing read-only KV is a portable reduction in invocation and allocation work. It is particularly relevant to MQA/GQA models and tensor-parallel shards with fewer KV heads than speculative positions. It requires no custom kernels or compiler changes. Other backends need their own layout and numerical audits; already-grouped engines may gain nothing.",
+      "risk": "Masked and unmasked entrypoints may still differ numerically. Incorrect head mapping, mask indexing, or dispatch-boundary handling would corrupt downstream hidden states and KV. Accidental KV materialization could overwhelm savings. Masks require O(mC) storage, and packing overhead may outweigh fewer calls.",
+      "history_relation": "Builds on rounds 0013, 0017, and 0018, which provide immutable bulk-appended KV and contiguous grouped queries. Round 0001 failed general block verification; this keeps singleton query length and the original GQA ratio instead of changing the attention reduction problem. Previous rounds have not tested this attention grouping. Drafting, projections, RoPE, acceptance, and scalar pipelining remain as accepted."
+    },
+    "plan": "1. Implement only inside candidate/. Add an independent attention eligibility gate within the current grouped-projection/grouped-RoPE verifier. Require its audited BF16 geometry, ordinary KVCache, nine query heads, three KV heads, head dimension 64, no sinks, drained history, and sufficient existing capacity. Unsupported attention cases retain the accepted path.\n\n2. Let C be the starting cache offset. Partition positions by their scalar prefix lengths C+i+1 into ranges below 1024, from 1024 through 4095, and at least 4096. These source-derived boundaries preserve scalar attention dispatch across supported device families; they are not benchmark parameters. Use grouping only for fragments containing more than three positions. Keep shorter fragments on existing singleton attention. Verify integer bounds before constructing masks.\n\n3. For each grouped fragment [lo,hi), set r=hi-lo and N=C+hi. During decode, construct one contiguous boolean mask [r,3,1,N], with mask[b,h,0,j] equal to j<C+lo+b+1. Reuse it across all three KV-head calls and all layers. Materializing the small head-expanded mask once avoids repeated implicit mask copies.\n\n4. Preserve existing projections, RoPE, and bulk KV insertion. For KV head h, pack q[lo:hi,3h:3h+3,:,:] into contiguous [r,3,1,64]. Broadcast the corresponding allocated-cache prefix kv.keys[:,h:h+1,:N,:] and values to [r,1,N,64] with batch stride zero. Call the existing attention helper with the original scale and boolean mask. Never tile or make these KV views contiguous. Retain completion dependencies on both updated buffers and protect their lifetime through all attention reads.\n\n5. Concatenate the three outputs in original head order, reshape to [1,r,576], and assemble fragments in position order. Feed that block directly to the accepted grouped output projection. Construct singleton views only for tracing or fallback. Preserve all subsequent arithmetic, full prediction materialization before rollback, emission of accepted drafts plus correction/bonus, and trimming m-1-a entries. Charge masks, packing, assembly, and cleanup to decode; keep state request-local.\n\n6. Extend candidate/checks.py with bitwise attention comparisons against the original nine-head singleton calls for every block length, varied cache capacities, and contexts around both dispatch boundaries and longer lengths. Cover cancellation, BF16 rounding boundaries, extreme finite inputs, and poisoned masked tails. Compare complete intermediates, logits, and valid KV against both the accepted verifier and actual scalar reference calls. Exercise every acceptance length, consecutive blocks, stale-tail overwrite, scalar continuation, small budgets, tracing, and fallback. Add counters proving grouped execution and the expected call reduction. Resolve numerical discrepancies before activation.\n\n7. Freeze the implementation independently of benchmark prompts and results. Have the orchestrator run native differential validation, unchanged exact-token evaluation, and both throughput confirmations against the current best. Retain only exact output and at least 1.03x incremental gain twice.",
+    "reason": "This removes a substantial remaining set of repeated operations with a concrete arithmetic-preservation argument. In-memory checks passed 2,700 configurations, 6,048,000 ordered-partition comparisons, 702,135 KV-address checks, and 390 shared-view checks. These establish indexing and scheduling only. Native parity and net throughput remain genuinely uncertain and warrant an experiment. No files were edited."
+  },
+  "review": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Grouped singleton attention with shared KV views",
+      "idea": "Within the accepted speculative verifier, batch singleton queries separately for each KV head. Share existing KV storage through broadcast views and expose each position\u2019s exact causal prefix with a boolean mask. Preserve query length one, GQA ratio three, and scalar reduction partitions; retain accepted attention for unsupported cases and short fragments.",
+      "cost_removed": "For fragment lengths r, replace 30m attention calls with 30 times the sum of min(r,3). An unsplit 17-position block therefore drops from 510 calls to 90. This reduces invocation and temporary-allocation counts, without removing valid attention arithmetic or logical KV reads. Query packing adds up to 587,520 bytes of BF16 payload per block across 30 layers, plus corresponding reads. Each grouped fragment adds 3rN boolean mask elements, reused across heads and layers. Head assembly replaces the existing position concatenation. Two-pass scratch volume remains and peak memory may increase.",
+      "source_evidence": "Verified candidate/inference.py:315\u2013377: grouped rotary produces [m,9,1,64] queries, followed by m singleton attention calls per layer and output concatenation. Installed versions are MLX 0.32.3 and mlx-lm 0.32.0. The [attention dispatcher](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/scaled_dot_product_attention.cpp) accepts the proposed shared KV layout and supplies the 1024/4096 dispatch boundaries. At GQA=3, two-pass partition counts remain constant within these regions. The [vector implementation](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/kernels/sdpa_vector.h) skips boolean-masked keys before loading their values or updating accumulators. Together these support an ordered-arithmetic equivalence argument, not a native bitwise proof.",
+      "generalization": "Grouping independent attention tasks over shared read-only KV is a portable reduction in invocation overhead. It applies most directly to MQA/GQA and tensor-parallel shards with fewer KV heads than speculative positions. The mechanism requires no custom kernels, compiler changes, or benchmark-specific choices. Numerical eligibility requires a backend audit; already-grouped engines and attention-bandwidth-dominated workloads may gain little.",
+      "risk": "Masked and unmasked entrypoints may differ numerically despite matching source arithmetic. Incorrect head mapping, mask addressing, dispatch partitioning, or buffer lifetimes would corrupt subsequent hidden states and KV. Implicit KV copies, mask reads, packing, and increased scratch memory could outweigh the saved calls.",
+      "history_relation": "Builds directly on accepted bulk KV append, grouped projections, and grouped rotary from rounds 0013, 0017, and 0018. Round 0001\u2019s exactness failure reinforces the need to preserve singleton reductions but does not resolve this different attention grouping. No supplied round tested this mechanism."
+    },
+    "plan": "1. Implement only inside candidate/. Add an independent attention eligibility gate requiring the accepted grouped-projection/grouped-RoPE path, audited native BF16 execution, ordinary KVCache, nine query heads, three KV heads, dimension 64, and no sliding attention or sinks. Require drained history, equal starting offsets, and capacity for the complete block. An attention-gate failure must preserve the accepted projection and rotary optimizations. Do not change execution flags or backend dispatch settings.\n\n2. Before cache mutation, let C be the starting offset and m the input count. Partition positions by scalar prefix length C+i+1 into lengths below 1024, 1024\u20134095, and at least 4096. Group only fragments longer than three positions; use existing singleton calls elsewhere. These boundaries preserve dispatch, not benchmark performance. Validate signed integer bounds for prefix lengths and mask addressing; conservatively require C+m and each grouped mask\u2019s 3rN element count to fit signed int32. Unsupported bounds retain accepted attention.\n\n3. For each grouped fragment [lo,hi), define r=hi-lo and N=C+hi. During decode, construct one contiguous boolean mask [r,3,1,N] satisfying mask[b,h,0,j] = (j < C+lo+b+1). Reuse that exact array across the three head calls and all layers. Avoid implicit head expansion on every call. Use the explicit boolean mask, not the causal-string shortcut or an additive approximation.\n\n4. Preserve bulk KV insertion. For KV head h, pack q[lo:hi,3h:3h+3,:,:] into contiguous [r,3,1,64]. Slice that head\u2019s allocated keys and values through N, then broadcast each to [r,1,N,64] with zero batch stride. Never tile or make KV views contiguous. Call the existing attention helper with the unchanged scale. Gate consumed queries on both updated buffers using device dependencies, without adding host synchronization. Keep buffers immutable and alive until all dependent reads complete.\n\n5. Concatenate the three results in original query-head order, reshape to [1,r,576], and assemble fragments in position order. Feed the resulting block directly to the accepted grouped output projection. Create singleton views only for fallback or tracing. Preserve full prediction materialization before rollback, emission of accepted drafts plus correction/bonus, and trimming m-1-a entries for acceptance length a. Charge masks, packing, assembly, diagnostics used in production, and cleanup to decode. Keep all new state request-local; leave prefill unchanged.\n\n6. Extend candidate/checks.py with native bitwise attention comparisons against the original nine-head singleton calls. Cover every supported block length, distinct head/position data, unequal spare capacities, exact-capacity buffers, both sides of each dispatch boundary, crossing fragments, and longer contexts including beyond 8192. Include cancellation, BF16 rounding boundaries, extreme finite inputs, and poisoned masked tails while keeping the compared valid prefix finite. Compare full intermediates, logits, and valid KV against both actual scalar model calls and the accepted verifier with only the new attention gate disabled. Exercise every acceptance length, stale-tail overwrite, scalar continuation and growth, small budgets, tracing, and fresh requests. Consecutive-block tests must use fragments longer than three so they actually exercise grouped attention. Add counters proving the expected grouped/scalar call counts, and check for hidden KV materialization. Resolve numerical discrepancies before activating affected cases.\n\n7. Freeze the implementation without tuning against benchmark prompts or results. Have the orchestrator run native differential checks, unchanged exact-token evaluation, and both throughput confirmations against the current best. Retain only exact output and at least 1.03x incremental gain in both confirmations. Record implementation-environment limitations separately from experimental results.",
+    "reason": "No fundamental flaw was found. Independent in-memory checks passed 6,768 dispatch configurations and 224 layout configurations, including 660 shared views; they also confirmed that unsplit boundary crossings can change scalar dispatch. These establish scheduling and addressing only. Native validation was unavailable because this session cannot access Metal. The reviewed mechanism removes substantial repeated invocation work, while bitwise parity and net throughput remain experimental questions. No files were edited."
+  },
+  "implementation": {
+    "outcome": "implemented",
+    "summary": "Implemented grouped singleton attention with shared KV views, dispatch-safe fragments, reusable boolean masks, independent eligibility gating, and expanded differential checks. Compilation, bounds checks, and structural simulation passed. Native bitwise checks could not run because no Metal device is accessible; authoritative evaluation and benchmarking remain with the orchestrator."
+  },
+  "eval": {
+    "correct": true,
+    "cases": [
+      {
+        "prompt": "Explain why the sky is blue.",
+        "correct": true
+      },
+      {
+        "prompt": "Write a short Python function that reverses a list.",
+        "correct": true
+      },
+      {
+        "prompt": "What are the main causes of inflation?",
+        "correct": true
+      },
+      {
+        "prompt": "Describe how photosynthesis works.",
+        "correct": true
+      },
+      {
+        "prompt": "Continue this story: The door opened and nobody was there.",
+        "correct": true
+      },
+      {
+        "prompt": "<benchmark>",
+        "correct": true
+      }
+    ]
+  },
+  "confirmations": [
+    {
+      "baseline_relative_decode_speed": 2.233006683380018,
+      "candidate_relative_decode_speed": 2.2656287414353447,
+      "gain": 1.0146090284001963
+    },
+    {
+      "baseline_relative_decode_speed": 2.2219086211242463,
+      "candidate_relative_decode_speed": 2.2647925423933226,
+      "gain": 1.0193004882655246
+    }
+  ],
+  "confirmed_gain": 1.0146090284001963,
+  "reason": "decode gain was not >= 1.03x twice"
+}
