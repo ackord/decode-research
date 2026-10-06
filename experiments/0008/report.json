@@ -1,0 +1,94 @@
+{
+  "round": "0008",
+  "parent_commit": "4c3d9bbd9ea5f8f2d8c5517e9fae641ebbcefe63",
+  "models": {
+    "research": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "review": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "implementation": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    }
+  },
+  "status": "accepted",
+  "research": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Request-local adaptive suffix drafting",
+      "idea": "Replace the latest-occurrence, fixed-length copier with a request-local suffix-frequency index. Use longer matching contexts to select continuations, and limit draft length by match length. Verify every draft with the accepted projection-major singleton verifier.",
+      "cost_removed": "Targets complete target computations wasted on rejected positions. Currently, even a one-token suffix match can trigger five-position verification. Limiting that case to one draft reduces verification to two positions, removing 633 projection calls and 90 attention evaluations when the existing policy would draft four tokens. Longer, more reliable matches can support blocks beyond four drafts and further amortize weight reads. Accepted-token arithmetic remains; savings depend on draft quality.",
+      "source_evidence": "candidate/inference.py:24-35 retains only the latest continuation for suffixes of length 1\u20133. Lines 69\u201380 choose up to four drafts without considering match strength. Lines 101\u2013137 execute all 30 layers and a full vocabulary head for every proposed position before checking acceptance at lines 168\u2013177. The installed llama implementation performs seven projections per layer; its tied head has 49,152\u00d7576 BF16 weights. [SuffixDecoding](https://arxiv.org/html/2411.04975v3) provides evidence for frequency-based continuation selection and speculation length proportional to matched-context length. This proposal uses only the current request and linear drafts; published results do not establish its performance here.",
+      "generalization": "Avoiding rejected full-model work applies across backends and becomes more valuable as target computation grows. Longer contextual matches can improve speculation in document-grounded generation, code editing, and repeated structures within a request. No auxiliary checkpoint, target modification, custom kernel, or cross-request reuse is required.",
+      "risk": "Observed continuation frequency and match length are imperfect predictors of greedy continuation. Longer blocks can increase rejected work, graph size, and cache-buffer lifetimes; the richer index adds CPU time and memory. Draft selection cannot authorize token emission: exactness still depends on the unchanged singleton verifier and correct rollback.",
+      "history_relation": "Round 0006 established that the current verifier can improve throughput with exact outputs, but retained round 0001\u2019s simple drafting policy. No prior round tested contextual continuation frequencies or match-dependent draft lengths. Preserve round 0004\u2019s scalar pipeline and round 0006\u2019s numerical schedule. The rejected head and projection transformations do not resolve this direction."
+    },
+    "plan": "1. Change only candidate/. Preserve model parameters, prefill model execution, the singleton verifier, and scalar pipelining. Freeze maximum matching context P=16, maximum drafts K=16, and the rule draft_length\u2264match_length before evaluation; do not sweep these using benchmark results.\n\n2. Replace the latest-position index with bounded continuation counts. When committing H[j], update contexts H[j-n:j] for 1\u2264n\u2264min(P+K-1,j), recording successor counts and latest occurrence for deterministic ties. Maintain each context\u2019s preferred successor incrementally. Construct the same index from prompt tokens during prefill; append generated tokens only during decode. Store everything per request.\n\n3. At a drained verification boundary, find the longest suffix of H, up to P tokens, with an observed continuation. Let its length be p. Extend a single draft by repeatedly selecting the most frequent successor of the entire matched context plus the draft prefix, breaking frequency ties by recency. Stop when that extended context has no observed successor or k reaches min(K,p,R-1,Q-C-1), where R is remaining output capacity, C is the common KV offset, and Q is minimum allocated KV capacity. This requires at most P+K-1 context tokens in the index and never extrapolates an unobserved full continuation.\n\n4. Pass [pending,drafts...] to the existing _verify without batching numerical operations or changing attention layouts. Preserve acceptance, corrective/bonus emission, and trimming by k-a. Generalize statistics to lengths 0\u2013K. Retain the cheap match check while scalar outputs are pending, but construct drafts only after draining and recomputing the current context.\n\n5. Validate index counts, conflicting continuations, recency ties, terminal self-match exclusion, overlapping occurrences, and contexts longer than three tokens on independent examples. Exercise short and long blocks, rejection at every position, cache-capacity limits, pipeline transitions, and output budgets. Compare teacher-forced logits and retained KV with scalar execution for the newly supported verification lengths, followed by greedy continuation after rollback.\n\n6. Hand unchanged exact-token evaluation and both throughput confirmations against the accepted round-0006 candidate to the orchestrator. Record verification lengths, accepted lengths, rejected positions, and scalar steps without hot-path logging. Keep only the required improvement; do not adjust policy from benchmark prompts or results.",
+    "reason": "The current draft policy can spend full-model work on weak matches while limiting strong matches to short blocks. Changing that policy offers substantial potential work reduction without introducing a new floating-point equivalence problem. Acceptance gains versus indexing and longer-block costs remain a worthwhile benchmark question."
+  },
+  "review": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Request-local adaptive suffix drafting",
+      "idea": "Replace latest-occurrence copying with a request-local index of contextual successor frequencies. Select the longest observed suffix, extend one draft using frequency with recency ties, and cap draft length by matched-context length. Preserve the accepted projection-major singleton verifier and scalar pipeline.",
+      "cost_removed": "With k drafts and a accepted drafts, verification computes k+1 target positions and emits a+1 tokens, wasting k-a positions. Reducing these rejected positions removes complete target computations. Reducing a weak-match verification from five positions to two removes 630 layer projections, three vocabulary projections, and 90 attention evaluations from that block; these become end-to-end savings only when the omitted positions would have been rejected. Longer accepted blocks may improve existing weight reuse. Indexing, pipeline drains, scheduling, transfers, and rollback must be included in net throughput.",
+      "source_evidence": "Verified candidate/inference.py:24 stores only the latest continuation for contexts of length 1\u20133; _draft at line 69 permits four drafts regardless of match strength; _verify at line 92 computes every proposed position before acceptance checking. Installed llama.py and the pinned checkpoint confirm 30 layers, seven projections per layer, and a tied BF16 head shaped [49152,576]. KVCache.trim changes offsets without shrinking allocation. harness/bench.py:20 synchronizes around timed decode. [SuffixDecoding](https://arxiv.org/html/2411.04975v3) supports occurrence-based continuation selection and speculation lengths proportional to matched-context length. Its additional match scoring, tree speculation, and prior-request reuse distinguish it from this restricted request-local linear policy; published performance does not establish this experiment\u2019s outcome.",
+      "generalization": "Reducing rejected full-model work is independent of hardware and inference backend. It can matter for large decoder-only models when prompts or committed outputs contain repeated structures. Benefits depend on request-local repetition and draft acceptance; no target modification, auxiliary training, or cross-request reuse is needed.",
+      "risk": "Longer matches and frequent successors are imperfect predictors. Shorter blocks can lose amortization, while longer blocks increase rejected work, dependency graphs, and cache-buffer lifetimes. Context depth is bounded, but total index memory grows with request length; tuple construction, hashing, and up to 31 updates per committed token add CPU work. Prior verification at up to five positions does not validate the newly supported lengths.",
+      "history_relation": "Retains round 0004\u2019s accepted pipeline and round 0006\u2019s accepted singleton verification schedule. No previous round tested successor frequencies or match-dependent draft lengths. Round 0001 failed exactness without a diagnosed cause; this experiment preserves the subsequently accepted numerical path. The rejected head and projection changes do not resolve this drafting direction."
+    },
+    "plan": "1. Implement only inside candidate/. Preserve public interfaces, model parameters and bindings, prefill model execution, first-token selection, _supported, _project, and _verify. Freeze maximum initial context P=16, maximum drafts K=16, and draft_length<=matched_context_length before evaluation. Use fresh request-local state; perform no policy tuning from benchmark prompts or results.\n\n2. Set maximum indexed context length L=P+K-1=31. Before appending committed token v=H[j], increment its successor count for each context H[j-n:j], 1<=n<=min(L,j). Count overlapping occurrences separately. Store exact counts and a cached preferred successor, breaking frequency ties by the most recent successor occurrence. Chronological updates can implement this without timestamps: after incrementing v, make it preferred whenever its count is at least the incumbent\u2019s count. Avoid scanning successor dictionaries during drafting. L bounds context depth, not total storage. Build the same index from prompt tokens during prefill; append the supplied first generated token only inside decode.\n\n3. Draft only at a drained boundary where H contains prompt plus committed outputs, pending token t=H[-1], and every KV cache represents H[:-1] at common offset C. Let R be remaining output slots and Q the minimum allocated key/value capacity across layers. Find the longest suffix S of H with an indexed successor, using lengths up to P. Let p=len(S) and limit=min(K,p,R-1,Q-C-1). If no match exists or limit<1, use scalar fallback. Preserve the capacity restriction so speculation cannot grow cache allocation; ordinary scalar steps handle growth.\n\n4. Construct a draft from an unchanged index snapshot. Starting with context S, select its preferred successor, append that token to the draft and to the entire context, and repeat until reaching limit or finding no successor. Do not shorten the context during extension or insert draft tokens into the index. Each resulting S+draft must occur contiguously in already committed H; overlapping occurrences are permitted. A terminal suffix contributes no successor until one has actually been observed.\n\n5. Preserve the two-output scalar pipeline and its output-budget accounting. While scalar outputs remain unread, a cheap existence check may use membership of the committed history\u2019s final one-token context: any longer eligible suffix implies that membership. On a possible match, drain outstanding outputs in order, commit each once, and recompute the longest match, capacity, and budget. Never construct a draft from the stale pre-drain context.\n\n6. Pass [t,d1,...,dk] to the unchanged verifier as separate native singleton tensors. Preserve projection dependencies, sequential attention, bounded KV views, full vocabulary heads, and argmax behavior. For predictions p0,...,pk, let a be the consecutive matching draft count. Commit d1,...,da and pa, retain native prediction tensor pa as pending, and trim k-a positions from every cache, leaving offset C+1+a. Index only committed tokens. Preserve fixed-length generation after EOS, empty and one-token budgets, and termination without processing the final pending token.\n\n7. Generalize draft-length and acceptance histograms to indices 0\u201316; retain scalar-step, verification, and rejected-position counters without hot-path logging. All first-token-dependent lookup, generated-token indexing, draft construction, verification, graph construction, transfers, synchronization, and rollback belong inside decode. Prefill may construct only prompt-derived indexing state alongside its existing model computation. Reuse no request-specific state across requests.\n\n8. Validate incremental counts and cached winners against an independent enumeration of observed occurrences, covering conflicting continuations, frequency/recency disagreement, ties, terminal exclusion, overlaps, and contexts through length 31. Exercise every draft length 1\u201316 and acceptance count 0\u2013k, small budgets, capacity limits, scalar growth, pipeline transitions, and request isolation. On independent target-model inputs, compare verifier logits and retained KV bitwise against teacher-forced scalar execution for verification lengths 2\u201317, including allocation/layout invariants and greedy continuation after rollback. Confirm longer blocks actually execute. An unexplained numerical mismatch requires repair before acceptance; unavailable native execution is an implementation limitation, not an experiment result.\n\n9. Have the orchestrator run unchanged exact-token evaluation, including the complete benchmark workload, and both unchanged throughput confirmations against the accepted round-0006 candidate. Require at least 1.03x incremental gain in each confirmation. Record active-path status, draft and acceptance distributions, rejected positions, correctness, and throughput without adjusting the frozen policy from benchmark results.",
+    "reason": "No fundamental flaw was found. The review clarifies exact counting, observed-continuation semantics, inexpensive pipeline checks, memory growth, and cache invariants. An independent in-memory index prototype passed checks on 2,101 synthetic histories, including 16-token drafts. Native longer-block numerical parity and net throughput remain for evaluation and benchmarking; neither was measured during review."
+  },
+  "implementation": {
+    "outcome": "implemented",
+    "summary": "Implemented request-local successor frequencies, recency tie-breaking, adaptive drafts capped at 16, and histograms through 16 in candidate/inference.py. Preserved the verifier and scalar pipeline. Independent indexing checks and simulated decode checks passed. Native numerical validation was unavailable because MLX could not access Metal; authoritative evaluation and benchmarking remain with the orchestrator."
+  },
+  "eval": {
+    "correct": true,
+    "cases": [
+      {
+        "prompt": "Explain why the sky is blue.",
+        "correct": true
+      },
+      {
+        "prompt": "Write a short Python function that reverses a list.",
+        "correct": true
+      },
+      {
+        "prompt": "What are the main causes of inflation?",
+        "correct": true
+      },
+      {
+        "prompt": "Describe how photosynthesis works.",
+        "correct": true
+      },
+      {
+        "prompt": "Continue this story: The door opened and nobody was there.",
+        "correct": true
+      },
+      {
+        "prompt": "<benchmark>",
+        "correct": true
+      }
+    ]
+  },
+  "confirmations": [
+    {
+      "baseline_relative_decode_speed": 1.6163268916731857,
+      "candidate_relative_decode_speed": 1.779491854213084,
+      "gain": 1.1009479972030864
+    },
+    {
+      "baseline_relative_decode_speed": 1.6913717815682174,
+      "candidate_relative_decode_speed": 1.7482062846234094,
+      "gain": 1.0336026080572869
+    }
+  ],
+  "confirmed_gain": 1.0336026080572869,
+  "reason": "decode gain confirmed twice at >= 1.03x"
+}

@@ -4,8 +4,29 @@ from mlx_lm.models.cache import KVCache, make_prompt_cache
 from mlx_lm.models import llama
 
 
+MAX_CONTEXT = 16
+MAX_DRAFTS = 16
+INDEX_CONTEXT = MAX_CONTEXT + MAX_DRAFTS - 1
+
+
+class _Successors:
+    """Exact occurrence counts with the most recent winner on frequency ties."""
+
+    __slots__ = ("counts", "preferred")
+
+    def __init__(self, token):
+        self.counts = {token: 1}
+        self.preferred = token
+
+    def observe(self, token):
+        count = self.counts.get(token, 0) + 1
+        self.counts[token] = count
+        if count >= self.counts[self.preferred]:
+            self.preferred = token
+
+
 class RequestCache(list):
-    """Ordinary caches plus request-local copying state and decode counters."""
+    """Ordinary caches plus request-local successor counts and decode counters."""
 
     def __init__(self, caches, token_ids):
         super().__init__(caches)
@@ -14,8 +35,8 @@ class RequestCache(list):
         self.stats = {
             "scalar_steps": 0,
             "verifications": 0,
-            "draft_lengths": [0] * 5,
-            "accepted_lengths": [0] * 5,
+            "draft_lengths": [0] * (MAX_DRAFTS + 1),
+            "accepted_lengths": [0] * (MAX_DRAFTS + 1),
             "rejected_positions": 0,
         }
         for token in token_ids:
@@ -23,15 +44,20 @@ class RequestCache(list):
 
     def append_token(self, token):
         j = len(self.history)
-        for n in range(1, min(3, j) + 1):
-            self.index[tuple(self.history[j - n : j])] = j
+        for n in range(1, min(INDEX_CONTEXT, j) + 1):
+            context = tuple(self.history[j - n : j])
+            successors = self.index.get(context)
+            if successors is None:
+                self.index[context] = _Successors(token)
+            else:
+                successors.observe(token)
         self.history.append(token)
 
     def match(self):
-        for n in range(min(3, len(self.history)), 0, -1):
-            j = self.index.get(tuple(self.history[-n:]))
-            if j is not None:
-                return j
+        for n in range(min(MAX_CONTEXT, len(self.history)), 0, -1):
+            context = tuple(self.history[-n:])
+            if context in self.index:
+                return context
         return None
 
 
@@ -67,8 +93,8 @@ def _supported(model, cache):
 
 
 def _draft(cache, remaining):
-    j = cache.match()
-    if j is None or remaining < 2:
+    context = cache.match()
+    if context is None or remaining < 2:
         return []
     c = cache[0].offset
     if any(kv.offset != c or kv.keys is None or kv.values is None for kv in cache):
@@ -76,8 +102,18 @@ def _draft(cache, remaining):
     if c != len(cache.history) - 1:
         raise RuntimeError("Speculation requires drained scalar outputs")
     capacity = min(min(kv.keys.shape[2], kv.values.shape[2]) for kv in cache)
-    k = min(4, remaining - 1, len(cache.history) - j, capacity - c - 1)
-    return cache.history[j : j + k] if k > 0 else []
+    limit = min(MAX_DRAFTS, len(context), remaining - 1, capacity - c - 1)
+    drafts = []
+    # Extend the entire observed context, without mutating the index or backing
+    # off to a shorter suffix. Every extension occurred in committed history.
+    for _ in range(max(0, limit)):
+        successors = cache.index.get(context)
+        if successors is None:
+            break
+        token = successors.preferred
+        drafts.append(token)
+        context += (token,)
+    return drafts
 
 
 def _project(projection, inputs, dependencies):
@@ -192,7 +228,7 @@ def decode(model, first_token, cache, max_new_tokens):
         # Preserve round 0004's submit-successor-before-host-read pipeline.
         if len(pending) == 2:
             commit(pending.pop(0).item())
-            if supported and state.match() is not None:
+            if supported and (state.history[-1],) in state.index:
                 for unread in pending:
                     commit(unread.item())
                 pending.clear()
