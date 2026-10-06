@@ -1,0 +1,94 @@
+{
+  "round": "0014",
+  "parent_commit": "647f660deb1acbe692c7b22a9518e1f1a7aa2113",
+  "models": {
+    "research": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "review": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "implementation": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    }
+  },
+  "status": "rejected",
+  "research": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Certified vocabulary screening from cached logits",
+      "idea": "Keep request-local anchors containing a previously computed normalized hidden vector and its full native vocabulary logits. For a new hidden vector, bound every logit using the anchor and the hidden-vector difference. Recompute 256 possible winning rows and emit only when conservative bounds certify the reference BF16 argmax; otherwise execute the original singleton head.",
+      "cost_removed": "A certified position replaces a 56,623,104-byte vocabulary-weight scan and 28.3 million multiply-accumulates with O(vocabulary) bound calculations and 256 row refinements. Cached logits, row-norm metadata, and refined BF16 weights total approximately 590 KB before intermediate traffic. Transformer work remains unchanged. Failed certificates pay screening overhead plus the full head.",
+      "source_evidence": "candidate/inference.py:216\u2013219 applies the full tied head separately to every speculative hidden state. Installed Embedding.as_linear executes x @ weight.T. Direct checkpoint inspection confirms a 49,152-by-576 BF16 head. The scalar [dispatch source](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/matmul.cpp) excludes M=1 from wide GEMV, permitting a focused audit of the scalar accumulation contract. An independent synthetic NumPy proxy using these weights passed provisional screening inequalities on 55 of 110 anchored positions with 256-row refinement; its approximate body and incomplete rounding treatment establish feasibility only, not native correctness or speed.",
+      "generalization": "Bounded reuse of linear-head scores applies across frameworks and hardware without changing target weights or training. It could benefit repeated contexts and large-vocabulary models, especially MoE models where the head represents substantial active work. Benefits diminish when hidden states change sharply or dense transformer computation dominates.",
+      "risk": "Loose bounds, selection costs, added synchronization, and anchor storage may outweigh avoided scans. Cached BF16 logits are rounded observations, not exact dot products. Certification must include their conversion preimages, both scalar accumulation errors, refinement error, and outward rounding throughout. Unsupported arithmetic, exceptional values, and ambiguous winners require the original head.",
+      "history_relation": "Preserves accepted rounds 0004, 0006, 0008, and 0013. Round 0002 tested a full quantized screening projection; this replaces that projection with cached scores and O(vocabulary) bounds. Round 0012 recycled token predictions for drafting, whereas this mechanism removes head computation under a numerical certificate. Round 0009 warns against serial host decisions, so screening and fallback decisions are grouped across each verification block."
+    },
+    "plan": "1. Modify candidate/ only. Preserve prefill computation, drafting, singleton transformer arithmetic, bulk KV updates, scalar pipelining, and acceptance/rollback. Prepare outward upper bounds S_i on original head-row norms from weights alone. Start every request with an empty anchor table.\n\n2. Fix refinement size and anchor capacity at 256. Key anchors by input token ID, retaining the most recent full native head result and its original normalized hidden vector. After acceptance, install anchors only from valid processed positions whose full heads actually ran. Use bounded LRU eviction; certified partial results must not replace complete anchors. No request-derived state survives a request.\n\n3. Screen verifier positions with an existing anchor. For current h and anchor h0, compute outward bounds D >= ||h-h0|| and H >= ||h||. Expand each cached logit's BF16 conversion preimage by rho_i = S_i*D + E_i(h) + E_i(h0), then map endpoints through reference BF16 conversion. Establish E from the actual scalar arithmetic contract, including underflow and range guards; gamma_(2d)*S_i*H plus an absolute allowance is usable only where justified. Account for rounding in differences, norms, and interval construction.\n\n4. Select the 256 largest upper bounds, retaining the maximum excluded bound. Gather original rows before FP32 conversion and refine their dot products. Enclose reference BF16 results using both refinement and reference arithmetic errors. Certify only when one lower bound strictly exceeds every competing upper bound. Otherwise conditionally construct the original singleton head on the saved native h. Group hidden-vector transfers and certificate decisions across the block; avoid per-position synchronization. Preserve complete-body completion before acceptance or cache trimming.\n\n5. Validate interval containment independently, including cancellation, conversion boundaries, ties, stale anchors, eviction, exceptional values, and forced fallback. Compare native greedy trajectories and retained KV against the reference across acceptance lengths, scalar transitions, capacity crossings, and small budgets. Record attempted screens, certificates, and actual full-head calls without hot-path logging.\n\n6. Keep all generated-token-dependent work inside decode. Freeze the policy before authoritative evaluation. Have the orchestrator run unchanged exact-token evaluation and both confirmations against the current best; retain only exact output and at least 1.03x improvement twice. A disabled arithmetic adapter is an implementation limitation, not a measured rejection of the mechanism.",
+    "reason": "This removes substantial repeated vocabulary computation with a local, repairable correctness argument. Its screening cost is materially lower than round 0002's mechanism, while certificate coverage and net throughput remain genuine experimental questions."
+  },
+  "review": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Certified vocabulary screening from cached logits",
+      "idea": "Within the existing speculative verifier, reuse request-local anchors containing a normalized hidden vector and its complete native vocabulary logits. Transport conservative logit intervals to each new hidden vector, refine 256 possible winners using original weights, and skip the full head only when the reference BF16 argmax is certified. Preserve the scalar decode pipeline.",
+      "cost_removed": "Each certified position avoids a full 49,152-by-576 projection: 28,311,552 multiply-accumulates over 56,623,104 bytes of BF16 weights. It substitutes O(vocabulary) screening and 256-row refinement. The approximately 590 KB estimate covers one cached logit vector, FP32 row norms, and gathered BF16 rows; it excludes intermediate arrays, FP32 refinement, transfers, and synchronization. At capacity, 256 cached BF16 logit vectors alone occupy 24 MiB. These are storage and operation counts, not measured memory traffic. Failed screens additionally pay the native head cost.",
+      "source_evidence": "Verified candidate/inference.py:216\u2013219 performs separate singleton vocabulary heads; installed Embedding.as_linear uses x @ weight.T. The pinned checkpoint contains the stated BF16 matrix. The stock [dispatch](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/matmul.cpp) excludes M=1 from wide GEMV, and the [scalar kernel](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/kernels/gemv.h) uses FP32 accumulation followed by output conversion. This supports a focused arithmetic audit, but declarations alone do not establish every required error bound. The researcher's approximate-body coverage result is not native correctness or throughput evidence.",
+      "generalization": "The work reduction follows from bounding changes in a fixed linear map and selectively evaluating rows. It does not require MLX, a particular device, custom kernels, or training. Each backend needs a valid arithmetic adapter. Potential benefit is greatest with recurring similar hidden states and substantial vocabulary-head cost, including large-vocabulary or MoE models; large dense transformers offer less head-related upside.",
+      "risk": "Hidden-state differences may make bounds too loose. Selection, refinement, host decisions, anchor retention, and fallback can outweigh avoided projections. Exactness requires enclosing cached-logit conversion preimages, both native accumulation errors, refinement error, and interval-construction rounding. Equal token IDs only select anchors; they establish no numerical similarity. Unsupported arithmetic and ambiguous winners must use the original head.",
+      "history_relation": "Preserves accepted rounds 0004, 0006, 0008, and 0013. Unlike round 0002, screening performs no full approximate vocabulary projection. Round 0003's implementation disabled its certificate path, so its 1.000x result does not resolve active certification. Round 0012 reused predictions for drafting, whereas this proposal conditionally removes head computation. Round 0009 supplies relevant evidence about synchronization overhead; decisions remain grouped across verifier positions."
+    },
+    "plan": "1. Implement only inside candidate/. Limit screening and anchor collection to the existing speculative verifier. Preserve prefill model computation, scalar model calls and pipelining, drafting, singleton transformer arithmetic, bulk KV updates, acceptance, and rollback. Prepare outward row-norm bounds S_i >= ||w_i||_2 from unchanged weights alone. Only immutable weight-derived metadata may survive requests, with model/weight identity checks. Create an empty anchor table for every request; do not seed it by computing generated-token-dependent state during prefill.\n\n2. Fix refinement size and anchor capacity at 256. Key anchors by the processed INPUT token ID. Store materialized native BF16 logits, the corresponding normalized hidden vector represented without loss, and its norm bound. Use known history/draft IDs rather than reading individual device tokens. Freeze anchor contents for each verification block. After acceptance, update the table chronologically using only valid positions whose complete native heads actually ran; certified partial results never replace complete anchors. Apply deterministic LRU eviction and release evicted arrays and completed graphs.\n\n3. Establish an explicit arithmetic adapter for the installed singleton head and refinement operations. Let a_i(h) be the native accumulator before BF16 conversion Q, with |a_i(h)-w_i\u00b7h| <= E_i(h). For guarded BF16 operands and standard FP32 multiply/add/FMA reductions, derive E_i from operation counts, rounding, and underflow. A conservative concrete starting contract is d<=576, nonzero operand magnitudes in [2^-64,2^16], u=2^-23 to cover nearest or toward-zero FP32 rounding, and E_i(h)=gamma_(2d)*S_i*H+2^-80, rounded outward, where gamma_n=nu/(1-nu). Document why the actual primitive contract satisfies this envelope, including intermediate flushing and overflow exclusion. Do not infer support from a version check or empirical agreement alone. Unsupported heads, dtypes, layouts, arithmetic, or ranges retain native execution.\n\n4. For cached native logit z_i=Q(a_i(h0)), construct a closed interval [P_i-,P_i+] containing its conversion preimage. Use asymmetric BF16 neighbor midpoints when justified by the conversion contract; handle signed zero and flushing explicitly. Never treat z_i as an exact dot product. Compute outward D>=||h-h0||_2, H>=||h||_2, and H0>=||h0||_2. With rho_i=S_i*D+E_i(h)+E_i(h0), the current native accumulator lies in [P_i--rho_i,P_i++rho_i]. Map enclosing endpoints through the justified monotone conversion to obtain native-logit bounds. Account for subtraction, norm reduction, square root, coefficient construction, and endpoint rounding. Group small hidden-vector transfers and use conservative host FP64 calculations if that simplifies the proof; these transfers remain timed decode work.\n\n5. Select the 256 largest upper bounds and retain the maximum excluded upper bound, including cutoff ties. Gather original BF16 weight rows BEFORE FP32 conversion. Refine with explicit FP32 products/reduction and enclose the native accumulator using refinement error plus E_i(h), then map through Q. Certify only if one selected lower bound strictly exceeds all other selected upper bounds and the excluded bound. Any equality, nonfinite value, unsupported case, or failed certificate uses the original singleton head on the saved native hidden tensor. Do not assume gathered-row arithmetic equals the full head.\n\n6. Group screening and certificate reads across the block. Queue anchor-miss heads when possible, then construct fallback heads only after certificate outcomes are known. An unconditional full projection followed by selection does not remove the claimed work. Keep every native head singleton and preserve projection dependencies. Ensure all verifier bodies and KV appends complete before acceptance or trimming, even when predictions are supplied by certified constants. Retain hidden tensors until fallback decisions finish; never recompute transformer bodies to recover them.\n\n7. Preserve the existing indexing exactly: with inputs [pending,d0,...,d(k-1)] and a accepted drafts, valid processed positions are 0 through a inclusive. Position a supplies the correction or bonus prediction and is eligible for anchor installation when its full head ran. Positions beyond a are rejected. Trim k-a entries, leaving offset C+a+1; the final emitted token remains pending. Commit table/LRU updates only after acceptance, using valid positions. Preserve zero/one-token budgets and fixed-length generation semantics.\n\n8. Independently test interval containment, BF16 midpoint and exponent boundaries, cancellation, zero/subnormal behavior, ties, range guards, and forced fallback. Exercise both successful certificates and actual avoided full heads. On native saved hidden tensors, compare certified predictions with the original head, including rejected speculative positions. Check anchor replacement, stale anchors, eviction, request isolation, every acceptance length, scalar transitions, cache-capacity crossings, and retained KV. Keep diagnostic full-head comparisons outside performance runs. Record request-local screen, certificate, fallback, and actual full-head counters without hot-path logging.\n\n9. Charge all generated-token-dependent bounds, transfers, selection, synchronization, anchor maintenance, and fallback to decode. Freeze the policy independently of benchmark contents and results. The orchestrator performs unchanged exact-token evaluation and both throughput confirmations against the current best; retain only exact output and at least 1.03x improvement twice. A disabled or unexercised certificate path is an implementation limitation, not a measured rejection of the mechanism.",
+    "reason": "No fundamental flaw was found. Independent falsification produced a BF16 counterexample to treating cached logits as exact dot products; conversion-preimage bounds repair it. An in-memory proxy passed 14,400 emulated row-containment checks, which does not establish native correctness or coverage. The reviewed specification makes arithmetic, anchor commitment, conditional execution, memory cost, and completion dependencies explicit. Native evaluation and benchmarking should decide the outcome."
+  },
+  "implementation": {
+    "outcome": "implemented",
+    "summary": "Implemented certified vocabulary screening in candidate/inference.py with conservative intervals, 256-row refinement, request-local LRU anchors, native fallback, and counters. Arithmetic and device-free integration tests passed, including avoided heads and acceptance/KV bookkeeping. Native evaluation and benchmarking remain for the orchestrator; Metal is unavailable locally."
+  },
+  "eval": {
+    "correct": true,
+    "cases": [
+      {
+        "prompt": "Explain why the sky is blue.",
+        "correct": true
+      },
+      {
+        "prompt": "Write a short Python function that reverses a list.",
+        "correct": true
+      },
+      {
+        "prompt": "What are the main causes of inflation?",
+        "correct": true
+      },
+      {
+        "prompt": "Describe how photosynthesis works.",
+        "correct": true
+      },
+      {
+        "prompt": "Continue this story: The door opened and nobody was there.",
+        "correct": true
+      },
+      {
+        "prompt": "<benchmark>",
+        "correct": true
+      }
+    ]
+  },
+  "confirmations": [
+    {
+      "baseline_relative_decode_speed": 1.8300054040810352,
+      "candidate_relative_decode_speed": 0.4089063206183446,
+      "gain": 0.22344541699519355
+    },
+    {
+      "baseline_relative_decode_speed": 1.8601107343816357,
+      "candidate_relative_decode_speed": 0.40058462841226117,
+      "gain": 0.21535525869938554
+    }
+  ],
+  "confirmed_gain": 0.21535525869938554,
+  "reason": "decode gain was not >= 1.03x twice"
+}

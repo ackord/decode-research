@@ -1,0 +1,413 @@
+diff --git a/candidate/inference.py b/candidate/inference.py
+index d325ba3..2b55b9e 100644
+--- a/candidate/inference.py
++++ b/candidate/inference.py
+@@ -2,6 +2,9 @@ import mlx.core as mx
+ import mlx.nn as nn
+ from mlx_lm.models.cache import KVCache, make_prompt_cache
+ from mlx_lm.models import llama
++import numpy as np
++
++from .screening import decode_bits, prepare
+ 
+ 
+ MAX_CONTEXT = 16
+@@ -32,6 +35,7 @@ class RequestCache(list):
+         super().__init__(caches)
+         self.history = []
+         self.index = {}
++        self.screener = None
+         self.stats = {
+             "scalar_steps": 0,
+             "verifications": 0,
+@@ -40,6 +44,11 @@ class RequestCache(list):
+             "draft_lengths": [0] * (MAX_DRAFTS + 1),
+             "accepted_lengths": [0] * (MAX_DRAFTS + 1),
+             "rejected_positions": 0,
++            "head_screens": 0,
++            "head_certificates": 0,
++            "head_fallbacks": 0,
++            "head_anchor_misses": 0,
++            "head_full": 0,
+         }
+         for token in token_ids:
+             self.append_token(int(token))
+@@ -69,7 +78,10 @@ def prefill(model, token_ids):
+     logits = model(tokens, cache=cache)
+     token = mx.argmax(logits[:, -1, :], axis=-1)
+     mx.eval(token)
+-    return token, RequestCache(cache, token_ids)
++    state = RequestCache(cache, token_ids)
++    if _supported(model, state):
++        state.screener = prepare(model, mx)
++    return token, state
+ 
+ 
+ def _supported(model, cache):
+@@ -141,7 +153,65 @@ def _bulk_start(cache, count):
+     return start
+ 
+ 
+-def _verify(model, cache, tokens):
++def _verify_heads(model, cache, norm, input_ids):
++    head = model.model.embed_tokens.as_linear if model.args.tie_word_embeddings else model.lm_head
++    screener = cache.screener
++    if screener is None or not screener.supported(model, norm, mx):
++        logits = _project(head, norm, norm)
++        cache.stats["head_full"] += len(norm)
++        return [mx.argmax(x[:, -1, :], axis=-1) for x in logits], None
++
++    # Read-only snapshot for this block: installation occurs after acceptance.
++    anchors = [screener.anchors.get(t) for t in input_ids]
++    misses = [i for i, a in enumerate(anchors) if a is None]
++    logits = [None] * len(norm)
++    miss_heads = _project(head, [norm[i] for i in misses], norm)
++    for i, x in zip(misses, miss_heads):
++        logits[i] = x
++    if miss_heads:
++        mx.async_eval(*miss_heads)
++    # Drain ALL bodies and appended K/V even if every head is certified. This
++    # also retains native hidden tensors for the subsequent singleton fallbacks.
++    hidden_array = mx.concatenate(norm, axis=1).view(mx.uint16)
++    mx.eval(hidden_array, *[a for kv in cache for a in (kv.keys, kv.values)])
++    hidden = decode_bits(np.asarray(hidden_array.tolist(), dtype=np.uint16)).reshape(len(norm), -1)
++    screens = {}
++    for i, anchor in enumerate(anchors):
++        if anchor is not None:
++            screen = screener.screen(hidden[i], anchor)
++            if screen is not None:
++                screens[i] = screen
++    winners = {}
++    if screens:
++        positions = list(screens)
++        indices = np.concatenate([screens[i][0] for i in positions])
++        # Gather the ORIGINAL BF16 rows first; widen only the small selection.
++        rows = screener.metadata.weight[mx.array(indices.tolist())].astype(mx.float32)
++        values = np.asarray(rows.tolist(), dtype=np.float32).reshape(len(positions), 256, -1)
++        for i, selected_rows in zip(positions, values):
++            winner = screener.certify(hidden[i], screens[i], selected_rows)
++            if winner is not None:
++                winners[i] = winner
++    fallbacks = [i for i, anchor in enumerate(anchors)
++                 if anchor is not None and i not in winners]
++    # No native head is constructed for a certified position. Each remaining
++    # native head is still singleton, dependent on the previous projection phase.
++    fallback_heads = _project(head, [norm[i] for i in fallbacks], [*norm, *miss_heads])
++    for i, x in zip(fallbacks, fallback_heads):
++        logits[i] = x
++    predictions = [mx.array([winners[i]], dtype=mx.uint32) if i in winners
++                   else mx.argmax(logits[i][:, -1, :], axis=-1)
++                   for i in range(len(norm))]
++    stats = cache.stats
++    stats["head_screens"] += len(norm) - len(misses)
++    stats["head_certificates"] += len(winners)
++    stats["head_fallbacks"] += len(fallbacks)
++    stats["head_anchor_misses"] += len(misses)
++    stats["head_full"] += len(misses) + len(fallbacks)
++    return predictions, (screener, hidden, logits)
++
++
++def _verify(model, cache, tokens, input_ids):
+     """Teacher-forced singleton forwards, interchanged only across projections.
+ 
+     tokens contains pending followed by drafts, each with native shape (1, 1).
+@@ -214,9 +284,7 @@ def _verify(model, cache, tokens):
+         downs = _project(layer.mlp.down_proj, activated, activated)
+         xs = [h + r for h, r in zip(hs, downs)]
+     norm = [body.norm(mx.depends(x, xs)) for x in xs]
+-    head = body.embed_tokens.as_linear if model.args.tie_word_embeddings else model.lm_head
+-    logits = _project(head, norm, norm)
+-    return [mx.argmax(x[:, -1, :], axis=-1) for x in logits]
++    return _verify_heads(model, cache, norm, input_ids)
+ 
+ 
+ def decode(model, first_token, cache, max_new_tokens):
+@@ -244,7 +312,8 @@ def decode(model, first_token, cache, max_new_tokens):
+                 inputs = [token.reshape(1, 1)] + [
+                     mx.array([[d]], dtype=token.dtype) for d in drafts
+                 ]
+-                predictions = _verify(model, cache, inputs)
++                input_ids = [state.history[-1], *drafts]
++                predictions, complete = _verify(model, cache, inputs, input_ids)
+                 mx.async_eval(*predictions)
+                 ids = mx.stack(predictions).tolist()
+                 accepted = 0
+@@ -257,7 +326,11 @@ def decode(model, first_token, cache, max_new_tokens):
+                 rejected = len(drafts) - accepted
+                 for kv in cache:
+                     kv.trim(rejected)
+-                del inputs, predictions, ids
++                if complete is not None:
++                    screener, hidden, logits = complete
++                    screener.install(input_ids, hidden, logits, accepted, mx)
++                    del screener, hidden, logits
++                del inputs, predictions, ids, input_ids, complete
+                 stats = state.stats
+                 stats["verifications"] += 1
+                 stats["draft_lengths"][len(drafts)] += 1
+diff --git a/candidate/screening.py b/candidate/screening.py
+new file mode 100644
+index 0000000..9d50fe9
+--- /dev/null
++++ b/candidate/screening.py
+@@ -0,0 +1,260 @@
++"""Request-local certificates for singleton BF16 vocabulary heads.
++
++Arithmetic adapter: the audited MLX 0.32.3 matmul.cpp dispatch sends M=1,
++N>1 to gemv (including layouts copied by check_transpose). gemv.h's GEMV
++and GEMVT widen BF16 operands to float, accumulate products and shuffle /
++threadgroup sums in float, then cast once to bfloat. No bias is supported.
++Sources: https://github.com/ml-explore/mlx/tree/v0.32.3/mlx/backend/metal
++Runtime library AND kernel-library hashes below bind this audit to the official
++PyPI wheels, rather than accepting a version string or numerical spot check.
++
++For d<=576, each dot has at most 2d rounding steps along any reduction path.
++u=2^-23 covers nearest and toward-zero FP32 arithmetic, reassociation and FMA.
++Nonzero inputs in [2^-64,2^16] give products <=2^32 and absolute partial sums
++<=576*2^32: overflow is impossible. Flushed products/partial sums contribute
++at most 2d*2^-126/(1-2d*u), well below the additive 2^-80 allowance. Thus
++E=gamma_(2d)*S*H+2^-80 encloses the native accumulator, including cancellation.
++Refinement uses explicit NumPy FP32 multiply and add reduction, NOT matmul;
++the same envelope applies, even with subnormal flushing or FMA contraction.
++
++We deliberately allow any standard monotone BF16 rounding direction. Closed
++preimages extend to BOTH adjacent BF16 values, not symmetric half ulps. Zero
++also includes +/-2^-126 for flushing. Endpoint floor/ceil (with possible flush
++to zero) enclose every such conversion, so no midpoint tie rule is assumed.
++All interval work uses host FP64 with outward operations; norm reductions have
++an explicit FP64 error allowance. The mechanism is independent of this backend;
++other arithmetic implementations need their own audited adapter.
++"""
++
++from collections import OrderedDict
++from functools import lru_cache
++import hashlib
++import importlib.metadata
++import weakref
++
++import numpy as np
++
++
++REFINE = CAPACITY = 256
++_TINY = 2.0 ** -126
++_ABS_ERROR = 2.0 ** -80
++_METADATA = None
++_ARTIFACTS = {
++    # libmlx.dylib, mlx.metallib: official macOS 14, 15, 26 wheels.
++    ("50766122a65a43e5377879ff4465507e8aaf06dd42588db6c4b2f5663e1035d7",
++     "9d2b8fe566f638981994be18e40ad4d9ef9b56576045e78405482a4f06131317"),
++    ("bee9cfa65fa98062ccfad5a10104c621ad0b7b98e4c4ddb1f1d1ae527991fd53",
++     "2e6db5c6b821920a209c63afe26aeb0ad2569c3c4f0dd07ca1e01921e4a3679d"),
++    ("ebc8a5f5465afb79d3d9c8f5b0929de1a9b277b7179db8672f92da77ae110a1e",
++     "95974b7de464ec2be7833a914ca5a53d283a70789470fd84218738fc8fcea3e1"),
++}
++
++
++def up(x):
++    return np.nextafter(x, np.inf)
++
++
++def down(x):
++    return np.nextafter(x, -np.inf)
++
++
++def gamma(n, u):
++    nu = up(float(n) * u)
++    return up(nu / down(1.0 - nu))
++
++
++def norm_bound(x):
++    """Upper Euclidean norm of nonnegative FP64 component bounds."""
++    squares = up(np.square(x, dtype=np.float64))
++    total = up(np.sum(squares, axis=-1, dtype=np.float64))
++    total = up(total / down(1.0 - gamma(x.shape[-1], 2.0 ** -52)))
++    return up(np.sqrt(total))
++
++
++def guarded(x):
++    a = np.abs(x)
++    return (np.isfinite(x).all() and (a <= 2.0 ** 16).all()
++            and ((a == 0) | (a >= 2.0 ** -64)).all())
++
++
++@lru_cache(maxsize=1)
++def _levels():
++    positive = decode_bits(np.arange(0x7f80, dtype=np.uint16))
++    levels = np.concatenate((-positive[:0:-1], positive))
++    levels.flags.writeable = False
++    return levels
++
++
++def decode_bits(bits):
++    """Lossless BF16 -> FP64, including signed zero and subnormals (no FTZ)."""
++    exponent = (bits.astype(np.uint32) >> 7) & 255
++    mantissa = bits & 127
++    value = np.ldexp(np.where(exponent == 0, mantissa, mantissa + 128).astype(np.float64),
++                     np.where(exponent == 0, -133, exponent.astype(np.int32) - 134))
++    value = np.where(exponent == 255, np.where(mantissa == 0, np.inf, np.nan), value)
++    return np.where((bits & 0x8000) != 0, -value, value)
++
++
++def preimage(z):
++    levels = _levels()
++    indices = np.searchsorted(levels, z)
++    if (not np.isfinite(z).all() or (np.abs(z) > 2.0 ** 44).any()
++            or (indices == 0).any() or (indices >= len(levels) - 1).any()
++            or not np.array_equal(levels[indices], z)):
++        return None
++    lo, hi = levels[indices - 1].copy(), levels[indices + 1].copy()
++    lo[z == 0], hi[z == 0] = -_TINY, _TINY
++    return lo, hi
++
++
++def convert_bounds(lo, hi):
++    """Enclose Q([lo,hi]) for directed/nearest rounding and optional FTZ."""
++    levels = _levels()
++    left = np.searchsorted(levels, lo, side="right") - 1
++    right = np.searchsorted(levels, hi, side="left")
++    if (not np.isfinite(lo).all() or not np.isfinite(hi).all()
++            or (left < 0).any() or (right >= len(levels)).any()):
++        return None
++    lower, upper = levels[left].copy(), levels[right].copy()
++    lower = np.where((lo >= 0) & (lo < _TINY), 0.0, lower)
++    upper = np.where((hi <= 0) & (hi > -_TINY), 0.0, upper)
++    return lower, upper
++
++
++@lru_cache(maxsize=1)
++def _audited_artifacts():
++    try:
++        dist = importlib.metadata.distribution("mlx-metal")
++        hashes = tuple(hashlib.sha256(dist.locate_file(p).read_bytes()).hexdigest()
++                       for p in ("mlx/lib/libmlx.dylib", "mlx/lib/mlx.metallib"))
++        return hashes in _ARTIFACTS
++    except (OSError, importlib.metadata.PackageNotFoundError):
++        return False
++
++
++def weight_of(model):
++    head = model.model.embed_tokens if model.args.tie_word_embeddings else model.lm_head
++    if not model.args.tie_word_embeddings and "bias" in head:
++        return None
++    return head.weight
++
++
++class Metadata:
++    def __init__(self, weight, rows):
++        self.weight = weight
++        self.rows = rows
++        self.error_coefficient = gamma(2 * weight.shape[1], 2.0 ** -23)
++
++    def error(self, hnorm, rows=None):
++        s = self.rows if rows is None else self.rows[rows]
++        return up(up(up(self.error_coefficient * s.astype(np.float64)) * hnorm)
++                  + _ABS_ERROR)
++
++
++def prepare(model, mx):
++    """Weight-only metadata may be shared; generated state never is."""
++    global _METADATA
++    weight = weight_of(model)
++    if (not _audited_artifacts() or mx.default_device().type != mx.gpu
++            or weight is None or weight.dtype != mx.bfloat16
++            or weight.ndim != 2 or not 0 < weight.shape[1] <= 576
++            or weight.shape[0] <= REFINE):
++        return None
++    if (_METADATA is not None and _METADATA[0]() is model
++            and _METADATA[1].weight is weight):
++        return Screener(_METADATA[1])
++    _METADATA = None
++    rows = []
++    for i in range(0, weight.shape[0], 1024):
++        # Widen original weights losslessly; do not retain a full FP32 copy.
++        block = decode_bits(np.asarray(weight[i:i + 1024].view(mx.uint16).tolist(),
++                                       dtype=np.uint16))
++        if not guarded(block):
++            return None
++        # Round norms outwards again when storing compact FP32 metadata.
++        rows.append(np.nextafter(norm_bound(np.abs(block)).astype(np.float32),
++                                 np.float32(np.inf)))
++    rows = np.concatenate(rows)
++    rows.flags.writeable = False
++    metadata = Metadata(weight, rows)
++    _METADATA = (weakref.ref(model), metadata)
++    return Screener(metadata)
++
++
++class Screener:
++    def __init__(self, metadata):
++        self.metadata = metadata
++        self.anchors = OrderedDict()
++
++    def supported(self, model, norm, mx):
++        return (weight_of(model) is self.metadata.weight
++                and mx.default_device().type == mx.gpu
++                and all(h.dtype == mx.bfloat16
++                        and h.shape == (1, 1, self.metadata.weight.shape[1])
++                        for h in norm))
++
++    def screen(self, h, anchor):
++        if not guarded(h):
++            return None
++        h0, h0norm, bits = anchor
++        z = decode_bits(bits)
++        interval = preimage(z)
++        if interval is None:
++            return None
++        hnorm = norm_bound(np.abs(h))
++        distance = norm_bound(up(np.abs(h - h0)))
++        m = self.metadata
++        rho = up(up(up(m.rows.astype(np.float64) * distance)
++                    + m.error(hnorm)) + m.error(h0norm))
++        bounds = convert_bounds(down(interval[0] - rho), up(interval[1] + rho))
++        if bounds is None:
++            return None
++        upper = bounds[1]
++        selected = np.argpartition(upper, -REFINE)[-REFINE:]
++        selected.sort()  # Deterministic row/refinement order, including ties.
++        excluded = upper.copy()
++        excluded[selected] = -np.inf
++        return selected, float(np.max(excluded)), float(hnorm)
++
++    def certify(self, h, screen, rows):
++        selected, excluded, hnorm = screen
++        if not guarded(rows):
++            return None
++        # Products and sums are explicitly FP32; this is not a native head.
++        products = np.multiply(rows, h.astype(np.float32), dtype=np.float32)
++        values = np.add.reduce(products, axis=1, dtype=np.float32).astype(np.float64)
++        error = up(2.0 * self.metadata.error(hnorm, selected))
++        bounds = convert_bounds(down(values - error), up(values + error))
++        if bounds is None:
++            return None
++        lo, hi = bounds
++        best = int(np.argmax(lo))
++        competitors = hi.copy()
++        competitors[best] = -np.inf
++        if lo[best] > max(excluded, float(np.max(competitors))):
++            return int(selected[best])
++        return None
++
++    def install(self, ids, hidden, logits, accepted, mx):
++        """Chronological valid positions only; partial heads never anchor."""
++        full = [i for i in range(accepted + 1) if logits[i] is not None]
++        values = {}
++        if full:
++            rows = np.asarray(mx.stack([logits[i].reshape(-1) for i in full])
++                              .view(mx.uint16).tolist(), dtype=np.uint16)
++            values = dict(zip(full, rows))
++        for i in range(accepted + 1):
++            token = ids[i]
++            if token in self.anchors:
++                self.anchors.move_to_end(token)
++            if i not in values:
++                continue
++            bits = values[i].copy()
++            if not guarded(hidden[i]) or preimage(decode_bits(bits)) is None:
++                continue
++            h = hidden[i].copy()
++            h.flags.writeable = bits.flags.writeable = False
++            self.anchors.pop(token, None)
++            self.anchors[token] = (h, float(norm_bound(np.abs(h))), bits)
++            if len(self.anchors) > CAPACITY:
++                self.anchors.popitem(last=False)
