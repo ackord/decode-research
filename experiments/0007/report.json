@@ -1,0 +1,94 @@
+{
+  "round": "0007",
+  "parent_commit": "48c84bc00c1d1ed15196690e4a121c29fcc7b897",
+  "models": {
+    "research": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "review": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "implementation": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    }
+  },
+  "status": "rejected",
+  "research": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Vocabulary-row blocking for scalar speculative heads",
+      "idea": "Partition the unchanged vocabulary matrix into contiguous row panels. Evaluate each panel across all speculative singleton hidden states before advancing to the next panel. Concatenate each position\u2019s logits in vocabulary order and apply the original argmax. Preserve the accepted transformer verifier and scalar fallback.",
+      "cost_removed": "Targets repeated vocabulary-weight reads. The current five-position verifier scans the 56,623,104-byte head five times. If a panel remains cached across positions, blocking could avoid 226,492,416 bytes of repeated reads per block. Arithmetic and rejected-position work remain unchanged. Twelve panels add 55 matrix calls for a five-position block, plus small logit concatenations; these costs must be measured.",
+      "source_evidence": "candidate/inference.py:134-137 applies the complete head separately to every normalized speculative state. Installed Embedding.as_linear performs x @ weight.T. Direct inspection of the pinned safetensors header confirms a BF16 head shaped [49152,576], occupying 56,623,104 bytes. A 4096-row panel occupies 4,718,592 bytes. The tagged runtime\u2019s [matmul dispatch](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/matmul.cpp) selects identical GEMV parameters for singleton heads with K=576 and either 49152 or 4096 output rows. Its [GEMV implementation](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/kernels/gemv.h) reduces rows independently; these aligned panels preserve each row\u2019s operands and reduction sequence. This supports numerical equivalence, without establishing runtime parity or speed.",
+      "generalization": "Output-row blocking is a portable memory-locality transformation using ordinary matrix operations. Larger frontier vocabulary heads can use smaller row panels or existing vocabulary shards while retaining the complete contraction dimension. Benefits require panels to fit a faster memory tier and grow with the head\u2019s share of decode traffic, particularly in large-vocabulary and MoE models. No custom kernels or compiler optimization are required.",
+      "risk": "Extra projection calls and dependencies may outweigh memory savings, or the existing head may already enjoy sufficient cache reuse. Changing output dimensions can change arithmetic on other execution paths; equal contraction length alone does not prove parity. Enable only paths with an established identical per-row computation, and retain the original head otherwise.",
+      "history_relation": "Extends round 0006\u2019s accepted temporal-reuse schedule to a matrix too large for reliable whole-matrix reuse, while retaining round 0004\u2019s pipeline. Round 0003 left batching disabled because its arithmetic contract was unresolved; this uses separate singleton projections and preserves their reduction sequence. Round 0002\u2019s screening overhead and round 0005\u2019s sibling packing do not test row blocking. The transformer and KV computations implicated by round 0001 remain unchanged."
+    },
+    "plan": "1. Modify only candidate/. Preserve prefill, request-local drafting, verification bodies, rollback, budgets, and scalar pipelining. Keep model parameters and module bindings untouched. Introduce only immutable views of existing head weights; all hidden-state-dependent work remains inside decode.\n\n2. Fix the panel width at 4096 vocabulary rows before evaluation. The target has twelve complete panels. Initially support its ordinary tied BF16 embedding head with native singleton hidden states and contiguous weight rows. Retain the existing full-head path for unsupported layouts, dtypes, or arithmetic paths.\n\n3. Replace only the final head phase of _verify. For each panel, evaluate h_i @ W_panel.T separately for every position, retaining shape (1,1,576), original BF16 operands, and the entire contraction dimension. Use dependencies on consumed inputs, following _project, to complete all positions for one panel before starting the next. Do not batch positions or synchronize the host per panel.\n\n4. Collect panel outputs separately for each position, concatenate along the vocabulary axis in original row order, and invoke the existing argmax. Preserve prediction tensors and the current acceptance logic. Concatenation introduces no numerical reduction and preserves reference tie handling.\n\n5. Confirm that the installed full and panel projections follow the identical per-row computation supported by the source audit, including strides, alignment, reduction order, and final conversion. Compare complete logits bitwise on independent BF16 vectors and model hidden states, including cancellation and ties across panel boundaries. An unexplained mismatch blocks activation; do not introduce empirical margin acceptance.\n\n6. Verify complete greedy trajectories and retained KV against reference execution on independent inputs, including partial acceptance, rollback, scalar transitions, and small budgets. Confirm that panel ordering executes and the optimized path is active without hot-path logging.\n\n7. Have the orchestrator run unchanged exact-token evaluation and both throughput confirmations against the accepted round-0006 candidate. Record active-path status and measured gain. Keep only the required improvement, without adjusting panel size or policy from benchmark prompts or results.",
+    "reason": "A substantial repeated weight scan remains in the accepted verifier. Row blocking has a concrete numerical-equivalence argument for the target and a portable traffic-reduction mechanism. Whether locality gains exceed the additional calls is genuinely unresolved and worth testing."
+  },
+  "review": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Vocabulary-row blocking for scalar speculative heads",
+      "idea": "Partition the unchanged tied vocabulary matrix into twelve contiguous 4096-row panels. Within the accepted speculative verifier, evaluate each panel across all singleton hidden states before advancing to the next panel. Concatenate each position\u2019s logits in vocabulary order and apply the original argmax. Preserve the existing transformer verifier and scalar pipeline.",
+      "cost_removed": "Targets repeated weight reads from slower memory. For B verification positions, replace B full-head calls with 12B panel calls while retaining all arithmetic. If each 4,718,592-byte panel remains cached across positions and full-head scans otherwise miss, ideal head traffic falls from B\u00d756,623,104 bytes to 56,623,104 bytes. At B=5, this could avoid 226,492,416 bytes, at the cost of 55 additional matrix calls, dependencies, allocations, and logit concatenations. These are conditional traffic savings, not measured results.",
+      "source_evidence": "Verified candidate/inference.py:134-137 applies separate full heads through _project. Installed Embedding.as_linear is x @ weight.T, and the pinned safetensors header confirms BF16 weights shaped [49152,576], totaling 56,623,104 bytes. MLX is pinned to 0.32.3. For native contiguous singleton operands, its [matmul dispatch](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/matmul.cpp) routes both output widths to GEMV with BM=8, BN=1, SM=1, SN=32, TM=4, TN=4; the wide-vector route excludes M=1. The [GEMV implementation](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/kernels/gemv.h) accumulates rows independently in float and converts to BF16. Panel boundaries align with its 32-row groups, preserving each row\u2019s operands, reduction, and conversion on this audited path. Runtime parity remains to be validated.",
+      "generalization": "Output-row blocking and shorter weight reuse distance are portable memory-locality transformations. Benefits require panels and intervening working data to fit a faster memory tier. Frontier vocabulary heads or existing vocabulary shards offer the same opportunity, although suitable panel sizes and arithmetic guarantees require separate assessment. The runtime source audit supports correctness; the proposed speedup comes from reduced memory traffic.",
+      "risk": "Additional calls and dependencies may outweigh locality gains, and the full head may already benefit from cache reuse. Changed output dimensions can select different arithmetic on other execution paths. Incorrect dependency placement can also leave the intended panel schedule unenforced. Preserve the existing full-head path wherever the arithmetic preconditions are unestablished.",
+      "history_relation": "Extends round 0006\u2019s accepted reuse schedule to its remaining full vocabulary scans and retains round 0004\u2019s pipeline. Round 0003 left batching disabled, so its result does not resolve this mechanism. Rounds 0002 and 0005 tested screening and sibling packing. Round 0001\u2019s exactness failure was not diagnosed; this proposal preserves the currently accepted transformer and KV computation."
+    },
+    "plan": "1. Modify only candidate/, principally the final head phase of _verify. Preserve prefill, first-token selection, drafting policy, transformer operations, cache handling, acceptance, rollback, budgets, and scalar pipelining. Keep shared model parameters, module bindings, and execution settings unchanged; harness/bench.py shares the model between implementations.\n\n2. Freeze panel width at 4096 before evaluation. Initially support the pinned runtime\u2019s audited native tied BF16 head with shape [49152,576] and separate hidden states shaped [1,1,576]. Document the contiguous-layout precondition and restrict activation to the established arithmetic path. Unsupported configurations retain the existing _project(full_head, norm, norm) path without disabling the accepted verifier. Construct ordinary immutable row-slice views, optionally once per request at its first eligible verification. Do not pack, cast, mutate, or copy the weight matrix unnecessarily.\n\n3. Preserve the existing final normalizations. Initialize phase dependencies to all normalized states. For each panel in vocabulary order, call _project with the separate original states and a projection computing h @ panel.T; make its consumed inputs depend on the preceding panel\u2019s outputs. Reuse _project\u2019s within-phase chaining, then set the next phase dependencies to the current outputs. Retain outputs separately for each position. Keep the complete 576-element contraction, native dtype, and singleton shape; do not batch positions or introduce compilation wrappers.\n\n4. Make logit assembly wait for all final-panel projections, so concatenation and argmax do not interrupt panel reuse. Concatenate each position\u2019s twelve outputs along the vocabulary axis into [1,1,49152], preserving BF16 values and vocabulary order. Invoke the existing mx.argmax(logits[:, -1, :], axis=-1) and retain native prediction tensors. Use the current asynchronous submission and joint ID materialization, with no host synchronization per panel.\n\n5. Validate the arithmetic contract against the actual implementation: identical dispatch parameters, matrix leading dimension, singleton batching, aligned row offsets, contraction reduction, and final conversion. The source argument applies because both widths use identical row groups and neither introduces an output tail; unchanged contraction length alone is insufficient. Compare complete BF16 logit bit patterns against the original head on independent vectors and model-derived normalized states, including cancellation, zero inputs, and ties spanning panel boundaries. Test every panel and verification length from two through five. An unexplained mismatch blocks activation; empirical margins or sampled agreement cannot replace the arithmetic argument.\n\n6. On independent inputs, compare greedy trajectories, retained KV prefixes, and continuations after rejection against reference execution. Exercise partial and full acceptance, immediate rejection, scalar transitions, small budgets, capacity boundaries, and fresh requests. Confirm the dependency graph enforces panel ordering and, where available, inspect an independent execution trace. Record a request-local blocked-head count without hot-path logging. Runtime access limitations should be reported and validation handed to the orchestrator; a disabled path does not test the mechanism.\n\n7. Keep all hidden-state-dependent computation, allocations, concatenations, transfers, and synchronization inside timed decode. Perform no future-token work during prefill and reuse no request-specific computation across requests. Keep validation and diagnostic tracing separate from timing. Have the orchestrator run unchanged exact-token evaluation and both throughput confirmations against the accepted round-0006 candidate. Require at least 1.03x incremental gain in both confirmations. Record active-path status, correctness, and measured gain without adjusting panel width or policy from benchmark prompts or results.",
+    "reason": "No fundamental flaw was found. The audited path has a concrete per-row equivalence argument, and blocking offers a portable reduction in repeated weight traffic. The review sharpens arithmetic support, execution dependencies, timing, and active-path validation. Whether the savings exceed the added overhead remains a benchmark question."
+  },
+  "implementation": {
+    "outcome": "implemented",
+    "summary": "Implemented twelve 4096-row vocabulary panels in candidate/inference.py, preserving phase dependencies, singleton projections, ordered logit assembly, and full-head fallback. Added request-local panel views and an activation counter. Syntax, structural scheduling checks for lengths 2\u20135, and diff checks passed. Metal device access was unavailable; BF16 parity, trajectory/KV correctness, and performance validation remain with the orchestrator."
+  },
+  "eval": {
+    "correct": true,
+    "cases": [
+      {
+        "prompt": "Explain why the sky is blue.",
+        "correct": true
+      },
+      {
+        "prompt": "Write a short Python function that reverses a list.",
+        "correct": true
+      },
+      {
+        "prompt": "What are the main causes of inflation?",
+        "correct": true
+      },
+      {
+        "prompt": "Describe how photosynthesis works.",
+        "correct": true
+      },
+      {
+        "prompt": "Continue this story: The door opened and nobody was there.",
+        "correct": true
+      },
+      {
+        "prompt": "<benchmark>",
+        "correct": true
+      }
+    ]
+  },
+  "confirmations": [
+    {
+      "baseline_relative_decode_speed": 1.4674870119478203,
+      "candidate_relative_decode_speed": 1.583068720218903,
+      "gain": 1.078761656716586
+    },
+    {
+      "baseline_relative_decode_speed": 1.7369093413409313,
+      "candidate_relative_decode_speed": 1.7565447238335357,
+      "gain": 1.0113047825958754
+    }
+  ],
+  "confirmed_gain": 1.0113047825958754,
+  "reason": "decode gain was not >= 1.03x twice"
+}

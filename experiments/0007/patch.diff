@@ -1,0 +1,102 @@
+diff --git a/candidate/inference.py b/candidate/inference.py
+index f3cfabc..ef62da0 100644
+--- a/candidate/inference.py
++++ b/candidate/inference.py
+@@ -1,9 +1,15 @@
++from importlib.metadata import version
++
+ import mlx.core as mx
+ import mlx.nn as nn
+ from mlx_lm.models.cache import KVCache, make_prompt_cache
+ from mlx_lm.models import llama
+ 
+ 
++_PANEL_ROWS = 4096
++_AUDITED_HEAD_RUNTIME = version("mlx") == "0.32.3"
++
++
+ class RequestCache(list):
+     """Ordinary caches plus request-local copying state and decode counters."""
+ 
+@@ -11,12 +17,14 @@ class RequestCache(list):
+         super().__init__(caches)
+         self.history = []
+         self.index = {}
++        self.head_panels = None
+         self.stats = {
+             "scalar_steps": 0,
+             "verifications": 0,
+             "draft_lengths": [0] * 5,
+             "accepted_lengths": [0] * 5,
+             "rejected_positions": 0,
++            "blocked_head_verifications": 0,
+         }
+         for token in token_ids:
+             self.append_token(int(token))
+@@ -89,6 +97,56 @@ def _project(projection, inputs, dependencies):
+     return outputs
+ 
+ 
++def _head_logits(model, cache, norm):
++    """Reuse each vocabulary panel across singleton positions before advancing.
++
++    Layout contract: the fixed model's unchanged safetensors embedding is row
++    contiguous; native final RMSNorm outputs are contiguous singleton vectors.
++    MLX has no public stride metadata. Do not substitute a strided embedding.
++    On 0.32.3 Metal, both widths dispatch GEMV with BM=8, BN=1, SM=1,
++    SN=32, TM=4, TN=4, matrix_ld=576 and one singleton batch. Panel offsets
++    align with 32-row groups, with no output tail. Each row retains its full
++    contraction, float accumulation/reduction and native BF16 conversion.
++    """
++    embedding = model.model.embed_tokens
++    head = embedding.as_linear if model.args.tie_word_embeddings else model.lm_head
++    eligible = (
++        _AUDITED_HEAD_RUNTIME
++        and mx.metal.is_available()
++        and mx.default_device().type == mx.gpu
++        and isinstance(cache, RequestCache)
++        and model.args.tie_word_embeddings
++        and type(embedding) is nn.Embedding
++        and embedding.weight.shape == (49152, 576)
++        and embedding.weight.dtype == mx.bfloat16
++        and 2 <= len(norm) <= 5
++        and all(x.shape == (1, 1, 576) and x.dtype == mx.bfloat16 for x in norm)
++    )
++    if not eligible:
++        return _project(head, norm, norm)
++
++    if cache.head_panels is None:
++        cache.head_panels = tuple(
++            embedding.weight[start : start + _PANEL_ROWS]
++            for start in range(0, 49152, _PANEL_ROWS)
++        )
++    parts = [[] for _ in norm]
++    dependencies = norm
++    for panel in cache.head_panels:
++        outputs = _project(lambda h: h @ panel.T, norm, dependencies)
++        for position, logits in zip(parts, outputs):
++            position.append(logits)
++        dependencies = outputs
++    # Gate every assembly on the entire final panel, so earlier concatenations
++    # cannot interrupt panel reuse. No host reads or synchronization per panel.
++    logits = [
++        mx.concatenate(mx.depends(position, dependencies), axis=-1)
++        for position in parts
++    ]
++    cache.stats["blocked_head_verifications"] += 1
++    return logits
++
++
+ def _verify(model, cache, tokens):
+     """Teacher-forced singleton forwards, interchanged only across projections.
+ 
+@@ -132,8 +190,7 @@ def _verify(model, cache, tokens):
+         downs = _project(layer.mlp.down_proj, activated, activated)
+         xs = [h + r for h, r in zip(hs, downs)]
+     norm = [body.norm(mx.depends(x, xs)) for x in xs]
+-    head = body.embed_tokens.as_linear if model.args.tie_word_embeddings else model.lm_head
+-    logits = _project(head, norm, norm)
++    logits = _head_logits(model, cache, norm)
+     return [mx.argmax(x[:, -1, :], axis=-1) for x in logits]
+ 
+ 
