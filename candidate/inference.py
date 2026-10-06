@@ -34,6 +34,7 @@ class RequestCache(list):
         self.index = {}
         self.batch_rows_eligible = None
         self.grouped_eligible = None
+        self.rotary_eligible = None
         self.stats = {
             "scalar_steps": 0,
             "verifications": 0,
@@ -44,6 +45,8 @@ class RequestCache(list):
             "grouped_blocks": 0,
             "grouped_positions": 0,
             "grouped_projection_calls": 0,
+            "rotary_blocks": 0,
+            "grouped_rotary_calls": 0,
             "draft_lengths": [0] * (MAX_DRAFTS + 1),
             "accepted_lengths": [0] * (MAX_DRAFTS + 1),
             "rejected_positions": 0,
@@ -170,6 +173,19 @@ def _grouped_supported(model, cache):
     return True
 
 
+def _rotary_supported(model):
+    """Separate native rotary gate; failure preserves projection grouping."""
+    return all(type(a.rope) is nn.RoPE and a.rope.dims == 64
+               and a.rope.traditional is False and a.rope.base == 100000
+               and a.rope.scale == 1.0
+               for a in (layer.self_attn for layer in model.layers))
+
+
+def _rotary_offsets(start, count):
+    # Avoid a float position conversion and an overflowing exclusive endpoint.
+    return mx.arange(count, dtype=mx.int32) + mx.array(start, dtype=mx.int32)
+
+
 def _grouped_project(weight, block, dependencies, lhs_indices, rhs_indices):
     """Independent M=1 products; keep the weight transpose column-major.
 
@@ -215,7 +231,7 @@ def _bulk_start(cache, count):
 
 
 def _verify(model, cache, tokens, *, _trace=None):
-    """Teacher-forced singleton forwards, interchanged only across projections.
+    """Teacher-forced singleton forwards with grouped projections and rotary.
 
     tokens contains pending followed by drafts, each with native shape (1, 1).
     Each attention reads its own native causal prefix. Eligible blocks append
@@ -238,6 +254,13 @@ def _verify(model, cache, tokens, *, _trace=None):
                        and kv.keys.ndim == kv.values.ndim == 4
                        and kv.keys.shape[3] == kv.values.shape[3] == 64
                        for kv in cache))
+    if isinstance(cache, RequestCache) and cache.rotary_eligible is None:
+        cache.rotary_eligible = _rotary_supported(model) if grouped else None
+    rotary = (grouped and cache.rotary_eligible and 0 <= start
+              and start + len(tokens) - 1 <= 2147483647)
+    if rotary:
+        rotary_offsets = _rotary_offsets(start, len(tokens))
+        cache.stats["rotary_blocks"] += 1
     if grouped:
         lhs_indices = mx.arange(len(tokens), dtype=mx.uint32)
         rhs_indices = mx.zeros((len(tokens),), dtype=mx.uint32)
@@ -273,7 +296,8 @@ def _verify(model, cache, tokens, *, _trace=None):
             q_block = group(attn.q_proj.weight, norm_block, [norm_block])
             k_block = group(attn.k_proj.weight, norm_block, [q_block])
             v_block = group(attn.v_proj.weight, norm_block, [k_block])
-            qs, ks, vs = _rows(q_block), _rows(k_block), _rows(v_block)
+            if not rotary or _trace is not None:
+                qs, ks, vs = _rows(q_block), _rows(k_block), _rows(v_block)
         else:
             qs = _project(attn.q_proj, norm, norm)
             ks = _project(attn.k_proj, norm, qs)
@@ -284,20 +308,36 @@ def _verify(model, cache, tokens, *, _trace=None):
             trace("v", vs)
         attention = []
         if start is not None:
-            rotated_qs, rotated_ks, reshaped_vs = [], [], []
-            for i in range(len(xs)):
-                q, k, v = mx.depends([qs[i], ks[i], vs[i]], vs)
-                q = q.reshape(1, 1, attn.n_heads, -1).transpose(0, 2, 1, 3)
-                k = k.reshape(1, 1, attn.n_kv_heads, -1).transpose(0, 2, 1, 3)
-                v = v.reshape(1, 1, attn.n_kv_heads, -1).transpose(0, 2, 1, 3)
-                rotated_qs.append(attn.rope(q, offset=start + i))
-                rotated_ks.append(attn.rope(k, offset=start + i))
-                reshaped_vs.append(v)
-            if _trace is not None:
-                trace("rope_q", rotated_qs)
-                trace("rope_k", rotated_ks)
-            kv.update_and_fetch(mx.concatenate(rotated_ks, axis=2),
-                                mx.concatenate(reshaped_vs, axis=2))
+            if rotary:
+                # Gate both rotary inputs on the final projection phase. Batch
+                # elements are singleton sequences with independent offsets.
+                q, k, v = mx.depends([q_block, k_block, v_block], [v_block])
+                q = attn.rope(q.reshape(len(tokens), 9, 1, 64),
+                              offset=rotary_offsets)
+                k = attn.rope(k.reshape(len(tokens), 3, 1, 64),
+                              offset=rotary_offsets)
+                cache.stats["grouped_rotary_calls"] += 2
+                rotated_qs = mx.split(mx.contiguous(q), len(tokens), axis=0)
+                if _trace is not None:
+                    trace("rope_q", rotated_qs)
+                    trace("rope_k", mx.split(k, len(tokens), axis=0))
+                kv.update_and_fetch(k.transpose(2, 1, 0, 3),
+                    v.reshape(len(tokens), 3, 1, 64).transpose(2, 1, 0, 3))
+            else:
+                rotated_qs, rotated_ks, reshaped_vs = [], [], []
+                for i in range(len(xs)):
+                    q, k, v = mx.depends([qs[i], ks[i], vs[i]], vs)
+                    q = q.reshape(1, 1, attn.n_heads, -1).transpose(0, 2, 1, 3)
+                    k = k.reshape(1, 1, attn.n_kv_heads, -1).transpose(0, 2, 1, 3)
+                    v = v.reshape(1, 1, attn.n_kv_heads, -1).transpose(0, 2, 1, 3)
+                    rotated_qs.append(attn.rope(q, offset=start + i))
+                    rotated_ks.append(attn.rope(k, offset=start + i))
+                    reshaped_vs.append(v)
+                if _trace is not None:
+                    trace("rope_q", rotated_qs)
+                    trace("rope_k", rotated_ks)
+                kv.update_and_fetch(mx.concatenate(rotated_ks, axis=2),
+                                    mx.concatenate(reshaped_vs, axis=2))
             cache.stats["bulk_updates"] += 1
             for i, q in enumerate(rotated_qs):
                 end = start + i + 1
