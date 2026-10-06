@@ -1,0 +1,131 @@
+diff --git a/candidate/inference.py b/candidate/inference.py
+index d325ba3..758d3ae 100644
+--- a/candidate/inference.py
++++ b/candidate/inference.py
+@@ -32,11 +32,14 @@ class RequestCache(list):
+         super().__init__(caches)
+         self.history = []
+         self.index = {}
++        self.batch_rows_eligible = None
+         self.stats = {
+             "scalar_steps": 0,
+             "verifications": 0,
+             "bulk_verifications": 0,
+             "bulk_updates": 0,
++            "batched_blocks": 0,
++            "batched_positions": 0,
+             "draft_lengths": [0] * (MAX_DRAFTS + 1),
+             "accepted_lengths": [0] * (MAX_DRAFTS + 1),
+             "rejected_positions": 0,
+@@ -118,6 +121,38 @@ def _draft(cache, remaining):
+     return drafts
+ 
+ 
++def _batch_supported(model, cache):
++    """Freeze the audited native BF16 activation path, without evaluating it."""
++    if not _supported(model, cache):
++        return False
++    body = model.model
++    # These widths bound the audited native normalization/SwiGLU layouts.
++    if model.args.hidden_size != 576 or model.args.intermediate_size != 1536:
++        return False
++    if body.embed_tokens.weight.dtype != mx.bfloat16:
++        return False
++    norms = [body.norm]
++    projections = []
++    for layer in body.layers:
++        norms.extend((layer.input_layernorm, layer.post_attention_layernorm))
++        attn, mlp = layer.self_attn, layer.mlp
++        projections.extend((attn.q_proj, attn.k_proj, attn.v_proj, attn.o_proj,
++                            mlp.gate_proj, mlp.up_proj, mlp.down_proj))
++    if not model.args.tie_word_embeddings:
++        projections.append(model.lm_head)
++    return (all(type(n) is nn.RMSNorm and n.weight.shape == (576,)
++                and n.weight.dtype == mx.bfloat16 for n in norms)
++            and all(p.weight.dtype == mx.bfloat16 and "bias" not in p
++                    for p in projections))
++
++
++def _rows(block):
++    # Native row operations produce contiguous blocks. Enforce that contract
++    # without copying suitable storage; split keeps the reduction stride at 1
++    # and the final matmul input strides at (K, 1), including every row offset.
++    return mx.split(mx.contiguous(block), block.shape[1], axis=1)
++
++
+ def _project(projection, inputs, dependencies):
+     """Gate consumed inputs, so a whole projection phase precedes the next."""
+     outputs = []
+@@ -150,12 +185,27 @@ def _verify(model, cache, tokens):
+     blocks retain dependencies protecting reads from subsequent cache writes.
+     """
+     start = _bulk_start(cache, len(tokens))
++    if isinstance(cache, RequestCache) and cache.batch_rows_eligible is None:
++        cache.batch_rows_eligible = _batch_supported(model, cache)
++    batched = (start is not None and len(tokens) <= MAX_DRAFTS + 1
++               and cache.batch_rows_eligible
++               and all(t.shape == (1, 1) for t in tokens)
++               and all(kv.keys.dtype == mx.bfloat16
++                       and kv.values.dtype == mx.bfloat16 for kv in cache))
+     if start is not None:
+         cache.stats["bulk_verifications"] += 1
++    if batched:
++        cache.stats["batched_blocks"] += 1
++        cache.stats["batched_positions"] += len(tokens)
+     body = model.model
+     xs = [body.embed_tokens(t) for t in tokens]
++    if batched:
++        x_block = mx.concatenate(xs, axis=1)
+     for layer, kv in zip(body.layers, cache):
+-        norm = [layer.input_layernorm(mx.depends(x, xs)) for x in xs]
++        if batched:
++            norm = _rows(layer.input_layernorm(x_block))
++        else:
++            norm = [layer.input_layernorm(mx.depends(x, xs)) for x in xs]
+         attn = layer.self_attn
+         qs = _project(attn.q_proj, norm, norm)
+         ks = _project(attn.k_proj, norm, qs)
+@@ -206,14 +256,29 @@ def _verify(model, cache, tokens):
+                 )
+                 attention.append(out.transpose(0, 2, 1, 3).reshape(1, 1, -1))
+         projected = _project(attn.o_proj, attention, attention)
+-        hs = [x + r for x, r in zip(xs, projected)]
+-        norm = [layer.post_attention_layernorm(h) for h in hs]
++        if batched:
++            h_block = x_block + mx.concatenate(projected, axis=1)
++            norm = _rows(layer.post_attention_layernorm(h_block))
++        else:
++            hs = [x + r for x, r in zip(xs, projected)]
++            norm = [layer.post_attention_layernorm(h) for h in hs]
+         gates = _project(layer.mlp.gate_proj, norm, projected)
+         ups = _project(layer.mlp.up_proj, norm, gates)
+-        activated = [llama.swiglu(g, mx.depends(u, ups)) for g, u in zip(gates, ups)]
++        if batched:
++            gate_block = mx.concatenate(mx.depends(gates, ups), axis=1)
++            up_block = mx.concatenate(ups, axis=1)
++            activated = _rows(llama.swiglu(gate_block, up_block))
++        else:
++            activated = [llama.swiglu(g, mx.depends(u, ups)) for g, u in zip(gates, ups)]
+         downs = _project(layer.mlp.down_proj, activated, activated)
+-        xs = [h + r for h, r in zip(hs, downs)]
+-    norm = [body.norm(mx.depends(x, xs)) for x in xs]
++        if batched:
++            x_block = h_block + mx.concatenate(downs, axis=1)
++        else:
++            xs = [h + r for h, r in zip(hs, downs)]
++    if batched:
++        norm = _rows(body.norm(x_block))
++    else:
++        norm = [body.norm(mx.depends(x, xs)) for x in xs]
+     head = body.embed_tokens.as_linear if model.args.tie_word_embeddings else model.lm_head
+     logits = _project(head, norm, norm)
+     return [mx.argmax(x[:, -1, :], axis=-1) for x in logits]
+@@ -225,6 +290,8 @@ def decode(model, first_token, cache, max_new_tokens):
+ 
+     state = cache if isinstance(cache, RequestCache) else None
+     supported = state is not None and _supported(model, cache)
++    if state is not None and state.batch_rows_eligible is None:
++        state.batch_rows_eligible = _batch_supported(model, cache)
+     token = first_token
+     output = []
+     pending = []

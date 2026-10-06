@@ -1,0 +1,94 @@
+{
+  "round": "0016",
+  "parent_commit": "9efa6b4dc2117e932d007d5a3090f5f44f814b75",
+  "models": {
+    "research": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "review": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "implementation": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    }
+  },
+  "status": "accepted",
+  "research": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Batch row-wise operations in speculative verification",
+      "idea": "Keep speculative hidden states in a contiguous position block and batch RMSNorm, residual additions, and the existing SwiGLU across its independent rows. Extract singleton views for every projection and vocabulary head. Preserve singleton RoPE, causal attention, bulk KV updates, drafting, and acceptance.",
+      "cost_removed": "For L layers and m verification positions, reduce normalization, residual-addition, and SwiGLU invocations from (5L+1)m to 5L+1. Add 4L+1 activation concatenations and singleton views. With the current 30 layers and a 17-position block, 2,567 row-operation calls become 151, plus 121 packing operations. This removes repeated dispatch, scheduling, and allocation work; arithmetic and model-weight traffic remain unchanged.",
+      "source_evidence": "candidate/inference.py:_verify separately invokes input normalization, two residual additions, post-attention normalization, and SwiGLU for every position in every layer, followed by separate final normalizations. The pinned configuration has 30 layers, hidden width 576, and intermediate width 1536. The installed RMSNorm calls the native primitive. Its [dispatch](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/normalization.cpp) selects the reduction configuration from feature width, while row count changes the number of independent groups. The [forward implementation](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/kernels/rms_norm.metal) gives each row the same reduction and rounding sequence. This supports batching normalization without changing its per-row arithmetic on the inspected path.",
+      "generalization": "Batching independent activation operations is portable across inference backends and requires no custom kernels or compiler changes. It can reduce scheduling and allocation overhead in deep or tensor-parallel speculative verifiers that retain singleton reductions. Benefits will diminish when weight or attention traffic dominates; other backends require their own numerical-equivalence audit.",
+      "risk": "Packing and extracting views may outweigh fewer calls, especially for short blocks. Changed layouts must preserve singleton projection dispatch, and batching must preserve RMSNorm and SwiGLU rounding boundaries. Matching immediate tokens alone cannot establish correctness if retained KV differs. Native numerical parity and throughput remain untested.",
+      "history_relation": "Preserves the accepted projection schedule, suffix drafting, scalar pipeline, and bulk KV append. Round 0013 supports coalescing repeated operations but does not establish this experiment's gain. Round 0001 batched the full transformer and failed exactness; this leaves projections, attention, and RoPE singleton. Round 0005 packed weight matrices and lost performance; this packs small activations while retaining original matrices and projection shapes."
+    },
+    "plan": "1. Implement only inside candidate/. Activate the new path for existing bulk-eligible verification blocks of at least three positions, with native supported normalization modules. Retain the current verifier for other cases. Preserve prefill, drafting constants, scalar pipelining, and request isolation.\n\n2. Concatenate the existing singleton embeddings into X shaped [1,m,D]. At each layer, call its original input RMSNorm once on X, then extract [1,1,D] row views for the unchanged projection-major Q/K/V calls. Preserve their execution dependencies and the current singleton RoPE, bulk KV append, and sequential causal attention.\n\n3. Concatenate singleton output projections and compute H=X+R with the original residual rounding boundary. Apply the original post-attention RMSNorm once, then run singleton gate/up projections. Concatenate their outputs separately, call the existing SwiGLU once, and extract singleton inputs for down projections. Concatenate down outputs and compute X=H+down. Batch the final RMSNorm and retain the original singleton heads and argmax operations. Use ordinary concatenation and views; introduce no fusion, rewritten arithmetic, or additional host synchronization.\n\n4. Preserve full-phase dependencies through packing and explicit dependencies. Ensure every projection sees the original singleton shape, contiguous reduction dimension, and supported layout. Keep acceptance, completion before rollback, cache offsets, and output-budget handling unchanged. Add a request-local activation counter to establish that validation exercises the new path.\n\n5. Check bitwise row equivalence for normalization, residuals, and SwiGLU on independent BF16 inputs, including cancellation, extreme magnitudes, and several block lengths. Compare intermediate states and retained KV against the existing verifier, then test scalar continuation after full acceptance and rejection, capacity boundaries, and short output budgets. An unsupported numerical path must use the existing verifier; tests alone must not substitute for the arithmetic argument.\n\n6. Hand authoritative exact-token evaluation and benchmarking against the current best to the orchestrator. Require the existing improvement threshold in both confirmation runs. Do not tune eligibility or packing policy using benchmark prompts or results.",
+    "reason": "This exposes a substantial, untested reduction in repeated verifier invocations with a concrete per-row equivalence argument and no additional acceptance synchronization. Whether packing costs outweigh those savings should be resolved by evaluation and benchmarking."
+  },
+  "review": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Batch row-wise operations in speculative verification",
+      "idea": "Keep speculative hidden states in a contiguous position block and batch the original RMSNorm, residual additions, and SwiGLU across independent rows. Split their outputs into singleton views for every projection and vocabulary head. Preserve singleton RoPE, causal attention, bulk KV updates, drafting, and acceptance.",
+      "cost_removed": "Reduce row-operation calls from (5L+1)m to 5L+1, adding 4L+1 concatenations and 3L+1 split calls. For L=30 and m=17, 2,567 row calls become 151, plus 121 concatenations and 91 splits. Crucially, the inspected concatenation implementation copies each input separately: those concatenations add 2,057 copy dispatches. Nominal affected arithmetic/copy dispatches therefore fall from 2,567 to 2,208, not 272; short blocks can increase dispatches. Packing copies 4,328,064 bytes of BF16 payload per maximum block, requiring additional reads and writes. The substantial library-call reduction remains; no projection FLOPs or weight scans are removed.",
+      "source_evidence": "Verified the repeated operations in candidate/inference.py:158\u2013219, the installed native RMSNorm and SwiGLU implementations, and checkpoint metadata: 30 layers, width 576, intermediate width 1536, and BF16 weights. The inspected [RMSNorm dispatch](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/normalization.cpp) selects reduction geometry by feature width; its [forward kernel](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/kernels/rms_norm.metal) preserves each row\u2019s reduction and casts. Existing SwiGLU uses a shapeless compiled elementwise expression. Its [dispatch](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/compiled.cpp) and [size threshold](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/utils.h) retain the same contiguous scalar-per-element path through the maximum 26,112-element block. [Matmul dispatch](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/matmul.cpp) supports preserving singleton GEMV with unchanged matrix dimensions and final input strides. The [concatenation implementation](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/slicing.cpp) establishes the additional per-input copies.",
+      "generalization": "Coalescing independent activation operations is portable and requires ordinary tensor operations. The saving is repeated invocation, scheduling, and allocation overhead; it requires no compiler changes or custom kernels. It may help deep or sharded verifiers retaining singleton projection arithmetic. Benefits diminish when weights or attention dominate, and engines already batching these operations gain nothing further. Other numerical implementations need their own equivalence audit.",
+      "risk": "Packing traffic, copy dispatches, views, and longer buffer lifetimes may outweigh savings. Singleton shape alone does not establish projection equivalence: strides and numerical dispatch must also match. Rewriting RMSNorm or SwiGLU can change rounding. Matching current predictions cannot excuse different retained KV. Native BF16 parity and throughput remain untested.",
+      "history_relation": "Preserves accepted rounds 0004, 0006, 0008, and 0013. Round 0001 establishes that full-transformer batching can fail exactness, without isolating which operations caused divergence. This proposal retains singleton projections, RoPE, and attention. Round 0005 tested weight packing, not activation packing. Round 0013 supports investigating coalesced operations but does not establish this experiment\u2019s gain."
+    },
+    "plan": "1. Implement only inside candidate/. Preserve prefill, model objects and weights, drafting constants, scalar pipelining, and request isolation. Select batching before any cache mutation, only when _bulk_start succeeds for at least three positions and all input, post-attention, and final normalization modules are native nn.RMSNorm with audited dtypes and layouts. Retain the existing verifier for unsupported cases. Add request-local counters for batched blocks and positions; freeze eligibility before evaluation.\n\n2. Concatenate the existing singleton embeddings along position into X=[1,m,D]. Apply the original input normalization once. Use an ordinary split along position to obtain [1,1,D] views, then retain _project and its projection-major Q/K/V schedule. Every projection must retain its original weights, dtype, singleton dimensions, and contiguous reduction dimension; require final input strides (K,1). Avoid blanket contiguous copies of already suitable views.\n\n3. Preserve the bulk attention path: singleton reshapes and RoPE at C+i, one KV append per layer, and sequential singleton attention against exactly the original causal prefix views of allocated buffers. Concatenate singleton output projections and compute H=X+R as the original separate residual addition. Normalize H once, split it for singleton gate/up projections, concatenate gate and up outputs separately, and call the existing llama.swiglu once. Split its output for singleton down projections, concatenate their outputs, and compute X=H+down. Batch the final normalization, then retain singleton vocabulary heads and original argmax operations.\n\n4. Preserve full projection-phase dependencies and sequential attention dependencies. Packing must depend on every producer; downstream row views must depend on the completed packed operation. Keep residual inputs alive through their consumers and use functional operations without manual buffer reuse. Preserve every original dtype and rounding boundary, including RMSNorm\u2019s normalization cast before weight multiplication. Add no whole-verifier compilation, arithmetic rewrites, fusion across residual boundaries, or host synchronization.\n\n5. Leave acceptance and rollback unchanged. For k=m-1 drafts and a accepted drafts, materialize all predictions before trimming k-a positions, leaving every cache at C+1+a and the final emitted token pending. Preserve allocation capacity, stale-tail overwrite, output-budget limits, fixed-length generation, and zero/one-token requests. All generated-token packing, verification, counters, transfers, and cleanup remain inside decode. The harness\u2019s synchronization before stopping the timer must continue to account for all submitted work.\n\n6. Validate bitwise batched-versus-singleton normalization, residuals, and existing SwiGLU on independent BF16 inputs across block lengths 3\u201317, including cancellation, small values, extreme magnitudes, and rounding boundaries. Check projection outputs from every row offset against standalone singleton inputs. Compare intermediate states, predictions, and retained KV against the existing verifier, then continue scalar decoding after immediate rejection, partial acceptance, and full acceptance. Exercise capacity endpoints, subsequent overwrites, short budgets, fallback, and independent requests. Counters must demonstrate active batching. Unsupported arithmetic paths must fall back before mutation; passing token samples alone is insufficient evidence of numerical equivalence.\n\n7. Hand authoritative exact-token evaluation and benchmarking to the orchestrator. Include all unchanged evaluation cases and require at least 1.03x gain over the current best in both confirmation runs. Do not tune packing or eligibility using benchmark prompts or results. Record native validation, path activation, and throughput separately.",
+    "reason": "No fundamental flaw was found. Review materially corrects the packing-cost claim and sharpens numerical eligibility, singleton layouts, dependencies, and validation. The mechanism still removes substantial invocation work, while net throughput remains uncertain. Native execution was unavailable because MLX could not access a Metal device; that is an environment limitation, not an experiment result. No files were edited."
+  },
+  "implementation": {
+    "outcome": "implemented",
+    "summary": "Updated candidate/inference.py with batched row operations, frozen eligibility, singleton projections, fallback, and request-local counters. Acceptance and rollback remain unchanged. Syntax and boundary checks passed. Native BF16/model validation could not run because no Metal device was available; authoritative evaluation and benchmarking remain with the orchestrator."
+  },
+  "eval": {
+    "correct": true,
+    "cases": [
+      {
+        "prompt": "Explain why the sky is blue.",
+        "correct": true
+      },
+      {
+        "prompt": "Write a short Python function that reverses a list.",
+        "correct": true
+      },
+      {
+        "prompt": "What are the main causes of inflation?",
+        "correct": true
+      },
+      {
+        "prompt": "Describe how photosynthesis works.",
+        "correct": true
+      },
+      {
+        "prompt": "Continue this story: The door opened and nobody was there.",
+        "correct": true
+      },
+      {
+        "prompt": "<benchmark>",
+        "correct": true
+      }
+    ]
+  },
+  "confirmations": [
+    {
+      "baseline_relative_decode_speed": 1.8773409958178404,
+      "candidate_relative_decode_speed": 1.987739643551276,
+      "gain": 1.058805857848612
+    },
+    {
+      "baseline_relative_decode_speed": 1.9097201111383273,
+      "candidate_relative_decode_speed": 1.9847507724873223,
+      "gain": 1.0392888261014708
+    }
+  ],
+  "confirmed_gain": 1.0392888261014708,
+  "reason": "decode gain confirmed twice at >= 1.03x"
+}
