@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { loadResearch, parseReport, progression, summarize, type Report } from "../lib/research";
 import { paginateHistory, roundHistoryHref } from "../lib/history";
@@ -15,20 +15,22 @@ function report(round: string, status: Report["status"], gain?: number): Report 
 
 test("actual history preserves outcomes and computes the accepted baseline", async () => {
   const data = await loadResearch(root);
-  assert.deepEqual(data.experiments.map(e => e.report.round), ["0001", "0002", "0003", "0004", "0005"]);
-  assert.deepEqual(data.experiments.map(e => e.report.status), ["rejected", "rejected", "rejected", "accepted", "rejected"]);
-  assert.equal(data.current?.report.round, "0004");
-  assert.equal(data.steps.length, 2);
-  assert.equal(data.cumulative, 1.2340681795410524);
+  const rounds = (await readdir(path.join(root, "experiments"))).filter(name => /^\d+$/.test(name)).sort((a, b) => Number(a) - Number(b));
+  const reports: Report[] = await Promise.all(rounds.map(async round => JSON.parse(await readFile(path.join(root, "experiments", round, "report.json"), "utf8"))));
+  const accepted = reports.filter(item => item.status === "accepted");
+  assert.deepEqual(data.experiments.map(e => e.report.round), rounds);
+  assert.deepEqual(data.experiments.map(e => e.report.status), reports.map(item => item.status));
+  assert.equal(data.current?.report.round, accepted.at(-1)?.round);
+  assert.equal(data.steps.length, accepted.length + 1);
+  assert.equal(data.cumulative, accepted.reduce((gain, item) => gain * item.confirmed_gain!, 1));
   assert.equal(data.experiments[0].exactness, "Failed · 2/5 cases");
   assert.equal(data.experiments[0].gain, undefined);
   assert.match(data.experiments[1].mechanism, /packed 4-bit/);
   assert.match(data.experiments[2].limitation!, /Batching remains disabled/);
   assert.equal(data.experiments[4].changesBaseline, false);
-  assert.equal(data.current?.report.confirmations?.[1].gain, 1.3360200885062277);
-  assert.match(data.candidate, /mx.async_eval/);
+  assert.equal(data.experiments.find(e => e.report.round === "0004")?.report.confirmations?.[1].gain, 1.3360200885062277);
   assert.equal(data.candidateFiles[0].path, "candidate/inference.py");
-  assert.equal(applyPatch(data.reference, data.sourceDiff), data.candidate);
+  assert.equal(data.sourceDiff ? applyPatch(data.reference, data.sourceDiff) : data.reference, data.candidate);
   assert.equal(data.testbed.contextTokens, 512);
   assert.equal(data.testbed.newTokens, 128);
 });

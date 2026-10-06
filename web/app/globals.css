@@ -99,6 +99,14 @@ a:focus-visible, button:focus-visible, summary:focus-visible { color: var(--acce
 .experiment > summary:focus-visible { text-decoration: none; }
 .experiment > summary:focus-visible .experiment-heading strong { color: var(--accent); text-decoration: underline; text-underline-offset: 4px; }
 pre:focus-visible { background: #e5ecf7; }
+.code-block .hljs-keyword, .code-block .hljs-literal, .code-block .hljs-meta { color: #365a8c; }
+.code-block .hljs-title, .code-block .hljs-built_in { color: #4d567e; }
+.code-block .hljs-string, .code-block .hljs-attr { color: #526755; }
+.code-block .hljs-number { color: #796044; }
+.code-block .hljs-comment { color: #697789; }
+.code-block .hljs-addition { color: #46654f; }
+.code-block .hljs-deletion { color: #925757; }
+.code-block .hljs-section { color: #365a8c; }
 
 .experiment-details .secondary-disclosure { border-top: 0; }
 

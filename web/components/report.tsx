@@ -2,9 +2,21 @@ import type { ReactNode } from "react";
 import Markdown from "react-markdown";
 import { ratio } from "../lib/format";
 import type { Experiment, Proposal } from "../lib/research";
+import CodeBlock from "./code-block";
 
 export function Prose({ text }: { text: string }) {
-  return <div className="report-prose"><Markdown>{text}</Markdown></div>;
+  return <div className="report-prose"><Markdown components={{
+    pre: ({ node, children }) => {
+      const code = node?.children.find(child => child.type === "element" && child.tagName === "code");
+      if (!code || code.type !== "element") return <pre tabIndex={0}>{children}</pre>;
+      const content = code.children.filter(child => child.type === "text").map(child => child.value).join("");
+      const classes = code.properties.className;
+      const language = Array.isArray(classes)
+        ? classes.map(String).find(name => name.startsWith("language-"))?.slice(9)
+        : undefined;
+      return <CodeBlock code={content} language={language} />;
+    },
+  }}>{text}</Markdown></div>;
 }
 
 export function Note({ title, id, children }: { title: string; id?: string; children: ReactNode }) {
@@ -47,7 +59,7 @@ export function ExperimentReport({ experiment }: { experiment: Experiment }) {
       </Note>
       <div className="final-decision"><span className="eyebrow">Final decision / {report.status}</span><Prose text={report.reason} /><p className="small-copy">{experiment.changesBaseline ? "Accepted into the baseline used for subsequent experiments." : "The accepted baseline was retained. This record remains evidence for future research."}</p></div>
       <details className="secondary-disclosure"><summary>Original researcher proposal<span aria-hidden="true">↗</span></summary>{report.research.proposal && <ProposalDetails proposal={report.research.proposal} />}<Note title="Researcher reasoning"><Prose text={report.research.reason} /></Note>{report.research.plan && <Note title="Original plan"><Prose text={report.research.plan} /></Note>}</details>
-      {experiment.patch && <details className="secondary-disclosure code-disclosure"><summary>Tested patch<span className="code-path">experiments/{report.round}/patch.diff</span></summary><pre tabIndex={0}><code>{experiment.patch}</code></pre></details>}
+      {experiment.patch && <details className="secondary-disclosure code-disclosure"><summary>Tested patch<span className="code-path">experiments/{report.round}/patch.diff</span></summary><CodeBlock code={experiment.patch} language="diff" /></details>}
       <p className="source-note">Source: experiments/{report.round}/report.json. Report prose is preserved; path redactions originate in the research record.</p>
     </div>
   );

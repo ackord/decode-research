@@ -5,6 +5,7 @@ import { historyHref, paginateHistory, roundHistoryHref } from "../lib/history";
 import ExperimentEntry from "./experiment-entry";
 import { REPOSITORY_URL } from "../lib/site";
 import StickyHeader from "./sticky-header";
+import CodeBlock from "./code-block";
 
 function Section({ id, number, label, children, className = "" }: {
   id: string; number: string; label: string; children: ReactNode; className?: string;
@@ -60,10 +61,10 @@ export default async function ResearchPage({ historyPage = 1 }: { historyPage?: 
           <div><dt>Exact-token evaluation</dt><dd>{current ? <a href={`${currentReportUrl}#round-${current.report.round}-evaluation`}>{current.exactness}</a> : "No accepted experiment yet"}</dd></div>
         </dl>
         {current && <p className="implementation-evidence"><a href={`${currentReportUrl}#round-${current.report.round}-confirmations`}>Benchmark confirmations ↗</a></p>}
-        <details className="secondary-disclosure code-disclosure"><summary>Current decoder<span className="code-path">candidate/inference.py</span></summary><pre tabIndex={0}><code>{research.candidate}</code></pre></details>
-        <details className="secondary-disclosure code-disclosure"><summary>Original greedy decoder<span className="code-path">reference/inference.py</span></summary><pre tabIndex={0}><code>{research.reference}</code></pre></details>
-        <details className="secondary-disclosure code-disclosure"><summary>Changes from the original reference<span className="code-path">reference/inference.py → candidate/inference.py</span></summary>{research.sourceDiff ? <pre tabIndex={0}><code>{research.sourceDiff}</code></pre> : <p className="small-copy">The inference.py files are identical.</p>}</details>
-        {helperSources.length > 0 && <details className="secondary-disclosure"><summary>Additional candidate Python files<span className="code-path">{helperSources.length} {helperSources.length === 1 ? "file" : "files"}</span></summary>{helperSources.map(file => <details className="secondary-disclosure code-disclosure" key={file.path}><summary>{file.path}</summary><pre tabIndex={0}><code>{file.content}</code></pre></details>)}</details>}
+        <details className="secondary-disclosure code-disclosure"><summary>Current decoder<span className="code-path">candidate/inference.py</span></summary><CodeBlock code={research.candidate} language="python" /></details>
+        <details className="secondary-disclosure code-disclosure"><summary>Original greedy decoder<span className="code-path">reference/inference.py</span></summary><CodeBlock code={research.reference} language="python" /></details>
+        <details className="secondary-disclosure code-disclosure"><summary>Changes from the original reference<span className="code-path">reference/inference.py → candidate/inference.py</span></summary>{research.sourceDiff ? <CodeBlock code={research.sourceDiff} language="diff" /> : <p className="small-copy">The inference.py files are identical.</p>}</details>
+        {helperSources.length > 0 && <details className="secondary-disclosure"><summary>Additional candidate Python files<span className="code-path">{helperSources.length} {helperSources.length === 1 ? "file" : "files"}</span></summary>{helperSources.map(file => <details className="secondary-disclosure code-disclosure" key={file.path}><summary>{file.path}</summary><CodeBlock code={file.content} language="python" /></details>)}</details>}
       </Section>
 
       <Section id="objective" number="03" label="The objective">
