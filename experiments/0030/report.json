@@ -1,0 +1,94 @@
+{
+  "round": "0030",
+  "parent_commit": "dae8a10d2d5ac4662768db1ddb4c537e6c0c05e8",
+  "models": {
+    "research": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "review": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "implementation": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    }
+  },
+  "status": "rejected",
+  "research": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Incremental trie for exact suffix drafting",
+      "idea": "Replace tuple-keyed successor tables with a bounded trie and retained pointers to the current suffixes. Preserve exactly the existing occurrence counts, recency tie-breaking, selected drafts, capacity limits, and pipeline decisions.",
+      "cost_removed": "RequestCache.append_token currently constructs 31 lists and 31 tuples per mature committed token, copying 992 token references and hashing contexts containing 496 tokens. Repeated contexts also require separate successor-count dictionary accesses. The trie replaces this O(L\u00b2) context construction and hashing with at most L+1 integer-keyed edge lookups and count updates, where L=31. Matching and draft extension become pointer traversal. Worst-case context storage falls from O(NL\u00b2) token references to O(NL) nodes. Transformer arithmetic and weight traffic remain unchanged.",
+      "source_evidence": "candidate/inference.py:RequestCache.append_token rebuilds every suffix through INDEX_CONTEXT=31; match rebuilds suffix tuples again; _draft repeatedly concatenates and hashes extended contexts. _decode calls append_token for every committed output, including all accepted speculative tokens, before submitting the next block. This work is therefore inside harness/bench.py's decode timer. An in-memory trie prototype compared against the current classes passed 14,541 prefix checks, 610,722 draft/capacity/budget checks, and 298,619 context-count/tie checks across 102 independent synthetic histories. These establish bookkeeping equivalence, not throughput. Incremental text indexing is also used in [SAM Decoding](https://arxiv.org/abs/2411.10666); this proposal retains the current drafting policy.",
+      "generalization": "Removing repeated context construction can reduce host scheduling delays in retrieval-based speculation, especially when verification commits many tokens together or request histories grow long. The improvement is an ordinary data-structure transformation, independent of MLX, accelerator architecture, compilation, and custom kernels.",
+      "risk": "Pointer chasing and additional trie nodes may offset allocation and hashing savings. Decode may remain dominated by target execution, making the total gain small. Incorrect occurrence updates or treating an unproductive terminal suffix as a match could alter drafting and pipeline behavior.",
+      "history_relation": "Round 0008 established the current frequency-and-recency policy. This experiment preserves its decisions exactly and retains every accepted verifier improvement. No prior round tested eliminating the tuple-key construction and separate successor-count tables; rejected drafting policies do not resolve this representation change."
+    },
+    "plan": "1. Change only candidate/. Keep MAX_CONTEXT=16, MAX_DRAFTS=16, INDEX_CONTEXT=31, all target operations, and existing scheduling limits unchanged.\n2. Introduce compact trie nodes containing the incoming token, occurrence count, children, and preferred child. Retain the root plus pointers for the current suffixes of lengths 1 through 31. On each committed token, transition every old suffix pointer and the root, increment each child once, and update the parent's preferred child when its count reaches or exceeds the current winner. Retain new suffix pointers through depth 31; depth-32 children supply successor counts for depth-31 contexts.\n3. Match by examining retained suffix pointers from length 16 downward, requiring an observed successor. Extend drafts through preferred children, preserving the existing matched-length, remaining-budget, and KV-capacity caps. Replace the scalar pipeline's one-token index-membership check with the equivalent productive-unigram-node check at the same point in control flow.\n4. Build fresh state from prompt tokens during prefill and update it only with committed outputs during decode. Preserve history, pending-token handling, rollback, and request isolation. Perform no additional target computation or training.\n5. Add differential checks against the existing tuple implementation using independent histories: overlapping repetitions, frequency ties, terminal suffixes, depth boundaries, all output budgets, and unequal KV capacities. Compare counts, drafts, drain decisions, and complete simulated decode schedules. Have the orchestrator run unchanged exact-token evaluation and both performance confirmations against the current best; retain only the required clear improvement.",
+    "reason": "This removes deterministic repeated work on every committed token without changing proposal quality or target arithmetic. The logical mechanism is supported by direct differential checks; its contribution to total decode latency remains a worthwhile benchmark question."
+  },
+  "review": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Incremental trie for exact suffix drafting",
+      "idea": "Replace tuple-keyed successor tables with a depth-limited trie and pointers to current suffixes. Preserve occurrence counts, recency ties, drafts, capacity limits, and pipeline decisions exactly.",
+      "cost_removed": "Each committed token after history reaches 31 tokens currently constructs 31 lists and 31 tuples, copying 992 token references. The initial dictionary lookups hash contexts containing 496 tokens in total; new-context insertion adds hashing. The trie replaces this with at most 32 edge traversals and count updates, plus node insertion on misses: expected O(L) rather than O(L\u00b2) indexing work. Matching and extension use pointers. Worst-case context storage becomes O(NL) nodes rather than O(NL\u00b2) tuple references. Target arithmetic and weight traffic remain unchanged.",
+      "source_evidence": "Verified RequestCache.append_token, match, _draft, and the pipeline predicate in [candidate/inference.py](candidate/inference.py:71). Commits update the index before subsequent submission. [harness/bench.py](harness/bench.py:20) includes those updates and final synchronization in decode timing. [SAM Decoding](https://arxiv.org/abs/2411.10666) provides precedent for dynamic suffix indexing, but does not establish this trie's equivalence or performance.",
+      "generalization": "This ordinary data-structure transformation can reduce host scheduling delays in retrieval-based speculative decoding across hardware and inference frameworks. Its benefit depends on indexing being a meaningful part of the decode critical path; it removes no model computation.",
+      "risk": "Node allocation, dictionaries, pointer chasing, and suffix-pointer maintenance may offset savings. Depth is bounded, but total storage still grows with request length, and actual memory savings require measurement. Terminal suffixes, incorrect update ordering, or missing depth-32 children could change drafts and scheduling.",
+      "history_relation": "Round 0008 established the frequency-and-recency policy and explicitly identified tuple construction and hashing as overhead. This experiment preserves that policy and every accepted verifier improvement. Prior drafting-policy failures do not resolve this representation change."
+    },
+    "plan": "1. Implement only inside candidate/. Keep MAX_CONTEXT=16, MAX_DRAFTS=16, INDEX_CONTEXT=31, public inference interfaces, target operations, verifier gates, counters, and scalar submission/read ordering unchanged. Replace the production tuple index rather than maintaining both representations.\n\n2. Use compact nodes containing an incoming token, occurrence count, children, and preferred-child pointer. A node's count is the number of complete occurrences of its root-to-node sequence in committed history, including overlaps. Consequently, a context's child counts equal the existing successor counts. Nodes may reach depth 32; retained current-suffix pointers stop at depth 31. No eviction or count approximation is permitted.\n\n3. Initialize the suffix-pointer array with the root at position zero. For each committed token, traverse a snapshot of the OLD root and suffix pointers. Create or find each token child and increment its count exactly once. Select that child as its parent's preferred child when no winner exists or its updated count is at least the incumbent's count. This preserves chronological recency ties without timestamps. Build new suffix pointers through depth 31, while still updating depth-32 children. Never extend newly updated suffix pointers during the same append. Append the token to history once.\n\n4. Match retained suffix pointers from length min(16, history length) downward, requiring preferred_child is not None. Node existence or positive occurrence count alone is insufficient. Return the node and matched length without reconstructing a tuple. Preserve all existing offset, buffer, and drained-history guards. With remaining budget R, common offset C, and minimum allocated key/value capacity Q, retain limit=min(16, matched_length, R-1, Q-C-1). Follow preferred children for at most that many tokens, stopping at an absent successor. Do not back off, mutate counts, or index proposals during extension. The final extension may consume a depth-32 node.\n\n5. Replace the scalar pipeline's unigram membership predicate with the current unigram node having an observed successor. Evaluate it at exactly the existing location: after committing the oldest of two pending outputs. Preserve subsequent draining and recomputation of drafting decisions. Use no additional tensor reads or synchronization. Only committed tokens update history and trie state; rejected proposals never enter either.\n\n6. Build fresh trie state from prompt IDs during the existing prefill. Append the supplied first generated token only at its existing decode commit. Keep every generated-token update and lookup inside decode. Preserve request isolation and normal cache lifetime; introduce no shared index, deferred rebuilding, or garbage-collection manipulation.\n\n7. Add differential checks against a test-only copy of the current tuple implementation and an independent occurrence/recency enumeration. Cover overlapping repetitions, frequency ties, token zero, terminal suffixes with productive shorter suffixes, depths 16/31/32, draft lengths 1\u201316, every acceptance length, short budgets, unequal capacities, invalid caches, scalar growth, and complete pipeline traces. Compare drafts, drain decisions, committed history, counts, winners, and cache offsets. Update candidate/checks.py's index-identity assertion to check independent trie roots, suffix arrays, and histories. Keep test oracles and instrumentation outside production decoding; confirm native output and retained-KV parity on independent inputs.\n\n8. Have the orchestrator run unchanged authoritative exact-token evaluation and both throughput confirmations against the current accepted implementation. Retain only exact output and at least 1.03x gain in both confirmations. Do not tune from benchmark prompts or results; unavailable native execution is not an experiment result.",
+    "reason": "No fundamental flaw was found. Independent in-memory checks passed 10,474 prefix checks, 411,714 draft/budget/capacity comparisons, and 4,712 complete decode simulations covering all draft and acceptance lengths. These used the current Python control flow with model/cache stand-ins and establish bookkeeping equivalence, not native numerical parity or throughput. Review clarifies terminal productivity, update ordering, depth-32 storage, and pipeline timing. No files were edited."
+  },
+  "implementation": {
+    "outcome": "implemented",
+    "summary": "Replaced the production tuple index with the incremental trie, preserving drafting and pipeline decisions. Added differential and native parity checks. Host-side checks and syntax validation passed. Native execution was unavailable because Metal could not initialize; authoritative evaluation and benchmarking remain with the orchestrator. Only candidate/ changed."
+  },
+  "eval": {
+    "correct": true,
+    "cases": [
+      {
+        "prompt": "Explain why the sky is blue.",
+        "correct": true
+      },
+      {
+        "prompt": "Write a short Python function that reverses a list.",
+        "correct": true
+      },
+      {
+        "prompt": "What are the main causes of inflation?",
+        "correct": true
+      },
+      {
+        "prompt": "Describe how photosynthesis works.",
+        "correct": true
+      },
+      {
+        "prompt": "Continue this story: The door opened and nobody was there.",
+        "correct": true
+      },
+      {
+        "prompt": "<benchmark>",
+        "correct": true
+      }
+    ]
+  },
+  "confirmations": [
+    {
+      "baseline_relative_decode_speed": 2.744738641967909,
+      "candidate_relative_decode_speed": 2.719532987667741,
+      "gain": 0.9908167379164028
+    },
+    {
+      "baseline_relative_decode_speed": 2.7324264831478615,
+      "candidate_relative_decode_speed": 2.730820775155137,
+      "gain": 0.9994123508893551
+    }
+  ],
+  "confirmed_gain": 0.9908167379164028,
+  "reason": "decode gain was not >= 1.03x twice"
+}

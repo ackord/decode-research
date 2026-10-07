@@ -1,0 +1,541 @@
+diff --git a/candidate/checks.py b/candidate/checks.py
+index 487774a..4927d02 100644
+--- a/candidate/checks.py
++++ b/candidate/checks.py
+@@ -704,6 +704,9 @@ def _decode_checks(model, base, pending):
+ 
+ def check_grouped(model):
+     """Fail at the first numerical discrepancy; never certify throughput."""
++    from .trie_checks import check_trie, check_native_trie
++    check_trie()
++    check_native_trie(model)
+     prompt = [1] + [41 + (i * 17) % 311 for i in range(23)]
+     pending, base = ci.prefill(model, prompt)
+     assert ci._grouped_supported(model, base), "Loaded model is outside the audited gate"
+@@ -739,6 +742,7 @@ def check_grouped(model):
+     assert second.stats["panel_head_blocks"] == second.stats["panel_view_sets"] == 0
+     assert second.stats["attention_blocks"] == second.stats["attention_calls"] == 0
+     assert second.stats["rotary_blocks"] == second.stats["grouped_rotary_calls"] == 0
+-    assert second.index is not base.index and second.history is not base.history
++    assert second.root is not base.root
++    assert second.suffixes is not base.suffixes and second.history is not base.history
+     _prefixes(base, second, "independent request")
+     print("Native panel heads, causal attention, grouped rotary/projections, logits, KV and transitions passed.")
+diff --git a/candidate/inference.py b/candidate/inference.py
+index 0d57b7c..2f844d0 100644
+--- a/candidate/inference.py
++++ b/candidate/inference.py
+@@ -12,20 +12,16 @@ HEAD_PANEL_ROWS = 4096
+ _HEAD_RUNTIME = version("mlx") == "0.32.3"
+ 
+ 
+-class _Successors:
+-    """Exact occurrence counts with the most recent winner on frequency ties."""
++class _TrieNode:
++    """Complete occurrences; child counts are exact successor frequencies."""
+ 
+-    __slots__ = ("counts", "preferred")
++    __slots__ = ("token", "count", "children", "preferred_child")
+ 
+-    def __init__(self, token):
+-        self.counts = {token: 1}
+-        self.preferred = token
+-
+-    def observe(self, token):
+-        count = self.counts.get(token, 0) + 1
+-        self.counts[token] = count
+-        if count >= self.counts[self.preferred]:
+-            self.preferred = token
++    def __init__(self, token=None):
++        self.token = token
++        self.count = 0
++        self.children = {}
++        self.preferred_child = None
+ 
+ 
+ class RequestCache(list):
+@@ -34,7 +30,8 @@ class RequestCache(list):
+     def __init__(self, caches, token_ids):
+         super().__init__(caches)
+         self.history = []
+-        self.index = {}
++        self.root = _TrieNode()
++        self.suffixes = [self.root]
+         self.batch_rows_eligible = None
+         self.grouped_eligible = None
+         self.rotary_eligible = None
+@@ -69,21 +66,28 @@ class RequestCache(list):
+             self.append_token(int(token))
+ 
+     def append_token(self, token):
+-        j = len(self.history)
+-        for n in range(1, min(INDEX_CONTEXT, j) + 1):
+-            context = tuple(self.history[j - n : j])
+-            successors = self.index.get(context)
+-            if successors is None:
+-                self.index[context] = _Successors(token)
+-            else:
+-                successors.observe(token)
++        # Only OLD suffixes are extended. The longest one updates depth 32,
++        # but is not retained for the next append.
++        suffixes = [self.root]
++        for depth, parent in enumerate(self.suffixes):
++            child = parent.children.get(token)
++            if child is None:
++                child = _TrieNode(token)
++                parent.children[token] = child
++            child.count += 1
++            winner = parent.preferred_child
++            if winner is None or child.count >= winner.count:
++                parent.preferred_child = child
++            if depth < INDEX_CONTEXT:
++                suffixes.append(child)
++        self.suffixes = suffixes
+         self.history.append(token)
+ 
+     def match(self):
+         for n in range(min(MAX_CONTEXT, len(self.history)), 0, -1):
+-            context = tuple(self.history[-n:])
+-            if context in self.index:
+-                return context
++            node = self.suffixes[n]
++            if node.preferred_child is not None:
++                return node, n
+         return None
+ 
+ 
+@@ -119,26 +123,26 @@ def _supported(model, cache):
+ 
+ 
+ def _draft(cache, remaining):
+-    context = cache.match()
+-    if context is None or remaining < 2:
++    matched = cache.match()
++    if matched is None or remaining < 2:
+         return []
++    context, matched_length = matched
+     c = cache[0].offset
+     if any(kv.offset != c or kv.keys is None or kv.values is None for kv in cache):
+         return []
+     if c != len(cache.history) - 1:
+         raise RuntimeError("Speculation requires drained scalar outputs")
+     capacity = min(min(kv.keys.shape[2], kv.values.shape[2]) for kv in cache)
+-    limit = min(MAX_DRAFTS, len(context), remaining - 1, capacity - c - 1)
++    limit = min(MAX_DRAFTS, matched_length, remaining - 1, capacity - c - 1)
+     drafts = []
+     # Extend the entire observed context, without mutating the index or backing
+     # off to a shorter suffix. Every extension occurred in committed history.
+     for _ in range(max(0, limit)):
+-        successors = cache.index.get(context)
+-        if successors is None:
++        child = context.preferred_child
++        if child is None:
+             break
+-        token = successors.preferred
+-        drafts.append(token)
+-        context += (token,)
++        drafts.append(child.token)
++        context = child
+     return drafts
+ 
+ 
+@@ -627,7 +631,7 @@ def _decode(model, first_token, cache, max_new_tokens):
+         # Preserve round 0004's submit-successor-before-host-read pipeline.
+         if len(pending) == 2:
+             commit(pending.pop(0).item())
+-            if supported and (state.history[-1],) in state.index:
++            if supported and state.suffixes[1].preferred_child is not None:
+                 for unread in pending:
+                     commit(unread.item())
+                 pending.clear()
+diff --git a/candidate/trie_checks.py b/candidate/trie_checks.py
+new file mode 100644
+index 0000000..461ecc0
+--- /dev/null
++++ b/candidate/trie_checks.py
+@@ -0,0 +1,385 @@
++"""Test-only tuple oracle and differential checks on independent inputs."""
++from collections import Counter
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from . import inference as ci
++
++MAX_CONTEXT = ci.MAX_CONTEXT
++MAX_DRAFTS = ci.MAX_DRAFTS
++INDEX_CONTEXT = ci.INDEX_CONTEXT
++mx = ci.mx
++
++class _Successors:
++    """Exact occurrence counts with the most recent winner on frequency ties."""
++
++    __slots__ = ("counts", "preferred")
++
++    def __init__(self, token):
++        self.counts = {token: 1}
++        self.preferred = token
++
++    def observe(self, token):
++        count = self.counts.get(token, 0) + 1
++        self.counts[token] = count
++        if count >= self.counts[self.preferred]:
++            self.preferred = token
++
++
++class TupleCache(ci.RequestCache):
++    """Ordinary caches plus request-local successor counts and decode counters."""
++
++    def __init__(self, caches, token_ids):
++        super().__init__(caches, [])
++        self.index = {}
++        for token in token_ids:
++            self.append_token(int(token))
++
++    def append_token(self, token):
++        j = len(self.history)
++        for n in range(1, min(INDEX_CONTEXT, j) + 1):
++            context = tuple(self.history[j - n : j])
++            successors = self.index.get(context)
++            if successors is None:
++                self.index[context] = _Successors(token)
++            else:
++                successors.observe(token)
++        self.history.append(token)
++
++    def match(self):
++        for n in range(min(MAX_CONTEXT, len(self.history)), 0, -1):
++            context = tuple(self.history[-n:])
++            if context in self.index:
++                return context
++        return None
++
++
++
++def tuple_draft(cache, remaining):
++    context = cache.match()
++    if context is None or remaining < 2:
++        return []
++    c = cache[0].offset
++    if any(kv.offset != c or kv.keys is None or kv.values is None for kv in cache):
++        return []
++    if c != len(cache.history) - 1:
++        raise RuntimeError("Speculation requires drained scalar outputs")
++    capacity = min(min(kv.keys.shape[2], kv.values.shape[2]) for kv in cache)
++    limit = min(MAX_DRAFTS, len(context), remaining - 1, capacity - c - 1)
++    drafts = []
++    # Extend the entire observed context, without mutating the index or backing
++    # off to a shorter suffix. Every extension occurred in committed history.
++    for _ in range(max(0, limit)):
++        successors = cache.index.get(context)
++        if successors is None:
++            break
++        token = successors.preferred
++        drafts.append(token)
++        context += (token,)
++    return drafts
++
++
++
++def tuple_decode(model, first_token, cache, max_new_tokens):
++    if max_new_tokens < 1:
++        return []
++
++    state = cache if isinstance(cache, TupleCache) else None
++    supported = state is not None and ci._supported(model, cache)
++    if state is not None and state.batch_rows_eligible is None:
++        state.batch_rows_eligible = ci._batch_supported(model, cache)
++    token = first_token
++    output = []
++    pending = []
++
++    def commit(value):
++        output.append(value)
++        if state is not None:
++            state.append_token(value)
++
++    commit(token.item())
++    while len(output) + len(pending) < max_new_tokens:
++        # While outputs are unread, token and KV are ahead of host history.
++        # Recompute speculative lookup and capacity decisions after draining.
++        if supported and not pending:
++            drafts = tuple_draft(state, max_new_tokens - len(output))
++            if drafts:
++                inputs = [token.reshape(1, 1)] + [
++                    mx.array([[d]], dtype=token.dtype) for d in drafts
++                ]
++                predictions = ci._verify(model, cache, inputs)
++                mx.async_eval(*predictions)
++                ids = mx.stack(predictions).tolist()
++                accepted = 0
++                while accepted < len(drafts) and drafts[accepted] == ids[accepted][0]:
++                    accepted += 1
++                for value in drafts[:accepted]:
++                    commit(value)
++                commit(ids[accepted][0])
++                token = predictions[accepted]
++                rejected = len(drafts) - accepted
++                for kv in cache:
++                    kv.trim(rejected)
++                del inputs, predictions, ids
++                stats = state.stats
++                stats["verifications"] += 1
++                stats["draft_lengths"][len(drafts)] += 1
++                stats["accepted_lengths"][accepted] += 1
++                stats["rejected_positions"] += rejected
++                continue
++
++        logits = model(token.reshape(1, 1), cache=cache)
++        token = mx.argmax(logits[:, -1, :], axis=-1)
++        mx.async_eval(token)
++        pending.append(token)
++        if state is not None:
++            state.stats["scalar_steps"] += 1
++        # Preserve round 0004's submit-successor-before-host-read pipeline.
++        if len(pending) == 2:
++            commit(pending.pop(0).item())
++            if supported and (state.history[-1],) in state.index:
++                for unread in pending:
++                    commit(unread.item())
++                pending.clear()
++
++    for unread in pending:
++        commit(unread.item())
++    return output
++
++
++
++def _nodes(cache):
++    result = {}
++
++    def visit(node, sequence):
++        for token, child in node.children.items():
++            key = sequence + (token,)
++            result[key] = child
++            visit(child, key)
++
++    visit(cache.root, ())
++    return result
++
++
++def _check_state(cache, oracle):
++    assert cache.history == oracle.history
++    history = cache.history
++    # Enumerate complete occurrences independently, including overlaps.
++    counts, latest = Counter(), {}
++    for start in range(len(history)):
++        for end in range(start + 1, min(len(history), start + 32) + 1):
++            key = tuple(history[start:end])
++            counts[key] += 1
++            latest[key] = end
++    nodes = _nodes(cache)
++    assert nodes.keys() == counts.keys()
++    for key, node in nodes.items():
++        assert node.count == counts[key], key
++        assert node.token == key[-1]
++        children = {token: counts[key + (token,)] for token in node.children}
++        winner = max(children, key=lambda t: (children[t], latest[key + (t,)])) if children else None
++        assert (node.preferred_child.token if node.preferred_child else None) == winner, key
++        successors = oracle.index.get(key)
++        if children:
++            assert successors is not None
++            assert children == successors.counts and winner == successors.preferred
++        else:
++            assert successors is None
++    assert cache.root.count == 0
++    assert {t: n.count for t, n in cache.root.children.items()} == dict(Counter(history))
++    if history:
++        winner = max(set(history), key=lambda t: (history.count(t), max(i for i, v in enumerate(history) if v == t)))
++        assert cache.root.preferred_child.token == winner
++    else:
++        assert cache.root.preferred_child is None
++    assert len(cache.suffixes) == min(INDEX_CONTEXT, len(history)) + 1
++    assert cache.suffixes[0] is cache.root
++    for n, node in enumerate(cache.suffixes[1:], 1):
++        assert node is nodes[tuple(history[-n:])]
++    matched, old = cache.match(), oracle.match()
++    if old is None:
++        assert matched is None
++    else:
++        assert matched == (nodes[old], len(old))
++    if history:
++        assert (cache.suffixes[1].preferred_child is not None) == ((history[-1],) in oracle.index)
++
++
++class _KV:
++    def __init__(self, offset, keys, values):
++        self.offset = offset
++        self.keys = SimpleNamespace(shape=(1, 1, keys, 1))
++        self.values = SimpleNamespace(shape=(1, 1, values, 1))
++        self.events = None
++
++    def trim(self, count):
++        if self.events is not None:
++            self.events.append(("trim", self.offset, count))
++        self.offset -= count
++
++
++def _draft_result(fn, cache, remaining):
++    try:
++        return fn(cache, remaining)
++    except RuntimeError as error:
++        return str(error)
++
++
++def check_trie():
++    """Host-only equivalence, including complete scalar/speculative traces."""
++    import random
++    rng = random.Random(2718)
++    streams = [[], [0] * 70, [0, 1] * 40, [1, 2, 3, 1, 2, 4, 1, 2],
++               list(range(40)) * 2 + list(range(16)),
++               [0, 1, 2, 0, 1],  # terminal longest suffix; shorter is productive
++               [rng.randrange(4) for _ in range(100)],
++               [rng.randrange(40) for _ in range(100)]]
++    for stream in streams:
++        cache, oracle = ci.RequestCache([], []), TupleCache([], [])
++        _check_state(cache, oracle)
++        for token in stream:
++            cache.append_token(token)
++            oracle.append_token(token)
++            _check_state(cache, oracle)
++            c = len(cache.history) - 1
++            for remaining in (0, 1, 2, 3, 8, 17, 40):
++                for spare in (0, 1, 2, 8, 17):
++                    cache[:] = [_KV(c, c + 30, c + spare), _KV(c, c + spare + 1, c + 25)]
++                    oracle[:] = cache[:]
++                    assert _draft_result(ci._draft, cache, remaining) == _draft_result(tuple_draft, oracle, remaining)
++        if stream:
++            for mutate in (lambda kv: setattr(kv, "offset", kv.offset + 1),
++                           lambda kv: setattr(kv, "keys", None),
++                           lambda kv: setattr(kv, "values", None)):
++                c = len(stream) - 1
++                cache[:] = [_KV(c, c + 40, c + 40), _KV(c, c + 40, c + 40)]
++                mutate(cache[-1])
++                oracle[:] = cache[:]
++                assert ci._draft(cache, 17) == tuple_draft(oracle, 17) == []
++            cache[:] = [_KV(len(stream), len(stream) + 40, len(stream) + 40)]
++            oracle[:] = cache[:]
++            assert _draft_result(ci._draft, cache, 17) == _draft_result(tuple_draft, oracle, 17)
++    # Force every draft length through depth 32 and every acceptance position.
++    for length in range(1, 17):
++        for accepted in range(length + 1):
++            cache = _pipeline_check([0] * 40,
++                                    [0] * (accepted + 1) + [1, 2, 3] * 20,
++                                    24, length + 1)
++            assert cache.stats["draft_lengths"][length] >= 1
++            assert cache.stats["accepted_lengths"][accepted] >= 1
++    for prompt, outputs in (([0, 1] * 20, [0, 1] * 40),
++                            (list(range(40)), list(range(40, 100))),
++                            ([0, 1, 2, 0, 1], [2, 0, 1, 3] * 20)):
++        for budget in (0, 1, 2, 3, 5, 17, 48):
++            for spare in (0, 1, 8, 17):
++                _pipeline_check(prompt, outputs, budget, spare)
++    print("Trie counts, recency, suffixes, drafts and pipeline traces passed.")
++
++
++class _Tensor:
++    """Only host scheduling operations; no target arithmetic is simulated."""
++    dtype = "int"
++
++    def __init__(self, value, events):
++        self.value, self.events = value, events
++
++    def item(self):
++        self.events.append(("read", self.value))
++        return self.value
++
++    def reshape(self, *shape):
++        return self
++
++    def __getitem__(self, key):
++        return self
++
++
++def _pipeline_check(prompt, outputs, budget, spare):
++    def run(tuple_mode):
++        events = []
++        base = TupleCache if tuple_mode else ci.RequestCache
++
++        class TracedCache(base):
++            def append_token(self, value):
++                super().append_token(value)
++                events.append(("commit", value, tuple(self.history)))
++
++        c = len(prompt)
++        cache = TracedCache([_KV(c, c + spare, c + spare + 2)], prompt)
++        cache[0].events = events
++        events.clear()
++
++        def model(token, *, cache):
++            kv = cache[0]
++            events.append(("submit", token.value, kv.offset))
++            value = outputs[kv.offset - c + 1]
++            kv.offset += 1
++            if kv.offset > min(kv.keys.shape[2], kv.values.shape[2]):
++                events.append(("grow", kv.offset))
++                kv.keys.shape = kv.values.shape = (1, 1, kv.offset + 8, 1)
++            return _Tensor(value, events)
++
++        def verify(model, cache, tokens):
++            events.append(("verify", tuple(t.value for t in tokens)))
++            return [model(t, cache=cache) for t in tokens]
++
++        draft_fn = tuple_draft if tuple_mode else ci._draft
++
++        def draft(state, remaining):
++            result = draft_fn(state, remaining)
++            events.append(("draft", remaining, tuple(result)))
++            return result
++
++        class Stack:
++            def __init__(self, tensors):
++                self.tensors = tensors
++
++            def tolist(self):
++                events.append(("stack_read", tuple(t.value for t in self.tensors)))
++                return [[t.value] for t in self.tensors]
++
++        fake_mx = SimpleNamespace(
++            array=lambda values, **kw: _Tensor(values[0][0], events),
++            argmax=lambda logits, **kw: logits,
++            async_eval=lambda *ts: events.append(("async", tuple(t.value for t in ts))),
++            stack=Stack)
++        # Both decoders use identical test doubles; tuple_decode is the frozen
++        # previous pipeline, so read/submission/drain ordering is independent.
++        with patch.object(ci, "mx", fake_mx), patch.dict(globals(), mx=fake_mx), \
++             patch.object(ci, "_supported", return_value=True), \
++             patch.object(ci, "_batch_supported", return_value=False), \
++             patch.object(ci, "_verify", verify), \
++             patch.object(ci, "_draft", draft):
++            if tuple_mode:
++                with patch.dict(globals(), tuple_draft=draft):
++                    result = tuple_decode(model, _Tensor(outputs[0], events), cache, budget)
++            else:
++                result = ci.decode(model, _Tensor(outputs[0], events), cache, budget)
++        return result, events, cache
++
++    a, ae, ac = run(False)
++    b, be, bc = run(True)
++    assert a == b == outputs[:budget]
++    assert ae == be, (prompt, budget, spare, ae, be)
++    assert ac.stats == bc.stats
++    assert [kv.offset for kv in ac] == [kv.offset for kv in bc]
++    _check_state(ac, bc)
++    return ac
++
++
++def check_native_trie(model):
++    """Native output and retained-KV parity against the previous decoder."""
++    from .checks import _clone, _prefixes
++    for prompt in ([0] * 48, [1, 7, 0, 7] * 12,
++                   [1] + [17 + (i * 19) % 131 for i in range(47)]):
++        pending, base = ci.prefill(model, prompt)
++        for budget in (1, 2, 5, 24):
++            candidate = _clone(model, base)
++            old_kv = _clone(model, base)
++            oracle = TupleCache(old_kv, prompt)
++            result = ci.decode(model, pending, candidate, budget)
++            old_result = tuple_decode(model, pending, oracle, budget)
++            assert result == old_result
++            assert candidate.stats == oracle.stats
++            _check_state(candidate, oracle)
++            _prefixes(candidate, oracle, "trie/tuple native parity")
