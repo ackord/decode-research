@@ -1,0 +1,424 @@
+diff --git a/candidate/checks.py b/candidate/checks.py
+index 487774a..a4f8601 100644
+--- a/candidate/checks.py
++++ b/candidate/checks.py
+@@ -6,7 +6,7 @@ import mlx.core as mx
+ import mlx.nn as nn
+ import numpy as np
+ from mlx_lm.models import llama
+-from mlx_lm.models.cache import make_prompt_cache
++from mlx_lm.models.cache import KVCache, make_prompt_cache
+ 
+ from . import inference as ci
+ 
+@@ -601,7 +601,7 @@ def _decode_checks(model, base, pending):
+             assert remaining >= 17
+             return drafts
+ 
+-        with patch.object(ci, "_draft", draft):
++        with patch.object(ci, "_draft", draft), patch.object(ci, "_retrieve", return_value=[]):
+             output = ci.decode(model, pending, cache, 24)
+         assert output == oracle
+         assert cache.stats["accepted_lengths"][accepted] == 1
+@@ -628,7 +628,7 @@ def _decode_checks(model, base, pending):
+         blocks.append(index)
+         return oracle[index:index + 2]
+ 
+-    with patch.object(ci, "_draft", consecutive_draft):
++    with patch.object(ci, "_draft", consecutive_draft), patch.object(ci, "_retrieve", return_value=[]):
+         assert ci.decode(model, pending, cache, 24) == oracle
+     assert blocks == [1, 4]
+     assert cache.stats["attention_blocks"] == 2
+@@ -672,7 +672,7 @@ def _decode_checks(model, base, pending):
+             drafted.append(remaining)
+             return oracle[1:remaining]
+ 
+-        with patch.object(ci, "_draft", bounded_draft):
++        with patch.object(ci, "_draft", bounded_draft), patch.object(ci, "_retrieve", return_value=[]):
+             output = ci.decode(model, pending, cache, limit)
+         assert output == oracle[:limit]
+         assert all(kv.offset == base[0].offset + limit - 1 for kv in cache)
+@@ -702,6 +702,235 @@ def _decode_checks(model, base, pending):
+         _prefixes(g, r, "fallback")
+ 
+ 
++def _retrieval_selection_checks():
++    """Synthetic features isolate indexing, validity and eligibility gates."""
++    def fixture(c=12, anchors=(3, 8, 10), capacity=None):
++        history = list(range(100, 101 + c))
++        history[c] = 7
++        for j in anchors:
++            history[j] = 7
++        kv = KVCache()
++        kv.offset = c
++        size = c + 5 if capacity is None else capacity
++        kv.keys = mx.zeros((1, 3, size, 64), dtype=mx.bfloat16)
++        kv.values = mx.full((1, 3, size, 64), float("nan"), dtype=mx.bfloat16)
++        cache = ci.RequestCache([kv], history)
++        cache.batch_rows_eligible = cache.grouped_eligible = True
++        return cache
++
++    def feature(cache, i, values):
++        cache[-1].values[0, :, i, :] = mx.array(values, dtype=mx.bfloat16).reshape(3, 64)
++
++    def select(cache, anchor, remaining=9):
++        actual = ci._retrieve(None, cache, remaining)
++        c = cache[0].offset
++        d = min(4, remaining - 1,
++                min(min(k.keys.shape[2], k.values.shape[2]) for k in cache) - c - 1)
++        expected = [] if anchor is None else cache.history[anchor + 1:anchor + 1 + min(d, c - anchor)]
++        assert actual == expected, (actual, expected)
++
++    # Head order is observable: each head has a different nonzero coordinate.
++    query = [0.0] * 192
++    for i, v in ((0, 1), (65, 2), (130, 3)):
++        query[i] = v
++    cache = fixture()
++    feature(cache, 11, query)
++    feature(cache, 2, query)
++    feature(cache, 7, query[64:] + query[:64])
++    feature(cache, 9, [-v for v in query])
++    select(cache, 3)
++    assert cache.stats["retrieval_attempts"] == 1
++    # Identical scores choose the most recent eligible anchor, with exactly
++    # two observed successors (including the committed pending token).
++    feature(cache, 9, query)
++    select(cache, 10)
++    feature(cache, 2, [-v for v in query])
++    feature(cache, 7, [-v for v in query])
++    feature(cache, 9, [-v for v in query])
++    select(cache, 10)  # Negative scores must remain eligible.
++    for bad in (0.0, float("nan"), float("inf"), 1e30):
++        for i in (2, 7, 9):
++            feature(cache, i, [bad] * 192)
++        select(cache, None)
++        feature(cache, 9, query)
++        select(cache, 10)  # Invalid rows cannot mask a valid comparison.
++        feature(cache, 11, [bad] * 192)
++        select(cache, None)
++        feature(cache, 11, query)
++
++    # Both inclusive window endpoints; j=0 and j=C-1 are excluded. The
++    # allocated tail and unused predecessor rows remain poisoned throughout.
++    cache = fixture(4100, (0, 3, 4, 4098, 4099))
++    feature(cache, 4099, query)
++    feature(cache, 3, query)
++    feature(cache, 4097, [-v for v in query])
++    select(cache, 4)
++    feature(cache, 3, [-v for v in query])
++    feature(cache, 4097, query)
++    select(cache, 4098)
++    cache = fixture(3, (1,))
++    feature(cache, 2, query)
++    feature(cache, 0, query)
++    select(cache, 1)
++    cache = fixture(2, (0, 1))
++    select(cache, None)
++    assert cache.stats["retrieval_attempts"] == 0
++    cache = fixture(12, ())
++    select(cache, None)
++    assert cache.stats["retrieval_attempts"] == 0
++
++    cache = fixture()
++    feature(cache, 11, query)
++    feature(cache, 9, query)
++    for remaining in (0, 1, 2):
++        select(cache, None, remaining)
++    for remaining in (3, 4, 5):
++        select(cache, 10, remaining)
++    # Unequal capacities must use the smaller buffer, including in layers
++    # other than the last, and preserve a one-token ordinary fallback.
++    cache[0].keys = cache[0].keys[..., :15, :]
++    select(cache, 10)
++    cache[0].values = cache[0].values[..., :14, :]
++    select(cache, None)
++    cache = fixture()
++    for flag in ("batch_rows_eligible", "grouped_eligible"):
++        with patch.object(cache, flag, False):
++            select(cache, None)
++    for name, array in (("keys", cache[0].keys.astype(mx.float32)),
++                        ("values", cache[0].values[:, :2]),
++                        ("values", cache[0].values[..., :32])):
++        with patch.object(cache[0], name, array):
++            select(cache, None)
++    cache.history.pop()
++    select(cache, None)
++
++
++def _retrieval_native_checks(model):
++    """Real feature retrieval, native logits/KV, rollback and decode transitions."""
++    for k in (2, 3, 4):
++        prompt = [1] + [100 + i for i in range(23)]
++        prompt[len(prompt) - k] = 41  # Only eligible matching anchor.
++        _, base = ci.prefill(model, prompt)
++        pending = mx.array([41])
++        drained = _clone(model, base, (len(prompt) + 7, len(prompt) + 5))
++        drained.append_token(41)
++        drafts = ci._retrieve(model, drained, 16)
++        assert drafts == drained.history[len(prompt) - k + 1:]
++        assert len(drafts) == k and drained.stats["retrieval_attempts"] == 1
++        tokens = [pending.reshape(1, 1)] + [mx.array([[d]]) for d in drafts]
++        g, r = _clone(model, drained), _clone(model, base)
++        trace = []
++        predictions = ci._verify(model, g, tokens, _trace=trace)
++        reference_logits = [model(t, cache=r) for t in tokens]
++        mx.eval(*predictions, *reference_logits)
++        for i, (a, b) in enumerate(zip(dict(trace)["logits"], reference_logits)):
++            _equal(a, b, f"retrieved logits/k{k}/row{i}")
++        _prefixes(g, r, f"retrieved verifier/k{k}")
++        for accepted in range(k + 1):
++            gc, rc = _clone(model, g, len(prompt) + k + 1), _clone(model, r, len(prompt) + k + 1)
++            for kv in [*gc, *rc]:
++                kv.trim(k - accepted)
++            token = predictions[accepted].reshape(1, 1)
++            for step in range(k + 2):
++                gl, rl = model(token, cache=gc), model(token, cache=rc)
++                _equal(gl, rl, f"retrieved rollback/k{k}/a{accepted}/step{step}")
++                token = mx.argmax(rl[:, -1, :], axis=-1).reshape(1, 1)
++            _prefixes(gc, rc, f"retrieved rollback growth/k{k}/a{accepted}")
++
++        oracle_cache = _clone(model, base)
++        token, oracle = pending, [41]
++        for _ in range(15):
++            logits = model(token.reshape(1, 1), cache=oracle_cache)
++            token = mx.argmax(logits[:, -1, :], axis=-1)
++            oracle.append(token.item())
++        active = _clone(model, base, len(prompt) + k + 1)
++        # Suppress only suffix drafting; the actual retrieval path is active.
++        with patch.object(ci, "_draft", return_value=[]):
++            assert ci.decode(model, pending, active, 16) == oracle
++        assert active.stats["retrieved_blocks"] >= 1
++        assert active.stats["retrieved_tokens"] >= k
++        assert active.stats["accepted_retrieved_tokens"] <= active.stats["retrieved_tokens"]
++        _prefixes(active, oracle_cache, f"active retrieval decode/k{k}")
++        # Ordinary multi-token drafts bypass retrieval entirely.
++        preserved = _clone(model, base)
++        with patch.object(ci, "_draft", return_value=oracle[1:3]), \
++             patch.object(ci, "_retrieve", side_effect=AssertionError("ordinary draft replaced")):
++            assert ci.decode(model, pending, preserved, 4) == oracle[:4]
++        assert preserved.stats["retrieval_attempts"] == 0
++
++
++def _retrieval_transition_checks():
++    """Controlled predictions exercise every acceptance length through decode.
++
++    Retrieval is real; only target forwards are replaced by a position oracle.
++    Native target math is checked separately by _retrieval_native_checks.
++    """
++    def run(prompt, oracle, expected_blocks, expected_accepted, ordinary=()):
++        class Target:
++            def __call__(self, token, cache):
++                position = cache[0].offset
++                # Cache content depends on the input as well as position, so
++                # rejected speculative inputs must be overwritten correctly.
++                value = token.reshape(1, 1, 1, 1).astype(mx.bfloat16)
++                features = mx.broadcast_to(value + position, (1, 3, 1, 64))
++                for kv in cache:
++                    kv.update_and_fetch(features, features)
++                logits = mx.full((1, 1, 2048), -1.0)
++                logits[0, 0, oracle[position - len(prompt) + 1]] = 1.0
++                return logits
++
++        def fresh():
++            kv = KVCache()
++            kv.offset = len(prompt)
++            capacity = len(prompt) + (10 if expected_blocks == 2 else 5)
++            kv.keys = mx.full((1, 3, capacity, 64), float("nan"), dtype=mx.bfloat16)
++            kv.values = mx.asarray(kv.keys, copy=True)
++            for i, token in enumerate(prompt):
++                kv.keys[..., i, :] = token + i
++                kv.values[..., i, :] = token + i
++            state = ci.RequestCache([kv], prompt)
++            state.batch_rows_eligible = state.grouped_eligible = True
++            return state
++
++        target, active, reference = Target(), fresh(), fresh()
++        first = mx.array([oracle[0]])
++        token = first
++        for expected in oracle[1:]:
++            logits = target(token, cache=reference)
++            token = mx.argmax(logits[:, -1, :], axis=-1)
++            assert token.item() == expected
++
++        def verify(model, cache, tokens):
++            return [mx.argmax(model(t, cache=cache)[:, -1, :], axis=-1) for t in tokens]
++
++        with patch.object(ci, "_supported", return_value=True), \
++             patch.object(ci, "_draft", return_value=list(ordinary)), \
++             patch.object(ci, "_verify", verify):
++            assert ci.decode(target, first, active, len(oracle)) == oracle
++        assert active.stats["retrieved_blocks"] == expected_blocks
++        assert active.stats["accepted_retrieved_tokens"] == expected_accepted, active.stats
++        _prefixes(active, reference, "controlled retrieval transitions")
++        assert all(kv.offset == len(prompt) + len(oracle) - 1 for kv in active)
++        assert active.head_panels is None
++        assert fresh().stats["retrieval_attempts"] == 0
++
++    for k in (2, 3, 4):
++        prompt = [100 + i for i in range(24)]
++        prompt[24 - k] = 41
++        observed = prompt[25 - k:] + [41]
++        for accepted in range(k + 1):
++            oracle = [41] + observed[:accepted] + [900] + list(range(1000, 1012))
++            run(prompt, oracle, 1, accepted)
++        # A failed retrieval must leave the ordinary one-token draft intact.
++        oracle = [700, 701, 702]
++        run(prompt, oracle, 0, 0, ordinary=[701])
++
++    prompt = [100 + i for i in range(24)]
++    prompt[3:8] = [41, 42, 43, 44, 45]
++    prompt[12:17] = [46, 47, 48, 49, 50]
++    run(prompt, list(range(41, 52)) + list(range(1000, 1012)), 2, 8)
++
++
+ def check_grouped(model):
+     """Fail at the first numerical discrepancy; never certify throughput."""
+     prompt = [1] + [41 + (i * 17) % 311 for i in range(23)]
+@@ -723,6 +952,9 @@ def check_grouped(model):
+     _head_gate_checks(model, base, pending)
+     _verification_checks(model, base, pending)
+     _decode_checks(model, base, pending)
++    _retrieval_selection_checks()
++    _retrieval_transition_checks()
++    _retrieval_native_checks(model)
+     # Real model prefixes exercise short vector boundaries and unchanged
+     # long-context attention, independent of benchmark prompts/results.
+     for length in (31, 32, 1015, 1021, 1022, 1023, 1024, 1057):
+@@ -739,6 +971,8 @@ def check_grouped(model):
+     assert second.stats["panel_head_blocks"] == second.stats["panel_view_sets"] == 0
+     assert second.stats["attention_blocks"] == second.stats["attention_calls"] == 0
+     assert second.stats["rotary_blocks"] == second.stats["grouped_rotary_calls"] == 0
++    assert all(second.stats[name] == 0 for name in
++               ("retrieval_attempts", "retrieved_blocks", "retrieved_tokens", "accepted_retrieved_tokens"))
+     assert second.index is not base.index and second.history is not base.history
+     _prefixes(base, second, "independent request")
+     print("Native panel heads, causal attention, grouped rotary/projections, logits, KV and transitions passed.")
+diff --git a/candidate/inference.py b/candidate/inference.py
+index 0d57b7c..e7e32f8 100644
+--- a/candidate/inference.py
++++ b/candidate/inference.py
+@@ -64,6 +64,10 @@ class RequestCache(list):
+             "draft_lengths": [0] * (MAX_DRAFTS + 1),
+             "accepted_lengths": [0] * (MAX_DRAFTS + 1),
+             "rejected_positions": 0,
++            "retrieval_attempts": 0,
++            "retrieved_blocks": 0,
++            "retrieved_tokens": 0,
++            "accepted_retrieved_tokens": 0,
+         }
+         for token in token_ids:
+             self.append_token(int(token))
+@@ -324,20 +328,12 @@ def _bulk_start(cache, count):
+     return start
+ 
+ 
+-def _verify(model, cache, tokens, *, _trace=None):
+-    """Teacher-forced forwards with grouped projections, rotary and short attention.
+-
+-    tokens contains pending followed by drafts, each with native shape (1, 1).
+-    Each attention reads its own native causal prefix. Eligible blocks append
+-    all singleton K/V results before the read-only attention phase; shorter
+-    blocks retain dependencies protecting reads from subsequent cache writes.
+-    """
+-    start = _bulk_start(cache, len(tokens))
++def _block_eligibility(model, cache, start, count, singleton_tokens=True):
++    """Shared metadata gates for retrieval and the unchanged grouped verifier."""
+     if isinstance(cache, RequestCache) and cache.batch_rows_eligible is None:
+         cache.batch_rows_eligible = _batch_supported(model, cache)
+-    batched = (start is not None and len(tokens) <= MAX_DRAFTS + 1
+-               and cache.batch_rows_eligible
+-               and all(t.shape == (1, 1) for t in tokens)
++    batched = (start is not None and count <= MAX_DRAFTS + 1
++               and cache.batch_rows_eligible and singleton_tokens
+                and all(kv.keys.dtype == mx.bfloat16
+                        and kv.values.dtype == mx.bfloat16 for kv in cache))
+     if isinstance(cache, RequestCache) and cache.grouped_eligible is None:
+@@ -348,6 +344,65 @@ def _verify(model, cache, tokens, *, _trace=None):
+                        and kv.keys.ndim == kv.values.ndim == 4
+                        and kv.keys.shape[3] == kv.values.shape[3] == 64
+                        for kv in cache))
++    return batched, grouped
++
++
++def _retrieve(model, cache, remaining):
++    """Select observed successors using only committed predecessor values."""
++    if not cache or remaining < 3:
++        return []
++    c = cache[0].offset
++    if (len(cache.history) != c + 1
++            or any(kv.offset != c or kv.keys is None or kv.values is None
++                   or kv.keys.ndim != 4 or kv.values.ndim != 4 for kv in cache)):
++        return []
++    capacity = min(min(kv.keys.shape[2], kv.values.shape[2]) for kv in cache)
++    d = min(4, remaining - 1, capacity - c - 1)
++    if d < 2 or _bulk_start(cache, d + 1) != c:
++        return []
++    if not _block_eligibility(model, cache, c, d + 1)[1]:
++        return []
++    history = cache.history
++    # Descending anchors make argmax's first-index tie rule prefer recency.
++    anchors = [j for j in range(c - 2, max(1, c - 4096) - 1, -1)
++               if history[j] == history[c]]
++    if not anchors:
++        return []
++    cache.stats["retrieval_attempts"] += 1
++    indices = mx.array(anchors, dtype=mx.int32)
++    values = cache[-1].values
++    # Gather in head-major storage, then transpose to token/head/dimension.
++    rows = mx.take(values[0], indices - 1, axis=1).transpose(1, 0, 2)
++    rows = rows.reshape(len(anchors), 192).astype(mx.float32)
++    query = values[0, :, c - 1, :].reshape(192).astype(mx.float32)
++    row_norms = mx.sum(rows * rows, axis=1)
++    query_norm = mx.sum(query * query)
++    valid_rows = mx.isfinite(row_norms) & (row_norms > 0)
++    valid_query = mx.isfinite(query_norm) & (query_norm > 0)
++    rows = rows / mx.sqrt(mx.where(valid_rows, row_norms, 1))[:, None]
++    query = query / mx.sqrt(mx.where(valid_query, query_norm, 1))
++    scores = mx.sum(rows * query[None], axis=1)
++    valid = valid_rows & valid_query & mx.isfinite(scores)
++    scores = mx.where(valid, scores, -float("inf"))
++    winner = mx.where(mx.any(valid), indices[mx.argmax(scores)], -1)
++    anchor = winner.item()  # Exactly one scalar read; no feature store survives.
++    if anchor < 0:
++        return []
++    k = min(d, c - anchor)
++    return history[anchor + 1:anchor + 1 + k]
++
++
++def _verify(model, cache, tokens, *, _trace=None):
++    """Teacher-forced forwards with grouped projections, rotary and short attention.
++
++    tokens contains pending followed by drafts, each with native shape (1, 1).
++    Each attention reads its own native causal prefix. Eligible blocks append
++    all singleton K/V results before the read-only attention phase; shorter
++    blocks retain dependencies protecting reads from subsequent cache writes.
++    """
++    start = _bulk_start(cache, len(tokens))
++    batched, grouped = _block_eligibility(
++        model, cache, start, len(tokens), all(t.shape == (1, 1) for t in tokens))
+     if isinstance(cache, RequestCache) and cache.rotary_eligible is None:
+         cache.rotary_eligible = _rotary_supported(model) if grouped else None
+     rotary = (grouped and cache.rotary_eligible and 0 <= start
+@@ -593,6 +648,11 @@ def _decode(model, first_token, cache, max_new_tokens):
+         # Recompute speculative lookup and capacity decisions after draining.
+         if supported and not pending:
+             drafts = _draft(state, max_new_tokens - len(output))
++            retrieved = False
++            if len(drafts) < 2:
++                continuation = _retrieve(model, state, max_new_tokens - len(output))
++                if continuation:
++                    drafts, retrieved = continuation, True
+             if drafts:
+                 inputs = [token.reshape(1, 1)] + [
+                     mx.array([[d]], dtype=token.dtype) for d in drafts
+@@ -616,6 +676,10 @@ def _decode(model, first_token, cache, max_new_tokens):
+                 stats["draft_lengths"][len(drafts)] += 1
+                 stats["accepted_lengths"][accepted] += 1
+                 stats["rejected_positions"] += rejected
++                if retrieved:
++                    stats["retrieved_blocks"] += 1
++                    stats["retrieved_tokens"] += len(drafts)
++                    stats["accepted_retrieved_tokens"] += accepted
+                 continue
+ 
+         logits = model(token.reshape(1, 1), cache=cache)

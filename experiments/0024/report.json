@@ -1,0 +1,94 @@
+{
+  "round": "0024",
+  "parent_commit": "c6200d0b4edc331408f64e4692ffb1ddf62bd672",
+  "models": {
+    "research": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "review": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "implementation": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    }
+  },
+  "status": "rejected",
+  "research": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Continuation retrieval from cached value vectors",
+      "idea": "When suffix drafting returns fewer than two tokens, use contextual features already in the last-layer value cache to select an earlier occurrence of the pending token. Compare predecessor vectors, copy up to four observed following tokens, and verify through the unchanged grouped verifier.",
+      "cost_removed": "A fully accepted four-token draft produces five tokens in one verification block. Compared with five scalar forwards, dense-projection invocations fall from 1,055 to 222, while grouping can amortize repeated weight reads. Target arithmetic is not eliminated when every position is accepted. Retrieval adds bounded history scanning, at most 4096\u00d7192 feature comparisons, gathering and normalization, and one host read. The corresponding BF16 feature payload is at most 1,572,864 bytes.",
+      "source_evidence": "candidate/inference.py:_draft caps draft length by matched-context length, so unigram matches produce at most one draft. _bulk_start excludes two-position blocks from the grouped path. Meanwhile, _verify stores unrotated value projections in every layer\u2019s KV cache; the target\u2019s last-layer values contain 192 contextual features per processed position. The installed llama.Attention applies RoPE only to queries and keys. [PLD+, Algorithm 1](https://aclanthology.org/2025.findings-naacl.338.pdf) supports ranking matching token occurrences using predecessor hidden-state similarity. Using cached value projections instead of separately retained hidden states is this experiment\u2019s untested hypothesis.",
+      "generalization": "Retrieval-assisted speculation can amortize large target-model traversals without training or additional target forwards. Existing value caches provide compact contextual features, particularly with grouped-query attention. The mechanism uses ordinary indexing and vector operations and requires no particular accelerator, compiler, or custom kernel. Benefits depend on reusable continuations within each request.",
+      "risk": "Value-vector similarity may select poor continuations. Rejected drafts waste transformer work, and retrieval synchronization may outweigh additional acceptance. A negative result would test this feature proxy and fallback policy, not establish that contextual retrieval generally fails.",
+      "history_relation": "Preserves the accepted suffix drafter whenever it supplies at least two tokens and retains all accepted verification optimizations. Round 0011 tested branching over occurrence counts; 0012 recycled contextual token predictions. Neither used existing continuous contextual features to choose observed spans. Unlike 0015, this experiment does not suppress existing multi-token drafts."
+    },
+    "plan": "1. Modify candidate/ only. Freeze the retrieval source to the last layer, search window to 4096 prior positions, and maximum retrieved draft to four tokens. Preserve prefill, model objects, existing drafting constants, scalar pipelining, and verifier arithmetic.\n\n2. At an existing drained drafting boundary, obtain the ordinary draft first. Attempt retrieval only when it contains fewer than two tokens and the existing grouped verifier is eligible. Let C be the common cache offset and H the committed history, with len(H)=C+1 and pending token H[C]. Set D=min(4, remaining-1, minimum_KV_capacity-C-1); require D>=2.\n\n3. Enumerate historical anchor positions j in descending order, max(1,C-4096)<=j<=C-2, requiring H[j]==H[C]. Compare the flattened last-layer value vector at C-1 against vectors at j-1 using FP32 cosine similarity. These are predecessor features: the pending token has not entered KV. Exclude zero-norm or nonfinite comparisons. Choose the largest finite score, with recency breaking ties; otherwise retain the ordinary draft. Materialize one winning-index-or-fallback sentinel and release retrieval temporaries before verification.\n\n4. Copy H[j+1:j+1+min(D,C-j)]. This contains two to four already-observed tokens. Pass them through the existing _verify and unchanged acceptance rule. For k drafts and a accepted drafts, emit drafts[:a] plus prediction[a], then trim k-a entries after all predictions complete. Read no allocated or rejected KV tail. Keep retrieval entirely inside decode and retain no additional request state across requests.\n\n5. Add counters for retrieval attempts, proposed tokens, and accepted retrieved tokens. Check predecessor alignment, head flattening, recency ties, invalid features, preservation of longer ordinary drafts, poisoned cache tails, budgets, unequal capacities, every acceptance boundary, scalar transitions, and independent requests. Compare emitted tokens and retained KV against reference execution on independent synthetic inputs, exercising the active retrieval path.\n\n6. Have the orchestrator run authoritative exact-token evaluation and both throughput confirmations against the current best. Keep only the required clear improvement. Do not adjust the layer, window, or draft length using benchmark prompts or results.",
+    "reason": "This can replace repeated scalar execution with the already-efficient verifier using information currently unused for drafting. It adds no model forward or persistent feature store. An in-memory prototype passed 4,000 bookkeeping cases, including 585 active retrieval cases, plus three targeted fixtures. These checks establish indexing and bounds only; acceptance quality, native correctness, and throughput remain experimental."
+  },
+  "review": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Continuation retrieval from cached value vectors",
+      "idea": "At an existing drained drafting boundary, preserve ordinary suffix drafts containing at least two tokens. Otherwise, rank earlier occurrences of the pending token by cosine similarity between their predecessor value vectors and the current predecessor\u2019s value vector in the last-layer cache. Copy two to four observed continuation tokens and verify them through the unchanged grouped verifier.",
+      "cost_removed": "A fully accepted four-token draft emits five tokens through one verification block. With panel heads active, dense-projection calls fall from 5\u00d7211=1,055 scalar calls to 210 body calls plus 12 head-panel calls=222. Arithmetic for those five target positions remains; grouping can amortize scheduling and weight traffic. This is conditional work accounting, not a predicted gain over the current best. Retrieval adds a bounded host-history scan, at most 4095\u00d7192 candidate features plus one 192-element query, gathering, FP32 normalization and reductions, and one additional scalar host read. The BF16 source payload is at most 1,572,864 bytes; FP32 feature buffers and other temporaries make actual memory traffic larger.",
+      "source_evidence": "candidate/inference.py:121 caps suffix drafts by matched-context length; :313 excludes two-position blocks from bulk/grouped verification. The grouped eligibility checks and verifier use BF16 caches shaped [1,3,capacity,64]. Inspection of installed mlx-lm 0.32.0 llama.Attention confirms that values are cached without RoPE; they are projections of normalized layer inputs, not final residual hidden states. candidate/inference.py:594 drafts only after scalar outputs drain. harness/bench.py:20 times decode through final synchronization. [PLD+, \u00a74.2.2 and Algorithm 1](https://aclanthology.org/2025.findings-naacl.338.pdf) supports ranking matching-token occurrences using predecessor hidden-state similarity. Substituting last-layer value vectors remains an untested hypothesis.",
+      "generalization": "Retrieval from existing contextual features can supply longer speculative spans without training, extra target forwards, or a separate feature store. The mechanism uses ordinary indexing and vector operations and can apply to large decoder models, particularly with compact grouped-query value caches. Benefits depend on reusable continuations and verification efficiency; distributed KV placement may add communication.",
+      "risk": "Value projection can distort the similarity information useful for continuation selection. Retrieval may replace a good one-token draft with a worse span, wasting target work. Synchronization, feature packing, normalization, and temporary storage may outweigh additional acceptance. Similarity is only a drafting heuristic. New draft sequences still require native validation of verifier outputs and retained KV.",
+      "history_relation": "Preserves the accepted suffix policy whenever it returns at least two tokens and retains every accepted verification optimization. Rounds 0011 and 0012 tested count-based branching and prediction recycling, respectively, without continuous cached-feature retrieval. Round 0015 suppressed existing speculation; this proposal preserves existing multi-token drafts. Round 0020 tested grouping two-position blocks, whereas this mechanism supplies longer drafts to the existing three-to-five-position path. Those failures do not resolve this feature proxy and fallback policy."
+    },
+    "plan": "1. Implement only inside candidate/. Preserve model objects, weights, tokenizer, prefill computation, first-token selection, public interfaces, fixed-length generation behavior, existing drafting constants, scalar pipelining, and verifier arithmetic. Freeze retrieval to the last layer, a 4096-position anchor window, and at most four draft tokens. Do not tune these choices using benchmark prompts or results.\n\n2. Obtain the unchanged ordinary draft first. Return it immediately when its length is at least two. Attempt retrieval only at an existing boundary with no unread scalar outputs. Require committed history H, common cache offset C, len(H)=C+1, and every cache representing H[:C]; H[C] is the pending token. Let R be the remaining output allowance and A the minimum allocated capacity across every key and value buffer. Set D=min(4,R-1,A-C-1), requiring D>=2. Match the verifier\u2019s actual batched/grouped eligibility, including BF16 cache dtype and [1,3,capacity,64] layout, and require _bulk_start(cache,D+1)==C. Reuse cached metadata checks. Preserve independent rotary, attention, and head fallbacks. Failed retrieval eligibility retains the ordinary draft.\n\n3. Enumerate anchors j in descending order with max(1,C-4096)<=j<=C-2 and H[j]==H[C]. An empty set returns the ordinary draft without device scoring or a host read. For last-layer values V, define feature f(i)[64*h+d]=V[0,h,i,d]. Compare f(C-1) with f(j-1). Gather only these rows, then arrange them as [number_of_anchors,192]; do not directly reshape head-major cache storage into token rows or pack/cast the entire cache. Never read position C or any allocated/rejected tail. The exclusion of j=0 prevents negative predecessor indexing.\n\n4. Cast gathered features to FP32 before multiplication. Require finite, strictly positive squared norms; normalize query and candidate rows separately using safe denominators, and exclude nonfinite scores. All finite cosine scores, including negative ones, remain eligible. Choose the highest computed score, with the largest j breaking ties. Construct one device scalar containing that anchor or -1 when no comparison is valid, and read it once. Mask invalid rows explicitly so an all-invalid argmax cannot select an anchor. Return only Python selection data and release retrieval tensor references before verification. Similarity never authorizes token emission or changes target arithmetic.\n\n5. For a winning anchor, set k=min(D,C-j) and copy H[j+1:j+1+k], giving two to four already-observed tokens. This slice may include the already-committed pending token H[C], but nothing beyond it. Do not extend it recursively from draft tokens or update the history index while drafting. Pass the pending token followed by this draft to the existing _verify. Complete and materialize all predictions before rollback. For a consecutive matches, emit drafts[:a] followed by prediction[a], retain that prediction tensor as pending, and trim k-a entries from every cache. End at offset C+a+1 with cache contents equal to the new history excluding its final token.\n\n6. Keep all retrieval scanning, indices, feature operations, synchronization, verification, bookkeeping, and cleanup inside decode. Add request-local counters for nonempty scoring attempts, retrieved verification blocks, proposed retrieved tokens, and accepted retrieved draft tokens; exclude corrective/bonus tokens from the acceptance counter. Retain existing counters without hot-path logging. Store no additional feature tensors or request-derived state across requests.\n\n7. Validate predecessor alignment, head flattening, both window endpoints, recent anchors with exactly two observed successors, deterministic ties, negative scores, zero/nonfinite/overflowing norms, all-invalid fallback, poisoned tails, unequal key/value capacities, short budgets, failed eligibility, and preservation of ordinary multi-token drafts. Exercise every acceptance length for k=2,3,4, consecutive retrievals, scalar transitions, rollback followed by capacity growth, and fresh requests. On independent synthetic target inputs, demonstrate the real retrieval path and compare emitted tokens and retained valid KV with singleton reference execution; compare verifier logits for retrieved blocks of three to five positions. Ranking scores need not match across platforms bitwise. Existing checks that patch _draft to suppress speculation must explicitly suppress retrieval within those baseline fixtures; separate checks must exercise active retrieval rather than disabling it throughout validation.\n\n8. Have the orchestrator run authoritative exact-token evaluation and both throughput confirmations against the current accepted candidate. Record retrieval activation and acceptance separately from correctness and throughput. Keep only exact output with at least 1.03x incremental gain in both confirmations. Treat unavailable native execution as an environment limitation, not an experiment result.",
+    "reason": "No fundamental flaw was found. Review clarifies eligibility, predecessor layout, invalid-score handling, temporary-memory costs, and validation isolation. Independent NumPy checks using current drafting helpers and the installed KVCache logic passed 1,800 selection cases, including 236 active retrieval cases, nine targeted fixtures, and 1,080 rollback cases with 4,140 scalar continuation steps. These establish bookkeeping only. Native MLX validation was unavailable because the sandbox cannot access Metal; exactness and throughput remain for the orchestrator. No files were edited."
+  },
+  "implementation": {
+    "outcome": "implemented",
+    "summary": "Implemented cached-value continuation retrieval in candidate/inference.py, preserving ordinary multi-token drafts and verifier arithmetic. Added request-local counters and validation checks. Syntax and NumPy-adapted selector/transition checks pass. Native MLX validation remains for the orchestrator because Metal is unavailable locally."
+  },
+  "eval": {
+    "correct": true,
+    "cases": [
+      {
+        "prompt": "Explain why the sky is blue.",
+        "correct": true
+      },
+      {
+        "prompt": "Write a short Python function that reverses a list.",
+        "correct": true
+      },
+      {
+        "prompt": "What are the main causes of inflation?",
+        "correct": true
+      },
+      {
+        "prompt": "Describe how photosynthesis works.",
+        "correct": true
+      },
+      {
+        "prompt": "Continue this story: The door opened and nobody was there.",
+        "correct": true
+      },
+      {
+        "prompt": "<benchmark>",
+        "correct": true
+      }
+    ]
+  },
+  "confirmations": [
+    {
+      "baseline_relative_decode_speed": 2.6343333861962437,
+      "candidate_relative_decode_speed": 2.632252779087537,
+      "gain": 0.999210195976102
+    },
+    {
+      "baseline_relative_decode_speed": 2.587586266857192,
+      "candidate_relative_decode_speed": 2.623482364365458,
+      "gain": 1.0138724254213423
+    }
+  ],
+  "confirmed_gain": 0.999210195976102,
+  "reason": "decode gain was not >= 1.03x twice"
+}
