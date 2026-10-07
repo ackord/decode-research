@@ -1,0 +1,94 @@
+{
+  "round": "0029",
+  "parent_commit": "a2e8b4e17d65b7abaf1fab9d69455b819f518d3e",
+  "models": {
+    "research": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "review": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "implementation": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    }
+  },
+  "status": "rejected",
+  "research": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "One Jacobi retry of a rejected speculative tail",
+      "idea": "Retain up to four already-computed predictions beyond an ordinary speculative mismatch. At the next drained boundary, use them as one approximate continuation when ordinary suffix drafting provides fewer than two tokens. Verify through the unchanged exact verifier, and never seed another retry from that retry.",
+      "cost_removed": "Adds no drafting model pass, vocabulary projection, prediction transfer, or contextual lookup table. Successful retries amortize subsequent target execution across additional emitted tokens. For illustration, a fully accepted four-token retry uses one five-position verifier with 222 grouped projection calls instead of 1055 projection calls across five scalar forwards. Verified-position arithmetic remains; rejected retry positions add work.",
+      "source_evidence": "candidate/inference.py:602 already materializes every speculative prediction. Lines 603\u2013613 retain the matching prefix and corrective prediction, then discard later predictions. Those discarded IDs are available without additional device work. Meanwhile, _draft at line 131 limits proposals by matched-context length, and _bulk_start excludes blocks shorter than three positions. The current eligible verifier executes 210 body projections plus twelve vocabulary panels. The authors\u2019 [Lookahead Decoding explanation](https://www.lmsys.org/blog/2023-11-21-lookahead-decoding/) describes using parallel predictions as Jacobi updates, while explicitly noting that simple Jacobi decoding can perform poorly. It motivates this bounded experiment without establishing its throughput.",
+      "generalization": "Any exact speculative decoder that computes rejected-tail predictions can attempt this reuse. It requires only a small request-local token buffer and existing verification, independently of hardware, kernels, compilation, or auxiliary training. Larger decoders could benefit when verification amortizes expensive weight access.",
+      "risk": "The retained predictions were conditioned on incorrect prefixes and may be poor proposals after correction. A retry can waste target computation or replace a useful one-token suffix draft. Preserving longer ordinary drafts and allowing only one retry limits exposure, but does not guarantee a gain.",
+      "history_relation": "Round 0012 tested contextual prediction recycling and lost at 0.986x. This experiment instead performs immediate positional refinement using one small buffer, without its context-table updates, eviction, forecast precedence, or additional pipeline draining. Accepted verifier improvements since round 0012 materially reduce grouped verification cost. Rounds 0025 and 0028 tested auxiliary drafting that added inference work; this proposal uses predictions already paid for."
+    },
+    "plan": "1. Modify only candidate/ during implementation. Preserve prefill, suffix indexing, scalar pipeline scheduling, target operations, and all accepted verifier optimizations. Initialize an empty request-local retry slot; clear it during decode cleanup.\n\n2. After an ordinary suffix verification with k drafts, predictions p0..pk, starting offset C, and acceptance length a, retain at most the first four IDs from p(a+1)..pk. Tag them with the resulting offset C+a+1 and pending token pa. These are proposals only, not a valid generated continuation. Store no rejected KV, hidden states, or tensor graphs.\n\n3. At the next drained decision, obtain the unchanged ordinary suffix draft first. Preserve it when its length is at least two. Otherwise, require a matching retry tag, len(history)=C+1, consistent caches, and actual grouped-verifier eligibility. With R remaining output slots and A the minimum key/value capacity, set k_retry=min(4, retained_count, R-1, A-C-1). Retry only when k_retry>=2; otherwise retain ordinary behavior.\n\n4. Consume or expire the slot at that decision. Clear it before any scalar submission. An ordinary suffix verification may replace it with a newly aligned tail; a retry verification must leave it empty. Freeze the four-token cap and single-retry policy before evaluation.\n\n5. Verify [pending,*retry] through unchanged _verify. Accept only consecutive exact matches, emit the corrective or bonus prediction, and trim k_retry-a_retry entries as usual. Update history and occurrence counts only with committed tokens. All reuse, bookkeeping, verification, and cleanup occur during decode.\n\n6. Add native checks covering active retries, acceptance lengths zero through four, stale tags, capacity limits, short budgets, preference for ordinary multi-token drafts, scalar transitions, and request isolation. Compare emitted tokens and retained KV against reference execution. Record retry attempts, proposed and accepted tokens, and rejected positions. Have the orchestrator run authoritative exact-token evaluation and both throughput confirmations against the current best; retain only the required clear improvement without policy tuning from benchmark results.",
+    "reason": "This is a small, sound experiment that may turn discarded target predictions into useful grouped verification without auxiliary inference overhead. Independent in-memory checks passed 129,600 retry-prefix and capacity cases covering acceptance lengths zero through four. These establish bookkeeping only; native parity, proposal quality, and throughput remain experimental. No files were edited."
+  },
+  "review": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "One Jacobi retry of a rejected speculative tail",
+      "idea": "Retain up to four already-materialized predictions beyond an ordinary speculative mismatch. At the immediately following drained boundary, use them as approximate proposals only when ordinary suffix drafting supplies fewer than two tokens. Verify them through the unchanged exact verifier, and never seed another retry from a retry.",
+      "cost_removed": "Obtaining these proposals requires no additional drafting forward, vocabulary projection, contextual table, or host read. Successful retries can amortize subsequent target execution: a fully accepted four-token retry uses 222 grouped projection calls versus 1055 across five scalar forwards when vocabulary panels are active. This comparison is illustrative because the baseline also supports suffix speculation. Verified-position arithmetic remains, previous rejected work cannot be recovered, and each retry adds token construction, complete verification, normal prediction transfer, and bookkeeping.",
+      "source_evidence": "Verified [candidate/inference.py](candidate/inference.py:594): all speculative prediction IDs are materialized before acceptance and rollback, then the rejected tail is discarded. _draft limits proposals by matched-context length; _bulk_start requires at least three positions; _verify performs seven grouped body projections across 30 layers plus twelve eligible vocabulary panels. [harness/bench.py](harness/bench.py:20) times decode through final synchronization. The authors\u2019 [Lookahead Decoding explanation](https://www.lmsys.org/blog/2023-11-21-lookahead-decoding/) supports the Jacobi-update interpretation and explicitly describes poor performance of simple Jacobi decoding; it does not establish this experiment\u2019s throughput.",
+      "generalization": "An exact speculative decoder can reuse discarded predictions as approximate proposals using a bounded request-local buffer. The mechanism requires no training, custom kernels, or particular hardware. Larger decoders may benefit where verification amortizes weight access, subject to proposal quality and an exact verifier for that target.",
+      "risk": "Retained predictions were conditioned on incorrect prefixes and need not form a coherent continuation. Retries may waste target computation or displace a useful one-token suffix draft. Longer ordinary drafts retain precedence, and retries cannot recursively reproduce themselves. Native numerical parity remains mandatory despite preserving verifier operations and supported block sizes.",
+      "history_relation": "Round 0012 tested contextual prediction recycling and lost at 0.986x. Its implementation maintained suffix forecasts, eviction, forecast precedence, and an expanded pipeline-drain predicate. This experiment instead uses immediate positional refinement with one bounded buffer and unchanged draining. Accepted verifier improvements since that round reduce grouped verification cost. Rounds 0025 and 0028 tested auxiliary drafting with additional inference work; neither resolves reuse of already-materialized predictions."
+    },
+    "plan": "1. Implement only inside candidate/. Preserve target parameters and modules, prefill computation, suffix indexing, scalar pipeline scheduling, and every accepted verifier optimization. Add one request-local retry slot containing at most four Python token IDs, a cache-offset tag, and a pending-token ID. Initialize it empty, reset it at decode entry, and clear it in the existing finally cleanup. Retain no additional KV, hidden states, or tensor graphs.\n\n2. Define alignment explicitly. At a drained boundary, history H has length C+1, KV represents H[:C], and H[C] is the pending token. For drafts d0 through d(k-1), verifier prediction pi is conditioned on H + drafts[:i]. If a drafts match consecutively, commit drafts[:a] and pa, then trim k-a positions. The resulting offset is C'=C+a+1, and pa is the new pending token.\n\n3. After an ordinary suffix verification completes and rolls back, copy IDs p(a+1) through p(min(k,a+4)) into the slot, tagged with C' and pa. Store a slot only when at least two IDs remain. These IDs occupy successive proposal positions after pa but were computed under the old speculative prefixes; do not treat them as an observed continuation. Full acceptance produces no slot. A retry verification must leave the slot empty.\n\n4. At the immediately following existing drained decision, obtain the unchanged ordinary suffix draft first, then consume or expire the old slot regardless of the outcome. Preserve ordinary drafts of length at least two. Otherwise require matching offset and pending-ID tags, len(history)=C+1, consistent nonempty caches, and actual grouped-verifier eligibility. Compare the pending tag with history[-1], avoiding another tensor read. With R remaining output slots and A the minimum capacity across every key and value buffer, set k_retry=min(4, retained_count, R-1, A-C-1). Require k_retry>=2. Honor _verify\u2019s batched/grouped gates, including cached false decisions, BF16 cache dtypes, layouts, and _bulk_start for k_retry+1 positions. Preserve independent rotary, attention, and vocabulary-panel fallbacks. Failed admission retains ordinary behavior, including a one-token suffix draft.\n\n5. Verify [pending,*retry] through unchanged _verify and its existing joint materialization barrier. Accept only consecutive fresh target matches; emit the fresh corrective or bonus prediction, retain its tensor as pending, and trim k_retry-a_retry positions. Recompute every retry position and overwrite the speculative interval; rejected KV is never valid continuation state. Append only committed tokens to history and successor counts. Do not retain unused retry IDs or seed another retry from its predictions.\n\n6. Clear the slot before any scalar submission. Preserve submit-before-read ordering and the existing pipeline-drain hint without additional drains, model calls for admission, or synchronization. All capture, selection, tensor construction, verification, counters, and cleanup involving generated tokens must occur inside decode. Freeze the four-token cap and single-retry policy before evaluation.\n\n7. Add inexpensive request-local counters for retry attempts, proposed tokens, accepted proposals excluding corrective/bonus tokens, and rejected positions. Require native differential checks with active retries, every acceptance length for two-, three-, and four-token retries, ordinary-block acceptance boundaries, suffix precedence, stale tags, cached eligibility failures, unequal capacities, short budgets, scalar transitions and growth, nonrecursive retry behavior, and fresh requests. Compare emitted tokens, retained KV, and committed-history counts with singleton reference execution. Explicitly isolate retry activation in existing fixtures that assert exactly one speculative block; separately test automatic capture and consumption of actual rejected-tail predictions. Keep test overrides out of authoritative evaluation.\n\n8. Have the orchestrator run authoritative exact-token evaluation and both throughput confirmations against the current accepted implementation. Record whether retries activated and their acceptance separately from speed. Retain only exact output with at least 1.03x improvement in both confirmations. Do not tune policy from benchmark prompts or results, and do not report an inactive path or an environment limitation as a resolved performance experiment.",
+    "reason": "No fundamental flaw was found. Review sharpens positional alignment, cached eligibility, slot lifetime, work accounting, and test isolation. Independent in-memory checks passed 24,696 admission cases, 4,104 prefix/KV cases, and 972 decode simulations, including every retry acceptance length. These used a NumPy stand-in and installed KVCache logic; they establish bookkeeping, not native BF16 parity or throughput. MLX is unavailable in this environment. No files were edited."
+  },
+  "implementation": {
+    "outcome": "implemented",
+    "summary": "Implemented the bounded, nonrecursive retry path and counters in candidate/inference.py, preserving the verifier and scalar scheduling. Added native differential checks in candidate/checks.py. Syntax and whitespace checks passed; native execution was unavailable because MLX could not access Metal. Authoritative evaluation and benchmarking remain with the orchestrator."
+  },
+  "eval": {
+    "correct": true,
+    "cases": [
+      {
+        "prompt": "Explain why the sky is blue.",
+        "correct": true
+      },
+      {
+        "prompt": "Write a short Python function that reverses a list.",
+        "correct": true
+      },
+      {
+        "prompt": "What are the main causes of inflation?",
+        "correct": true
+      },
+      {
+        "prompt": "Describe how photosynthesis works.",
+        "correct": true
+      },
+      {
+        "prompt": "Continue this story: The door opened and nobody was there.",
+        "correct": true
+      },
+      {
+        "prompt": "<benchmark>",
+        "correct": true
+      }
+    ]
+  },
+  "confirmations": [
+    {
+      "baseline_relative_decode_speed": 2.7836891042381335,
+      "candidate_relative_decode_speed": 2.786690553214672,
+      "gain": 1.0010782270807357
+    },
+    {
+      "baseline_relative_decode_speed": 2.7757354927246203,
+      "candidate_relative_decode_speed": 2.8088553118039843,
+      "gain": 1.0119319074768374
+    }
+  ],
+  "confirmed_gain": 1.0010782270807357,
+  "reason": "decode gain was not >= 1.03x twice"
+}

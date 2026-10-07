@@ -1,0 +1,345 @@
+diff --git a/candidate/checks.py b/candidate/checks.py
+index 487774a..f0c4145 100644
+--- a/candidate/checks.py
++++ b/candidate/checks.py
+@@ -601,7 +601,9 @@ def _decode_checks(model, base, pending):
+             assert remaining >= 17
+             return drafts
+ 
+-        with patch.object(ci, "_draft", draft):
++        # This fixture asserts exactly one block; retry activation has its own
++        # differential fixtures below and must not alter these block counts.
++        with patch.object(ci, "_draft", draft), patch.object(ci, "_retry_draft", return_value=[]):
+             output = ci.decode(model, pending, cache, 24)
+         assert output == oracle
+         assert cache.stats["accepted_lengths"][accepted] == 1
+@@ -702,6 +704,182 @@ def _decode_checks(model, base, pending):
+         _prefixes(g, r, "fallback")
+ 
+ 
++def _retry_checks(model, base, pending):
++    """Native retry acceptance/rollback and automatic rejected-tail capture."""
++    oracle_cache = _clone(model, base)
++    token, oracle = pending, [pending.item()]
++    for _ in range(23):
++        token = mx.argmax(model(token.reshape(1, 1), cache=oracle_cache)[:, -1, :], axis=-1)
++        oracle.append(token.item())
++
++    def committed(cache, label):
++        assert cache.history == base.history + oracle, label
++        expected = ci.RequestCache([], cache.history)
++        assert cache.index.keys() == expected.index.keys(), label
++        for context, successors in cache.index.items():
++            other = expected.index[context]
++            assert successors.counts == other.counts, (label, context)
++            assert successors.preferred == other.preferred, (label, context)
++        assert cache.retry_slot is None and cache.head_panels is None
++        _prefixes(cache, oracle_cache, label)
++
++    # Inject proposals only in this optional suite, after decode-entry reset.
++    # Every accepted length exercises native verification, rollback, scalar
++    # transitions and eventual capacity growth against singleton execution.
++    for k in (2, 3, 4):
++        for accepted in range(k + 1):
++            cache = _clone(model, base, base[0].offset + k + 1)
++            proposals = oracle[1:k + 1]
++            if accepted < k:
++                proposals[accepted] = (proposals[accepted] + 1) % 49152
++            calls = []
++
++            def inject(state, remaining):
++                if not calls:
++                    state.retry_slot = (state[0].offset, state.history[-1], proposals)
++                calls.append(True)
++                return []
++
++            with patch.object(ci, "_draft", inject):
++                assert ci.decode(model, pending, cache, 24) == oracle
++            assert cache.stats["retry_attempts"] == 1
++            assert cache.stats["retry_proposed_tokens"] == k
++            assert cache.stats["retry_accepted_proposals"] == accepted
++            assert cache.stats["retry_rejected_positions"] == k - accepted
++            assert cache.stats["grouped_blocks"] == 1
++            committed(cache, f"retry/k{k}/a{accepted}")
++
++    for limit in (4, 5, 6):
++        cache, reference = _clone(model, base, base[0].offset + 5), _clone(model, base)
++
++        def bounded_retry(state, remaining):
++            state.retry_slot = (state[0].offset, state.history[-1], oracle[1:5])
++            return []
++
++        with patch.object(ci, "_draft", bounded_retry):
++            assert ci.decode(model, pending, cache, limit) == oracle[:limit]
++        token = pending
++        for _ in range(limit - 1):
++            token = mx.argmax(model(token.reshape(1, 1), cache=reference)[:, -1, :], axis=-1)
++        assert cache.stats["retry_attempts"] == 1
++        assert cache.stats["retry_proposed_tokens"] == limit - 2
++        assert cache.history == base.history + oracle[:limit]
++        _prefixes(cache, reference, f"retry short budget/{limit}")
++
++    # Real predictions from an ordinary rejected block must be captured and
++    # consumed automatically; a retry cannot seed another retry, even rejected.
++    native_verify, native_retry = ci._verify, ci._retry_draft
++    for accepted in range(7):
++        cache = _clone(model, base, base[0].offset + 17)
++        drafts = oracle[1:7]
++        if accepted < 6:
++            drafts[accepted] = (drafts[accepted] + 1) % 49152
++        blocks, slots, lookups = [], [], []
++
++        def ordinary(state, remaining):
++            lookups.append(True)
++            return drafts if len(lookups) == 1 else []
++
++        def verify(*args, **kwargs):
++            predictions = native_verify(*args, **kwargs)
++            blocks.append(mx.stack(predictions).tolist())
++            return predictions
++
++        def observe(model, state, slot, remaining):
++            if slot is not None:
++                slots.append(slot)
++                assert slot == (base[0].offset + accepted + 1, oracle[accepted + 1],
++                                [r[0] for r in blocks[0][accepted + 1:accepted + 5]])
++            return native_retry(model, state, slot, remaining)
++
++        with patch.object(ci, "_draft", ordinary), patch.object(ci, "_verify", verify), \
++                patch.object(ci, "_retry_draft", observe):
++            assert ci.decode(model, pending, cache, 24) == oracle
++        assert len(slots) == cache.stats["retry_attempts"] == int(6 - accepted >= 2)
++        assert len(blocks) == 1 + len(slots)
++        if slots:
++            assert cache.stats["retry_proposed_tokens"] == min(4, 6 - accepted)
++        committed(cache, f"automatic retry/ordinary-a{accepted}")
++
++    # Metadata-only admission: stale tags, cached failures, shape/dtype gates,
++    # minimum capacity across all K/V buffers, and short output budgets.
++    cache = _clone(model, base, base[0].offset + 5)
++    cache.append_token(pending.item())
++    c = cache[0].offset
++    slot = (c, pending.item(), oracle[1:5])
++    assert ci._retry_draft(model, cache, slot, 5) == oracle[1:5]
++    for remaining in (0, 1, 2, 3, 4):
++        expected = oracle[1:remaining] if remaining >= 3 else []
++        assert ci._retry_draft(model, cache, slot, remaining) == expected
++    assert ci._retry_draft(model, cache, (c + 1, slot[1], slot[2]), 5) == []
++    assert ci._retry_draft(model, cache, (c, slot[1] + 1, slot[2]), 5) == []
++    assert ci._retry_draft(model, cache, (c, slot[1], slot[2][:1]), 5) == []
++    for name in ("batch_rows_eligible", "grouped_eligible"):
++        with patch.object(cache, name, False):
++            assert ci._retry_draft(model, cache, slot, 5) == []
++        gate = "_batch_supported" if name == "batch_rows_eligible" else "_grouped_supported"
++        with patch.object(cache, name, None), patch.object(ci, gate, return_value=False) as probe:
++            assert ci._retry_draft(model, cache, slot, 5) == []
++            assert ci._retry_draft(model, cache, slot, 5) == []
++            assert probe.call_count == 1 and getattr(cache, name) is False
++    with patch.object(cache[-1], "offset", c + 1):
++        assert ci._retry_draft(model, cache, slot, 5) == []
++    with patch.object(cache, "history", cache.history[:-1]):
++        assert ci._retry_draft(model, cache, slot, 5) == []
++    for name in ("keys", "values"):
++        array = getattr(cache[-1], name)
++        for capacity in (c + 2, c + 3, c + 4):
++            with patch.object(cache[-1], name, array[..., :capacity, :]):
++                expected = oracle[1:capacity - c] if capacity >= c + 3 else []
++                assert ci._retry_draft(model, cache, slot, 5) == expected
++        for replacement in (None, array.astype(mx.float32), array[:, :1]):
++            with patch.object(cache[-1], name, replacement):
++                assert ci._retry_draft(model, cache, slot, 5) == []
++    # Independent optimizations may fall back without disabling admission.
++    for name in ("rotary_eligible", "attention_eligible", "head_eligible"):
++        with patch.object(cache, name, False):
++            assert ci._retry_draft(model, cache, slot, 5) == oracle[1:5]
++
++    # Ordinary suffixes of length two take precedence; length one survives a
++    # failed retry admission and is replaced when a retry is eligible.
++    for length, eligible in ((2, True), (1, False), (1, True), (0, False)):
++        cache = _clone(model, base, base[0].offset + 17)
++        calls = []
++
++        def precedence(state, remaining):
++            if calls:
++                assert state.retry_slot is None
++                return []
++            calls.append(True)
++            state.retry_slot = (state[0].offset, state.history[-1], oracle[1:5])
++            state.grouped_eligible = eligible
++            return oracle[1:1 + length]
++
++        with patch.object(ci, "_draft", precedence):
++            assert ci.decode(model, pending, cache, 24) == oracle
++        assert cache.stats["retry_attempts"] == int(length < 2 and eligible)
++        assert cache.stats["verifications"] == int(length > 0)
++        committed(cache, f"suffix precedence/{length}/{eligible}")
++
++    # Entry resets even a zero-token request; finally also clears on failure.
++    cache.retry_slot = slot
++    assert ci.decode(model, pending, cache, 0) == [] and cache.retry_slot is None
++    cache = _clone(model, base)
++
++    def fail(state, remaining):
++        state.retry_slot = slot
++        raise RuntimeError("fixture")
++
++    with patch.object(ci, "_draft", fail):
++        try:
++            ci.decode(model, pending, cache, 4)
++        except RuntimeError as error:
++            assert str(error) == "fixture"
++        else:
++            raise AssertionError("Expected fixture failure")
++    assert cache.retry_slot is None
++
++
+ def check_grouped(model):
+     """Fail at the first numerical discrepancy; never certify throughput."""
+     prompt = [1] + [41 + (i * 17) % 311 for i in range(23)]
+@@ -723,6 +901,7 @@ def check_grouped(model):
+     _head_gate_checks(model, base, pending)
+     _verification_checks(model, base, pending)
+     _decode_checks(model, base, pending)
++    _retry_checks(model, base, pending)
+     # Real model prefixes exercise short vector boundaries and unchanged
+     # long-context attention, independent of benchmark prompts/results.
+     for length in (31, 32, 1015, 1021, 1022, 1023, 1024, 1057):
+@@ -736,6 +915,10 @@ def check_grouped(model):
+     assert second.grouped_eligible is None and second.rotary_eligible is None
+     assert second.attention_eligible is None
+     assert second.head_eligible is None and second.head_panels is None
++    assert second.retry_slot is None
++    assert all(second.stats[name] == 0 for name in (
++        "retry_attempts", "retry_proposed_tokens", "retry_accepted_proposals",
++        "retry_rejected_positions"))
+     assert second.stats["panel_head_blocks"] == second.stats["panel_view_sets"] == 0
+     assert second.stats["attention_blocks"] == second.stats["attention_calls"] == 0
+     assert second.stats["rotary_blocks"] == second.stats["grouped_rotary_calls"] == 0
+diff --git a/candidate/inference.py b/candidate/inference.py
+index 0d57b7c..2452d88 100644
+--- a/candidate/inference.py
++++ b/candidate/inference.py
+@@ -9,6 +9,7 @@ MAX_CONTEXT = 16
+ MAX_DRAFTS = 16
+ INDEX_CONTEXT = MAX_CONTEXT + MAX_DRAFTS - 1
+ HEAD_PANEL_ROWS = 4096
++MAX_RETRY = 4
+ _HEAD_RUNTIME = version("mlx") == "0.32.3"
+ 
+ 
+@@ -41,6 +42,7 @@ class RequestCache(list):
+         self.attention_eligible = None
+         self.head_eligible = None
+         self.head_panels = None
++        self.retry_slot = None
+         self.stats = {
+             "scalar_steps": 0,
+             "verifications": 0,
+@@ -64,6 +66,10 @@ class RequestCache(list):
+             "draft_lengths": [0] * (MAX_DRAFTS + 1),
+             "accepted_lengths": [0] * (MAX_DRAFTS + 1),
+             "rejected_positions": 0,
++            "retry_attempts": 0,
++            "retry_proposed_tokens": 0,
++            "retry_accepted_proposals": 0,
++            "retry_rejected_positions": 0,
+         }
+         for token in token_ids:
+             self.append_token(int(token))
+@@ -324,6 +330,38 @@ def _bulk_start(cache, count):
+     return start
+ 
+ 
++def _retry_draft(model, cache, slot, remaining):
++    """Admit one positional retry using only host IDs and cache metadata."""
++    if slot is None or not cache:
++        return []
++    offset, pending_id, retained = slot
++    if (cache[0].offset != offset or len(cache.history) != offset + 1
++            or cache.history[-1] != pending_id
++            or any(kv.offset != offset or kv.keys is None or kv.values is None
++                   for kv in cache)):
++        return []
++    capacity = min(min(kv.keys.shape[2], kv.values.shape[2]) for kv in cache)
++    count = min(MAX_RETRY, len(retained), remaining - 1, capacity - offset - 1)
++    if count < 2 or _bulk_start(cache, count + 1) is None:
++        return []
++    # Match _verify's batched/grouped gates, including cached false decisions.
++    # Token construction below always produces native (1, 1) inputs. Rotary,
++    # attention and vocabulary panels retain their independent fallbacks.
++    if cache.batch_rows_eligible is None:
++        cache.batch_rows_eligible = _batch_supported(model, cache)
++    if not cache.batch_rows_eligible:
++        return []
++    if cache.grouped_eligible is None:
++        cache.grouped_eligible = _grouped_supported(model, cache)
++    if not cache.grouped_eligible or not all(
++            kv.keys.dtype == kv.values.dtype == mx.bfloat16
++            and kv.keys.ndim == kv.values.ndim == 4
++            and kv.keys.shape[:2] == kv.values.shape[:2] == (1, 3)
++            and kv.keys.shape[3] == kv.values.shape[3] == 64 for kv in cache):
++        return []
++    return retained[:count]
++
++
+ def _verify(model, cache, tokens, *, _trace=None):
+     """Teacher-forced forwards with grouped projections, rotary and short attention.
+ 
+@@ -563,11 +601,14 @@ def _verify(model, cache, tokens, *, _trace=None):
+ 
+ 
+ def decode(model, first_token, cache, max_new_tokens):
++    if isinstance(cache, RequestCache):
++        cache.retry_slot = None
+     try:
+         return _decode(model, first_token, cache, max_new_tokens)
+     finally:
+         if isinstance(cache, RequestCache):
+             cache.head_panels = None
++            cache.retry_slot = None
+ 
+ 
+ def _decode(model, first_token, cache, max_new_tokens):
+@@ -593,6 +634,14 @@ def _decode(model, first_token, cache, max_new_tokens):
+         # Recompute speculative lookup and capacity decisions after draining.
+         if supported and not pending:
+             drafts = _draft(state, max_new_tokens - len(output))
++            slot, state.retry_slot = state.retry_slot, None
++            retry = False
++            if len(drafts) < 2:
++                retry_drafts = _retry_draft(model, state, slot, max_new_tokens - len(output))
++                if retry_drafts:
++                    drafts, retry = retry_drafts, True
++                del retry_drafts
++            del slot
+             if drafts:
+                 inputs = [token.reshape(1, 1)] + [
+                     mx.array([[d]], dtype=token.dtype) for d in drafts
+@@ -610,14 +659,27 @@ def _decode(model, first_token, cache, max_new_tokens):
+                 rejected = len(drafts) - accepted
+                 for kv in cache:
+                     kv.trim(rejected)
++                if not retry and rejected >= 2:
++                    # p[a] is now pending at C+a+1. Later predictions were
++                    # conditioned on old drafts: proposals, never observations.
++                    state.retry_slot = (cache[0].offset, ids[accepted][0],
++                                        [row[0] for row in ids[accepted + 1:accepted + 1 + MAX_RETRY]])
+                 del inputs, predictions, ids
+                 stats = state.stats
+                 stats["verifications"] += 1
+                 stats["draft_lengths"][len(drafts)] += 1
+                 stats["accepted_lengths"][accepted] += 1
+                 stats["rejected_positions"] += rejected
++                if retry:
++                    stats["retry_attempts"] += 1
++                    stats["retry_proposed_tokens"] += len(drafts)
++                    stats["retry_accepted_proposals"] += accepted
++                    stats["retry_rejected_positions"] += rejected
++                del drafts
+                 continue
+ 
++        if state is not None:
++            state.retry_slot = None
+         logits = model(token.reshape(1, 1), cache=cache)
+         token = mx.argmax(logits[:, -1, :], axis=-1)
+         mx.async_eval(token)
