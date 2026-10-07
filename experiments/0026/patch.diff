@@ -1,0 +1,721 @@
+diff --git a/candidate/checks.py b/candidate/checks.py
+index 487774a..fb1d2e5 100644
+--- a/candidate/checks.py
++++ b/candidate/checks.py
+@@ -722,7 +722,8 @@ def check_grouped(model):
+     _head_checks(model)
+     _head_gate_checks(model, base, pending)
+     _verification_checks(model, base, pending)
+-    _decode_checks(model, base, pending)
++    with patch.object(ci, "load_predictor", return_value=None):
++        _decode_checks(model, base, pending)
+     # Real model prefixes exercise short vector boundaries and unchanged
+     # long-context attention, independent of benchmark prompts/results.
+     for length in (31, 32, 1015, 1021, 1022, 1023, 1024, 1057):
+@@ -742,3 +743,238 @@ def check_grouped(model):
+     assert second.index is not base.index and second.history is not base.history
+     _prefixes(base, second, "independent request")
+     print("Native panel heads, causal attention, grouped rotary/projections, logits, KV and transitions passed.")
++
++
++def check_auxiliary(model):
++    """Active learned proposals and controlled rejection; no benchmark data."""
++    from mlx.utils import tree_flatten
++    predictor = ci.load_predictor(model)
++    assert predictor is not None, "Run python -m candidate.residual_heads before active checks"
++    modules = [(name, id(module)) for name, module in model.named_modules()]
++    parameters = [(name, value, mx.asarray(value, copy=True))
++                  for name, value in tree_flatten(model.parameters())]
++    prompt = [1] + [41 + (i * 17) % 311 for i in range(23)]
++    pending, base = ci.prefill(model, prompt)
++    assert base.feature_offset == len(prompt)
++
++    # Capture the actual native normalized output, including full prefill head
++    # shape, without changing the model object or its arithmetic.
++    captured = []
++    norm_call = nn.RMSNorm.__call__
++
++    def capture_norm(module, x):
++        result = norm_call(module, x)
++        if module is model.model.norm:
++            captured.append(result)
++        return result
++
++    native = make_prompt_cache(model)
++    with patch.object(nn.RMSNorm, "__call__", capture_norm):
++        native_logits = model(mx.array(prompt)[None], cache=native)
++    mx.eval(native_logits)
++    _equal(pending, mx.argmax(native_logits[:, -1, :], axis=-1), "native prefill token")
++    _equal(base.feature, captured[-1][:, -1:, :], "native prefill feature")
++    _prefixes(base, native, "native prefill KV")
++    candidate_cache = make_prompt_cache(model)
++    candidate_logits, candidate_feature = ci._native_forward(
++        model, mx.array(prompt)[None], candidate_cache, True)
++    _equal(candidate_logits, native_logits, "full prompt-shaped head")
++    _equal(candidate_feature, base.feature, "copied prompt feature")
++
++    # Independent singleton oracle, with actual target features for all output
++    # positions. The same target object remains usable by native reference.
++    reference = _clone(model, base, base[0].offset + 48)
++    token = pending
++    oracle, oracle_features = [pending.item()], [base.feature]
++    for _ in range(31):
++        captured.clear()
++        with patch.object(nn.RMSNorm, "__call__", capture_norm):
++            logits = model(token.reshape(1, 1), cache=reference)
++        token = mx.argmax(logits[:, -1, :], axis=-1)
++        mx.eval(token, captured[-1])
++        oracle.append(token.item())
++        oracle_features.append(mx.asarray(captured[-1], copy=True))
++
++    # Every verifier branch exposes native normalized rows. Features must not
++    # change the default prediction-only interface or rounding boundaries.
++    for size, flags in ((2, {}), (3, {}), (7, {}),
++                        (3, {"batch_rows_eligible": False}),
++                        (3, {"grouped_eligible": False}),
++                        (3, {"rotary_eligible": False}),
++                        (3, {"attention_eligible": False}),
++                        (3, {"head_eligible": False})):
++        g, r = _clone(model, base), _clone(model, base)
++        g.append_token(pending.item())
++        for name, value in flags.items():
++            setattr(g, name, value)
++        inputs = [mx.array([[value]], dtype=pending.dtype) for value in oracle[:size]]
++        predictions, features = ci._verify(model, g, inputs, _features=True)
++        for row, input_token in enumerate(inputs):
++            captured.clear()
++            with patch.object(nn.RMSNorm, "__call__", capture_norm):
++                logits = model(input_token, cache=r)
++            _equal(features[row], captured[-1], f"verifier feature/{flags}/row{row}")
++            _equal(predictions[row], mx.argmax(logits[:, -1, :], axis=-1),
++                   f"verifier prediction/{flags}/row{row}")
++        _prefixes(g, r, f"verifier feature capture/{flags}")
++
++    def fresh(capacity=None):
++        state = _clone(model, base, capacity)
++        state.feature = mx.asarray(base.feature, copy=True)
++        state.feature_offset = base.feature_offset
++        return state
++
++    def compare_result(state, length, label):
++        r = _clone(model, base)
++        for value in oracle[:max(0, length - 1)]:
++            mx.eval(model(mx.array([[value]], dtype=pending.dtype), cache=r))
++        _prefixes(state, r, label)
++        assert state.feature is None and state.feature_offset is None
++        assert state.head_panels is None
++
++    # Real trained proposals must actually reach target verification.
++    active = fresh(base[0].offset + 40)
++    with patch.object(ci, "_draft", return_value=[]):
++        assert ci.decode(model, pending, active, 32) == oracle
++    assert active.stats["predictor_calls"] > 0
++    assert active.stats["proposed_tokens"] == 2 * active.stats["predictor_calls"]
++    compare_result(active, 32, "trained auxiliary proposals")
++
++    # Controlled proposal IDs test each acceptance length and consecutive
++    # blocks. They replace only predictions, never target math or KV updates.
++    for acceptance in ((0,), (1,), (2,), (0, 1, 2, 2), (2, 0, 1)):
++        state = fresh(base[0].offset + 40)
++        calls = []
++        original_gate = ci._auxiliary_eligible
++
++        def gate(model_arg, cache_arg, token_arg, remaining):
++            return len(calls) < len(acceptance) and original_gate(
++                model_arg, cache_arg, token_arg, remaining)
++
++        def forced(model_arg, params, feature, current):
++            position = len(state.history) - len(base.history) - 1
++            assert current.item() == oracle[position]
++            assert state.feature_offset == base[0].offset + position
++            _equal(feature, oracle_features[position], "retained accepted target feature")
++            ids = oracle[position + 1:position + 3].copy()
++            a = acceptance[len(calls)]
++            if a < 2:
++                ids[a] = (ids[a] + 1) % 49152
++            calls.append(a)
++            return mx.array(ids, dtype=current.dtype)
++
++        with patch.object(ci, "_draft", return_value=[]), \
++             patch.object(ci, "_auxiliary_eligible", gate), \
++             patch.object(ci, "propose", forced):
++            assert ci.decode(model, pending, state, 32) == oracle
++        assert calls == list(acceptance)
++        assert state.stats["accepted_auxiliary_proposals"] == sum(acceptance)
++        assert state.stats["predictor_calls"] == len(acceptance)
++        for a in set(acceptance):
++            assert state.stats["accepted_lengths"][a] == acceptance.count(a)
++        compare_result(state, 32, f"auxiliary acceptance/{acceptance}")
++
++    # Suffix -> auxiliary -> suffix -> scalar, with a suffix rejection and
++    # corrective feature retention. A one-token suffix is replaced only when
++    # auxiliary eligibility succeeds.
++    state = fresh(base[0].offset + 40)
++    phases = []
++    original_gate = ci._auxiliary_eligible
++
++    def transition_draft(cache, remaining):
++        position = len(cache.history) - len(base.history)
++        if len(phases) == 0:
++            phases.append("suffix")
++            return [oracle[position], (oracle[position + 1] + 1) % 49152]
++        if len(phases) == 1:
++            return [oracle[position]]
++        if len(phases) == 2:
++            phases.append("suffix")
++            return oracle[position:position + 2]
++        return []
++
++    def transition_propose(model_arg, params, feature, current):
++        position = len(state.history) - len(base.history) - 1
++        _equal(feature, oracle_features[position], "suffix corrective feature")
++        phases.append("auxiliary")
++        return mx.array(oracle[position + 1:position + 3], dtype=current.dtype)
++
++    def transition_gate(*args):
++        return len(phases) == 1 and original_gate(*args)
++
++    with patch.object(ci, "_draft", transition_draft), \
++         patch.object(ci, "_auxiliary_eligible", transition_gate), \
++         patch.object(ci, "propose", transition_propose):
++        assert ci.decode(model, pending, state, 32) == oracle
++    assert phases == ["suffix", "auxiliary", "suffix"]
++    assert state.stats["predictor_calls"] == 1
++    assert state.stats["scalar_steps"] > 0
++    compare_result(state, 32, "suffix/auxiliary/scalar transitions")
++
++    # Small budgets and buffer metadata, including cached false decisions.
++    for length in (0, 1, 2, 3, 4, 5):
++        state = fresh(base[0].offset + 40)
++        with patch.object(ci, "_draft", return_value=[]):
++            assert ci.decode(model, pending, state, length) == oracle[:length]
++        assert state.stats["predictor_calls"] == 0 if length < 4 else state.stats["predictor_calls"] > 0
++        compare_result(state, max(1, length), f"small auxiliary budget/{length}")
++    for capacity in (base[0].offset + 2,
++                     (base[0].offset + 5, base[0].offset + 2)):
++        state = fresh(capacity)
++        state.append_token(pending.item())
++        assert not ci._auxiliary_eligible(model, state, pending, 3)
++    for flag in ("batch_rows_eligible", "grouped_eligible"):
++        state = fresh(base[0].offset + 3)
++        state.append_token(pending.item())
++        setattr(state, flag, False)
++        assert not ci._auxiliary_eligible(model, state, pending, 3)
++    for change in ("tag", "layout", "dtype", "offset"):
++        state = fresh(base[0].offset + 3)
++        state.append_token(pending.item())
++        if change == "tag":
++            state.feature_offset -= 1
++        elif change == "layout":
++            state[-1].keys = state[-1].keys[:, :2]
++        elif change == "dtype":
++            state[-1].values = state[-1].values.astype(mx.float32)
++        else:
++            state[-1].offset += 1
++        assert not ci._auxiliary_eligible(model, state, pending, 3), change
++
++    # Failed eligibility must preserve one-token suffix behavior and scalar
++    # capacity growth; independent rotary/attention/head failures still draft.
++    for flag in ("batch_rows_eligible", "grouped_eligible",
++                 "rotary_eligible", "attention_eligible", "head_eligible"):
++        state = fresh(base[0].offset + 3)
++        setattr(state, flag, False)
++        suffix_calls = []
++
++        def one_token(cache, remaining):
++            if suffix_calls:
++                return []
++            suffix_calls.append(True)
++            return [oracle[1]]
++
++        with patch.object(ci, "_draft", one_token):
++            assert ci.decode(model, pending, state, 32) == oracle
++        if flag in ("batch_rows_eligible", "grouped_eligible"):
++            assert state.stats["predictor_calls"] == 0
++            assert state.stats["draft_lengths"][1] == 1
++        else:
++            assert state.stats["predictor_calls"] > 0
++        compare_result(state, 32, f"cached fallback and growth/{flag}")
++
++    # Fresh requests retain no generated state, and native reference still sees
++    # exactly the original modules and weight arrays on the same model object.
++    second_pending, second = ci.prefill(model, prompt)
++    _equal(second_pending, pending, "fresh auxiliary request")
++    _equal(second.feature, base.feature, "fresh prompt feature")
++    for key in ("predictor_calls", "proposed_tokens", "accepted_auxiliary_proposals"):
++        assert second.stats[key] == 0
++    assert second.history is not base.history and second.index is not base.index
++    assert modules == [(name, id(module)) for name, module in model.named_modules()]
++    after = dict(tree_flatten(model.parameters()))
++    for name, value, snapshot in parameters:
++        assert after[name] is value, name
++        _equal(after[name], snapshot, f"unchanged target weight/{name}")
++    print("Trained auxiliary proposals, target features, rejection, KV and request isolation passed.")
+diff --git a/candidate/inference.py b/candidate/inference.py
+index 0d57b7c..8f2a92f 100644
+--- a/candidate/inference.py
++++ b/candidate/inference.py
+@@ -4,6 +4,8 @@ from importlib.metadata import version
+ from mlx_lm.models.cache import KVCache, make_prompt_cache
+ from mlx_lm.models import llama
+ 
++from .residual_heads import load_predictor, propose
++
+ 
+ MAX_CONTEXT = 16
+ MAX_DRAFTS = 16
+@@ -41,7 +43,12 @@ class RequestCache(list):
+         self.attention_eligible = None
+         self.head_eligible = None
+         self.head_panels = None
++        self.feature = None
++        self.feature_offset = None
+         self.stats = {
++            "predictor_calls": 0,
++            "proposed_tokens": 0,
++            "accepted_auxiliary_proposals": 0,
+             "scalar_steps": 0,
+             "verifications": 0,
+             "bulk_verifications": 0,
+@@ -87,13 +94,27 @@ class RequestCache(list):
+         return None
+ 
+ 
++def _native_forward(model, tokens, cache, capture):
++    if not capture:
++        return model(tokens, cache=cache), None
++    # Exactly the native Model body/head decomposition, with original shapes.
++    features = model.model(tokens, cache=cache)
++    head = (model.model.embed_tokens.as_linear if model.args.tie_word_embeddings
++            else model.lm_head)
++    logits = head(features)
++    return logits, mx.asarray(features[:, -1:, :], copy=True)
++
++
+ def prefill(model, token_ids):
+     tokens = mx.array(token_ids)[None]
+     cache = make_prompt_cache(model)
+-    logits = model(tokens, cache=cache)
++    logits, feature = _native_forward(model, tokens, cache, _supported(model, cache))
+     token = mx.argmax(logits[:, -1, :], axis=-1)
+-    mx.eval(token)
+-    return token, RequestCache(cache, token_ids)
++    mx.eval(token, *([] if feature is None else [feature]))
++    state = RequestCache(cache, token_ids)
++    state.feature = feature
++    state.feature_offset = cache[0].offset if feature is not None else None
++    return token, state
+ 
+ 
+ def _supported(model, cache):
+@@ -324,14 +345,7 @@ def _bulk_start(cache, count):
+     return start
+ 
+ 
+-def _verify(model, cache, tokens, *, _trace=None):
+-    """Teacher-forced forwards with grouped projections, rotary and short attention.
+-
+-    tokens contains pending followed by drafts, each with native shape (1, 1).
+-    Each attention reads its own native causal prefix. Eligible blocks append
+-    all singleton K/V results before the read-only attention phase; shorter
+-    blocks retain dependencies protecting reads from subsequent cache writes.
+-    """
++def _verification_layout(model, cache, tokens):
+     start = _bulk_start(cache, len(tokens))
+     if isinstance(cache, RequestCache) and cache.batch_rows_eligible is None:
+         cache.batch_rows_eligible = _batch_supported(model, cache)
+@@ -348,6 +362,30 @@ def _verify(model, cache, tokens, *, _trace=None):
+                        and kv.keys.ndim == kv.values.ndim == 4
+                        and kv.keys.shape[3] == kv.values.shape[3] == 64
+                        for kv in cache))
++    return start, batched, grouped
++
++
++def _auxiliary_eligible(model, cache, token, remaining):
++    if (remaining < 3 or cache.feature is None or not cache
++            or cache.feature_offset != cache[0].offset
++            or len(cache.history) != cache[0].offset + 1):
++        return False
++    # Use precisely the verifier's gates, including cached false decisions,
++    # independently bounded K/V capacity, dtype and grouped buffer layout.
++    start, batched, grouped = _verification_layout(
++        model, cache, [token.reshape(1, 1)] * 3)
++    return start == cache[0].offset and batched and grouped
++
++
++def _verify(model, cache, tokens, *, _trace=None, _features=False):
++    """Teacher-forced forwards with grouped projections, rotary and short attention.
++
++    tokens contains pending followed by drafts, each with native shape (1, 1).
++    Each attention reads its own native causal prefix. Eligible blocks append
++    all singleton K/V results before the read-only attention phase; shorter
++    blocks retain dependencies protecting reads from subsequent cache writes.
++    """
++    start, batched, grouped = _verification_layout(model, cache, tokens)
+     if isinstance(cache, RequestCache) and cache.rotary_eligible is None:
+         cache.rotary_eligible = _rotary_supported(model) if grouped else None
+     rotary = (grouped and cache.rotary_eligible and 0 <= start
+@@ -551,6 +589,7 @@ def _verify(model, cache, tokens, *, _trace=None):
+         else:
+             logit_block = group(body.embed_tokens.weight, norm_block, [norm_block])
+         logits = _rows(logit_block)
++        norm = _rows(norm_block) if _features else None
+     else:
+         if batched:
+             norm = _rows(body.norm(x_block))
+@@ -559,7 +598,8 @@ def _verify(model, cache, tokens, *, _trace=None):
+         logits = _project(head, norm, norm)
+     if _trace is not None:
+         trace("logits", logits)
+-    return [mx.argmax(x[:, -1, :], axis=-1) for x in logits]
++    predictions = [mx.argmax(x[:, -1, :], axis=-1) for x in logits]
++    return (predictions, norm) if _features else predictions
+ 
+ 
+ def decode(model, first_token, cache, max_new_tokens):
+@@ -568,6 +608,8 @@ def decode(model, first_token, cache, max_new_tokens):
+     finally:
+         if isinstance(cache, RequestCache):
+             cache.head_panels = None
++            cache.feature = None
++            cache.feature_offset = None
+ 
+ 
+ def _decode(model, first_token, cache, max_new_tokens):
+@@ -579,6 +621,9 @@ def _decode(model, first_token, cache, max_new_tokens):
+     if state is not None and state.batch_rows_eligible is None:
+         state.batch_rows_eligible = _batch_supported(model, cache)
+     token = first_token
++    feature = state.feature if supported else None
++    feature_offset = state.feature_offset if supported else None
++    predictor = load_predictor(model) if supported else None
+     output = []
+     pending = []
+ 
+@@ -592,48 +637,84 @@ def _decode(model, first_token, cache, max_new_tokens):
+         # While outputs are unread, token and KV are ahead of host history.
+         # Recompute speculative lookup and capacity decisions after draining.
+         if supported and not pending:
++            state.feature, state.feature_offset = feature, feature_offset
+             drafts = _draft(state, max_new_tokens - len(output))
+-            if drafts:
++            auxiliary = (len(drafts) < 2 and predictor is not None
++                         and _auxiliary_eligible(model, state, token,
++                                                 max_new_tokens - len(output)))
++            proposal_ids = None
++            if auxiliary:
++                proposal_ids = propose(model, predictor, feature, token)
++                inputs = [token.reshape(1, 1)] + [
++                    proposal_ids[i:i + 1].reshape(1, 1) for i in range(2)]
++                state.stats["predictor_calls"] += 1
++                state.stats["proposed_tokens"] += 2
++            elif drafts:
+                 inputs = [token.reshape(1, 1)] + [
+-                    mx.array([[d]], dtype=token.dtype) for d in drafts
+-                ]
+-                predictions = _verify(model, cache, inputs)
+-                mx.async_eval(*predictions)
+-                ids = mx.stack(predictions).tolist()
++                    mx.array([[d]], dtype=token.dtype) for d in drafts]
++            else:
++                inputs = None
++            if inputs is not None:
++                start = cache[0].offset
++                predictions, features = _verify(model, cache, inputs, _features=True)
++                # Proposals and target IDs cross to the host at one boundary.
++                all_ids = mx.concatenate([mx.concatenate(predictions)] +
++                                         ([proposal_ids] if auxiliary else []))
++                mx.async_eval(all_ids, *features)
++                ids = all_ids.tolist()
++                if auxiliary:
++                    drafts = ids[len(predictions):]
+                 accepted = 0
+-                while accepted < len(drafts) and drafts[accepted] == ids[accepted][0]:
++                while accepted < len(drafts) and drafts[accepted] == ids[accepted]:
+                     accepted += 1
+                 for value in drafts[:accepted]:
+                     commit(value)
+-                commit(ids[accepted][0])
++                commit(ids[accepted])
+                 token = predictions[accepted]
++                # The corrective/bonus token belongs to this target row, not
++                # the final (possibly rejected) row or an auxiliary residual.
++                feature = mx.asarray(features[accepted], copy=True)
++                mx.async_eval(feature)
++                feature_offset = start + accepted + 1
+                 rejected = len(drafts) - accepted
+                 for kv in cache:
+                     kv.trim(rejected)
+-                del inputs, predictions, ids
++                state.feature, state.feature_offset = feature, feature_offset
++                del inputs, predictions, features, ids, all_ids, proposal_ids
+                 stats = state.stats
+                 stats["verifications"] += 1
+                 stats["draft_lengths"][len(drafts)] += 1
+                 stats["accepted_lengths"][accepted] += 1
+                 stats["rejected_positions"] += rejected
++                if auxiliary:
++                    stats["accepted_auxiliary_proposals"] += accepted
+                 continue
+ 
+-        logits = model(token.reshape(1, 1), cache=cache)
++        logits, next_feature = _native_forward(
++            model, token.reshape(1, 1), cache, supported)
+         token = mx.argmax(logits[:, -1, :], axis=-1)
+-        mx.async_eval(token)
+-        pending.append(token)
++        next_offset = cache[0].offset if supported else None
++        mx.async_eval(token, *([] if next_feature is None else [next_feature]))
++        pending.append((token, next_feature, next_offset))
++        del logits, next_feature
++        # Only bounded queue entries retain scalar features while KV is ahead.
++        feature = None
+         if state is not None:
++            state.feature = None
++            state.feature_offset = None
+             state.stats["scalar_steps"] += 1
+         # Preserve round 0004's submit-successor-before-host-read pipeline.
+         if len(pending) == 2:
+-            commit(pending.pop(0).item())
++            unread, feature, feature_offset = pending.pop(0)
++            commit(unread.item())
+             if supported and (state.history[-1],) in state.index:
+-                for unread in pending:
++                for unread, feature, feature_offset in pending:
+                     commit(unread.item())
+                 pending.clear()
+ 
+-    for unread in pending:
++    for unread, feature, feature_offset in pending:
+         commit(unread.item())
++
+     return output
+ 
+ 
+@@ -650,3 +731,9 @@ def check_grouped(model):
+     """
+     from .checks import check_grouped as run_checks
+     return run_checks(model)
++
++
++def check_auxiliary(model):
++    """Separate active-path checks; requires the trained, fingerprinted heads."""
++    from .checks import check_auxiliary as run_checks
++    return run_checks(model)
+diff --git a/candidate/residual_heads.py b/candidate/residual_heads.py
+new file mode 100644
+index 0000000..a451b57
+--- /dev/null
++++ b/candidate/residual_heads.py
+@@ -0,0 +1,211 @@
++"""Two independent residual horizons; the target and its vocabulary stay frozen.
++
++On a model-capable host, run `python -m candidate.residual_heads` once before
++validation. Training has no access to harness prompts, outputs or timings.
++Only the exported immutable BF16 parameters are used during requests.
++"""
++import hashlib
++import json
++from importlib.metadata import version
++from pathlib import Path
++
++import mlx.core as mx
++import mlx.nn as nn
++
++MODEL_ID = "mlx-community/SmolLM2-135M-Instruct"
++MODEL_REVISION = "422de227b90002f443a21a58b1087f6ee7632731"
++CORPUS = "Salesforce/wikitext"
++CORPUS_REVISION = "b08601e04326c79dfdd32d625aee71d232d685c3"
++ROOT = Path(__file__).resolve().parent
++ARTIFACT = ROOT / "residual_heads.safetensors"
++MANIFEST = ROOT / "residual_heads.manifest.json"
++RECIPE = {
++    "corpus": CORPUS, "corpus_revision": CORPUS_REVISION,
++    "configuration": "wikitext-2-raw-v1", "split": "train",
++    "model": MODEL_ID, "model_revision": MODEL_REVISION,
++    "tokenizer_revision": MODEL_REVISION,
++    "join": "newline", "add_special_tokens": False,
++    "block_length": 128, "blocks": 4096, "selection_seed": 0,
++    "continuation_length": 64, "continue_after_eos": True,
++    "examples_per_block": 62, "examples": 253952,
++    "alignment": "(f_i, embedding(y_i)) -> (y_(i+1), y_(i+2)); i=0..61",
++    "initialization": "zeros", "training_dtype": "float32",
++    "epochs": 3, "shuffle_seed": 0, "batch_size": 256,
++    "optimizer": "AdamW", "learning_rate": 0.001,
++    "betas": [0.9, 0.999], "epsilon": 1e-8, "weight_decay": 0.01,
++    "bias_correction": True, "loss": "mean of two cross entropies",
++    "export_dtype": "bfloat16",
++}
++_PARAMETERS = None
++
++
++def _sha(path):
++    digest = hashlib.sha256()
++    with open(path, "rb") as stream:
++        for block in iter(lambda: stream.read(1024 * 1024), b""):
++            digest.update(block)
++    return digest.hexdigest()
++
++
++def load_predictor(model):
++    global _PARAMETERS
++    if (not model.args.tie_word_embeddings
++            or model.model.embed_tokens.weight.shape != (49152, 576)
++            or model.model.embed_tokens.weight.dtype != mx.bfloat16):
++        return None
++    if _PARAMETERS is not None:
++        return _PARAMETERS
++    if not ARTIFACT.exists() and not MANIFEST.exists():
++        # Training unavailability must not silently install an untrained head.
++        return None
++    manifest = json.loads(MANIFEST.read_text())
++    if (manifest["recipe"] != RECIPE or manifest["training_steps"] != 2976
++            or manifest["artifact_sha256"] != _sha(ARTIFACT)):
++        raise ValueError("Residual-head artifact does not match the frozen recipe")
++    parameters = mx.load(str(ARTIFACT))
++    if (set(parameters) != {"A", "b"}
++            or parameters["A"].shape != (1152, 1152)
++            or parameters["b"].shape != (1152,)
++            or any(p.dtype != mx.bfloat16 for p in parameters.values())):
++        raise ValueError("Invalid residual-head parameters")
++    mx.eval(parameters)
++    _PARAMETERS = parameters
++    return parameters
++
++
++def _residual(parameters, z, embedding):
++    u = mx.concatenate([z, embedding], axis=-1) @ parameters["A"].T + parameters["b"]
++    u = u.reshape(-1, 2, 576)
++    return z[:, None, :] + nn.silu(u)
++
++
++def propose(model, parameters, feature, token):
++    z = feature.reshape(1, 576)
++    embedding = model.model.embed_tokens(token.reshape(1)).reshape(1, 576)
++    rows = _residual(parameters, z, embedding).reshape(2, 576)
++    # A single two-row projection; no target KV writes or token host reads.
++    logits = model.model.embed_tokens.as_linear(rows)
++    return mx.argmax(logits, axis=-1).astype(token.dtype)
++
++
++def train():
++    """Fixed corpus-only training and atomic, fingerprinted artifact export."""
++    import tempfile
++    import numpy as np
++    import mlx.optimizers as optim
++    from datasets import load_dataset
++    from huggingface_hub import snapshot_download
++    from mlx_lm import load
++    from mlx_lm.models.cache import make_prompt_cache
++    from mlx.utils import tree_flatten
++    from .inference import _native_forward, _grouped_supported
++
++    if ARTIFACT.exists() or MANIFEST.exists():
++        raise FileExistsError("Remove both existing artifacts explicitly before retraining")
++    # Every temporary training/cache file is inside candidate and is removed,
++    # including on failure. No training examples survive artifact handoff.
++    with tempfile.TemporaryDirectory(prefix=".residual-training-", dir=ROOT) as directory:
++        temporary = Path(directory)
++        snapshot = Path(snapshot_download(MODEL_ID, revision=MODEL_REVISION,
++                                         cache_dir=temporary / "hub"))
++        model, tokenizer = load(str(snapshot))
++        weights_before = {name: _sha(path) for name, path in
++                          ((str(p.relative_to(snapshot)), p)
++                           for p in sorted(snapshot.rglob("*")) if p.is_file())}
++        identities = [id(module) for _, module in model.named_modules()]
++
++        def target_hashes():
++            return {name: hashlib.sha256(np.asarray(value.view(mx.uint16)).tobytes()).hexdigest()
++                    for name, value in tree_flatten(model.parameters())}
++
++        arrays_before = target_hashes()
++        assert _grouped_supported(model, make_prompt_cache(model))
++        target_weight = model.model.embed_tokens.weight.astype(mx.float32)
++        dataset = load_dataset(CORPUS, "wikitext-2-raw-v1", split="train",
++                               revision=CORPUS_REVISION, cache_dir=str(temporary / "corpus"))
++        text = "\n".join(dataset["text"])
++        tokens = np.asarray(tokenizer.encode(text, add_special_tokens=False), dtype=np.int32)
++        selected = np.random.default_rng(0).choice(len(tokens) // 128, 4096, replace=False)
++        # Disk-backed feature storage bounds RAM during frozen-target generation.
++        features = np.memmap(temporary / "features.bin", mode="w+", dtype=np.float32,
++                             shape=(4096, 62, 576))
++        generated = np.memmap(temporary / "generated.bin", mode="w+", dtype=np.int32,
++                              shape=(4096, 64))
++        for block_index, span in enumerate(selected):
++            cache = make_prompt_cache(model)
++            prompt = mx.array(tokens[span * 128:(span + 1) * 128])[None]
++            logits, feature = _native_forward(model, prompt, cache, True)
++            token = mx.argmax(logits[:, -1, :], axis=-1)
++            for i in range(64):
++                mx.eval(token, feature)
++                generated[block_index, i] = token.item()
++                if i < 62:
++                    features[block_index, i] = np.asarray(feature.reshape(576).astype(mx.float32))
++                if i < 63:
++                    logits, feature = _native_forward(model, token.reshape(1, 1), cache, True)
++                    token = mx.argmax(logits[:, -1, :], axis=-1)
++            del logits, feature, token, cache, prompt
++            if (block_index + 1) % 128 == 0:
++                print(f"Frozen continuations: {block_index + 1}/4096", flush=True)
++        features.flush()
++        generated.flush()
++        feature_hash = _sha(temporary / "features.bin")
++        continuation_hash = _sha(temporary / "generated.bin")
++        parameters = {"A": mx.zeros((1152, 1152), dtype=mx.float32),
++                      "b": mx.zeros((1152,), dtype=mx.float32)}
++        optimizer = optim.AdamW(learning_rate=1e-3, betas=[0.9, 0.999], eps=1e-8,
++                               weight_decay=0.01, bias_correction=True)
++
++        def loss(params, z, pending, labels):
++            rows = _residual(params, z, target_weight[pending])
++            logits = rows @ target_weight.T
++            return nn.losses.cross_entropy(logits, labels, reduction="mean")
++
++        value_and_grad = mx.value_and_grad(loss)
++        shuffle = np.random.default_rng(0)
++        flat_features = features.reshape(253952, 576)
++        steps = 0
++        for epoch in range(3):
++            order = shuffle.permutation(253952)
++            for lo in range(0, len(order), 256):
++                indices = order[lo:lo + 256]
++                blocks, positions = indices // 62, indices % 62
++                z = mx.array(np.asarray(flat_features[indices]))
++                pending = mx.array(np.asarray(generated[blocks, positions]))
++                labels = mx.array(np.stack([generated[blocks, positions + 1],
++                                            generated[blocks, positions + 2]], axis=1))
++                value, gradients = value_and_grad(parameters, z, pending, labels)
++                parameters = optimizer.apply_gradients(gradients, parameters)
++                mx.eval(parameters, optimizer.state, value)
++                steps += 1
++            print(f"Epoch {epoch + 1}/3 complete", flush=True)
++        assert steps == 2976
++        assert all(p.dtype == mx.float32 for p in parameters.values())
++        assert identities == [id(module) for _, module in model.named_modules()]
++        assert weights_before == {name: _sha(snapshot / name) for name in weights_before}
++        assert arrays_before == target_hashes()
++        export = temporary / ARTIFACT.name
++        mx.save_safetensors(str(export), {k: v.astype(mx.bfloat16) for k, v in parameters.items()})
++        manifest = {
++            "recipe": RECIPE, "training_steps": steps,
++            "selected_spans": [[int(i) * 128, (int(i) + 1) * 128] for i in selected],
++            "dataset_fingerprint": dataset._fingerprint,
++            "corpus_text_sha256": hashlib.sha256(text.encode()).hexdigest(),
++            "token_ids_sha256": hashlib.sha256(tokens.tobytes()).hexdigest(),
++            "features_sha256": feature_hash, "continuations_sha256": continuation_hash,
++            "target_and_tokenizer_files": weights_before, "target_arrays_sha256": arrays_before,
++            "versions": {name: version(name) for name in
++                         ("mlx", "mlx-lm", "numpy", "datasets", "huggingface-hub", "transformers")},
++            "artifact_sha256": _sha(export), "artifact_bytes": export.stat().st_size,
++            "parameter_bytes": 2656512,
++        }
++        manifest_file = temporary / MANIFEST.name
++        manifest_file.write_text(json.dumps(manifest, indent=2) + "\n")
++        # Release mappings before TemporaryDirectory removes their backing data.
++        del flat_features, features, generated
++        export.replace(ARTIFACT)
++        manifest_file.replace(MANIFEST)
++
++
++if __name__ == "__main__":
++    train()

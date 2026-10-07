@@ -1,0 +1,94 @@
+{
+  "round": "0026",
+  "parent_commit": "02c1f586c9e55d50f557423d126c7d65082d1937",
+  "models": {
+    "research": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "review": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "implementation": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    }
+  },
+  "status": "rejected",
+  "research": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Parallel drafting with two trained residual heads",
+      "idea": "Train a small, separate predictor that uses the target\u2019s already-computed final hidden vector and known pending token to propose two future tokens simultaneously. Preserve suffix drafts of length at least two. Otherwise, verify the two proposals through the existing exact verifier.",
+      "cost_removed": "Successful drafts amortize target traversals without auxiliary transformer passes, attention, or KV updates. On the eligible panelled path, accepting both proposals replaces three scalar forwards containing 633 projection calls with one 222-call verification plus two auxiliary projections. Target arithmetic for verified positions remains. The proposed auxiliary parameters occupy 2,656,512 BF16 bytes; the auxiliary vocabulary projection reuses the existing weights and adds real work.",
+      "source_evidence": "candidate/inference.py:121 caps suffix drafts by matched-context length, while _bulk_start requires at least three verification positions. Weak matches therefore miss the efficient grouped path. At :537 the verifier already computes normalized hidden vectors but returns only predictions; :621 similarly discards scalar hidden features. The installed llama.Model.__call__ exposes the same body-then-head decomposition. The existing tied head is [49152,576], occupying 56,623,104 BF16 bytes. [Medusa-1](https://arxiv.org/html/2401.10774v3) supports separately trained residual future-token heads over a frozen backbone; [EAGLE](https://arxiv.org/abs/2401.15077) motivates conditioning on the known next token. This smaller predictor with a shared frozen vocabulary head remains an untested design.",
+      "generalization": "A shallow auxiliary predictor can replace expensive autoregressive drafting across large decoder-only models. Its learned storage grows as O(hidden_size\u00b2), and it uses ordinary matrix multiplication, activation functions, and exact verification. No target changes, custom kernels, or cross-request generated state are required.",
+      "risk": "Two parallel predictions may have insufficient joint greedy agreement, particularly with a frozen shared vocabulary head. Training quality and distribution shift matter. The additional vocabulary projection and feature bookkeeping may outweigh verification savings. Incorrect feature alignment across acceptance or scalar pipelining could degrade proposals; target tokens and retained KV must still follow the existing exact path.",
+      "history_relation": "Round 0025 tested full-depth four-bit drafting and obtained 0.997x. This removes its sequential 30-layer auxiliary passes and temporary KV writes entirely. Rounds 0012 and 0024 tested cached predictions and value-vector retrieval, not learned future-token mappings. Preserve all accepted verifier optimizations and the existing longer suffix drafts."
+    },
+    "plan": "1. Implement and train only auxiliary components inside candidate/. Use a pinned revision of Salesforce/wikitext, wikitext-2-raw-v1, train split. With seed 0, select 4096 disjoint 128-token spans and generate 64-token frozen-target greedy continuations. Collect normalized target features, their predicted pending tokens, and the following two tokens as labels. Freeze this data recipe before evaluation. Train for three epochs with AdamW, learning rate 1e-3, batch size 256, and equal cross-entropy losses. Never use harness prompts, benchmark outputs, timings, or request-time training. Deliver a fingerprinted trained artifact before benchmarking; unavailable training is an implementation limitation, not a measured failure.\n\n2. For normalized feature z and pending-token embedding e, compute u=A\u00b7concat(z,e)+b, where A has shape [1152,1152]. Reshape u into two 576-element rows and form z_j=z+SiLU(u_j). Project both rows together through the unchanged, frozen vocabulary matrix and take their argmax proposals. Only A and b are trained. Keep the predictor separate from target modules; auxiliary arithmetic need not match reference arithmetic.\n\n3. Retain the final prompt feature during the unchanged prefill computation, without running the predictor. Expose existing normalized features from scalar body/head execution and _verify without recomputation or changed target operations. Carry each scalar prediction\u2019s feature alongside it in the existing pending queue. After verification accepts a drafts, retain normalized feature a, which produced the new pending prediction. Discard rejected features.\n\n4. At an existing drained boundary, obtain the ordinary suffix draft first. Preserve drafts containing at least two tokens. Otherwise require a trained predictor, aligned feature state, actual grouped-verifier eligibility, at least three remaining output slots, and capacity for pending plus two proposals. Generate both proposals on device and pass [pending,d0,d1] into the unchanged verifier. Materialize proposal IDs and target predictions together at its existing completion boundary. Failed eligibility retains ordinary behavior.\n\n5. Preserve exact prefix acceptance, corrective/bonus emission, and rollback to C+a+1. Keep all generated-token feature handling and prediction work inside decode. Preserve scalar draining, fixed-length generation, and request isolation. Add separate counters for predictor calls, proposed tokens, and accepted proposals.\n\n6. Validate unchanged target parameters, feature alignment, all three acceptance lengths, consecutive blocks, scalar transitions, capacity limits, and small budgets. Exercise trained proposals separately from legacy verifier fixtures. Compare emitted tokens and retained KV against singleton reference execution. Have the orchestrator perform authoritative exact-token evaluation and both benchmark confirmations against the current best; retain only the required clear improvement without subsequent benchmark-based tuning.",
+    "reason": "This tests a substantially cheaper learned drafter than round 0025 while retaining the established exact verifier. The mechanism is practical and removes substantial scheduling and repeated weight-access opportunities; acceptance and net throughput remain genuine experimental questions."
+  },
+  "review": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Parallel drafting with two trained residual heads",
+      "idea": "Train a separate shallow predictor that consumes an already-computed normalized target feature and its known pending token, then proposes two future tokens simultaneously. Preserve suffix drafts containing at least two tokens. Otherwise, verify eligible auxiliary proposals through the existing target verifier.",
+      "cost_removed": "Each auxiliary block pays one residual projection, one two-row vocabulary projection, and a three-position target verification to emit one to three tokens. When both proposals match, the eligible panelled verifier uses 222 target projection invocations instead of 633 across three scalar forwards, plus two auxiliary projection invocations. This reduces scheduling and creates opportunities to amortize weight reads; it does not remove target arithmetic for verified positions. Auxiliary parameters occupy 2,656,512 BF16 bytes. Embedding lookup, two vocabulary predictions, feature retention, rejected positions, and transfers remain real costs. The current baseline can also use one-token suffix drafts, so the scalar comparison is illustrative.",
+      "source_evidence": "Verified that [candidate/inference.py](candidate/inference.py:121) caps suffix drafts by matched-context length, requires at least three positions for bulk verification, and already computes the required normalized features. Installed mlx-lm 0.32.0 exposes the unchanged body-then-head decomposition. The pinned checkpoint confirms 30 layers and a tied BF16 [49152,576] vocabulary matrix. [harness/bench.py](harness/bench.py:20) synchronizes around decode and shares the model object between implementations. [Medusa-1](https://arxiv.org/html/2401.10774v3) supports frozen-backbone residual heads, but trains separate vocabulary heads. [EAGLE](https://arxiv.org/html/2401.15077v3) motivates conditioning on the known next token. Neither establishes this smaller shared-head predictor\u2019s acceptance or speed.",
+      "generalization": "A fixed number of shallow learned predictors requires O(hidden_size\u00b2) additional parameters and avoids sequential auxiliary transformer passes and auxiliary KV state. Standard dense operations and exact verification can apply to larger decoder-only models independently of hardware, kernels, or compilers. Benefits depend on acceptance and amortized target weight access.",
+      "risk": "The frozen shared vocabulary head and independent horizon predictions may give poor joint agreement. Training distribution, BF16 export, vocabulary projection costs, and reduced scalar overlap may outweigh savings. Feature capture must preserve target computation and bounded buffer lifetimes. Misaligned features hurt drafting; emitted tokens and retained KV must remain determined exclusively by target verification.",
+      "history_relation": "Round 0025 actually tested full-depth four-bit drafting and achieved 0.997x. This replaces its sequential 30-layer auxiliary passes and temporary KV writes with shallow parallel predictions. Rounds 0012 and 0024 tested prediction recycling and value-vector retrieval, not trained future-token mappings. Preserve all accepted verifier optimizations and existing multi-token suffix drafts."
+    },
+    "plan": "1. Implement only inside candidate/. Keep the predictor separate from target modules and optimizer parameters. For normalized target feature z and unchanged pending-token embedding e, compute u=A\u00b7concat(z,e)+b, with A shaped [1152,1152] and b shaped [1152]. Reshape u into two 576-element rows, form q_j=z+SiLU(u_j), and project both rows together through the unchanged tied vocabulary matrix. Their argmax IDs are proposals only. Do not add another normalization or require auxiliary arithmetic to match target arithmetic.\n\n2. Freeze the training recipe before evaluation. Use Salesforce/wikitext, wikitext-2-raw-v1, train split at revision b08601e04326c79dfdd32d625aee71d232d685c3, verified in the [pinned dataset](https://huggingface.co/datasets/Salesforce/wikitext/tree/b08601e04326c79dfdd32d625aee71d232d685c3/wikitext-2-raw-v1). Join text rows in dataset order with newlines, tokenize with the pinned target tokenizer without added special tokens, and partition into nonoverlapping 128-token blocks. Select 4096 blocks without replacement using NumPy default_rng(0). Generate exactly 64 frozen-target greedy tokens per block using native scalar decode, including continuation after EOS. No benchmark prompts, outputs, timings, or request-time training may enter this process.\n\n3. Make label alignment explicit. If generated tokens are y0\u2026y63, let f_i be the normalized target feature that produced y_i. Train on (f_i, embedding(y_i)) with labels (y_(i+1), y_(i+2)) for i=0\u202661: 62 examples per continuation and 253,952 examples total. Never cross continuation boundaries. Initialize A and b to zero; optimize only these parameters in FP32 for three epochs, with seeded shuffling, batch size 256, and the mean of the two cross-entropy losses. Use AdamW with learning rate 1e-3, betas (0.9,0.999), epsilon 1e-8, weight decay 0.01, and bias correction enabled. Frozen target values may be converted to FP32 for auxiliary training without modifying the target. Export the final checkpoint to BF16. Deliver a fingerprinted artifact and manifest recording corpus, target/tokenizer revisions, selected spans, seeds, settings, versions, and hashes before authoritative evaluation. Remove temporary training data before handoff. Unavailable training is an implementation limitation, not a performance result; do not substitute an untrained predictor.\n\n4. Capture features without recomputation or target changes. On the supported native model, execute the existing body and unchanged head with their original shapes, including the full prompt-shaped head during prefill. Retain only the final prompt feature; do not run the predictor or embed the generated pending token during prefill. Preserve the original model-call fallback elsewhere. Expose the already-computed final normalized rows from every verifier branch, including ordinary suffix verification. Keep the default verifier interface usable by existing checks.\n\n5. Carry each scalar prediction\u2019s target feature and processed-prefix length alongside it in the existing bounded pending queue. Preserve submit-successor-before-host-read ordering and the current draining policy. Draft only when the queue is empty. At a drained boundary with history H and common KV offset C, require len(H)=C+1: KV represents H[:C], pending is H[C], and the paired feature was computed from H[:C] and is tagged C. Do not use auxiliary residual rows as retained target features.\n\n6. Obtain the unchanged suffix draft first and preserve it whenever its length is at least two. Otherwise require the trained artifact, aligned feature, at least three remaining output slots, and capacity for C+3 across every key and value buffer. Require _bulk_start(cache,3)==C and the verifier\u2019s actual batched/grouped eligibility, including cached false flags, BF16 cache dtype, and layout. Preserve independent rotary, attention, and head fallbacks. Failed eligibility retains ordinary behavior, including one-token suffix drafts. Construct both auxiliary IDs on device and pass [pending,d0,d1] to the existing verifier without intermediate token host reads or any auxiliary KV mutation.\n\n7. Materialize both proposal IDs and all three target predictions together at the existing verification completion boundary. Let a be the consecutive matching-prefix length, from zero through two. Commit drafts[:a] followed by target prediction p_a, retain p_a with target normalized feature f_a, and trim exactly 2-a KV positions after completion. The new offset and feature tag are C+a+1. Apply the same feature-selection rule to suffix blocks of arbitrary length. Discard rejected features; retaining the last verifier row is incorrect after rejection. Preserve fixed-length output and existing acceptance arithmetic.\n\n8. Keep all generated-token-dependent embedding, prediction, feature handling, verification, transfers, bookkeeping, and cleanup inside decode. Only immutable trained parameters may persist across requests; reset features, queues, proposals, counters, and other request state. Retain bounded feature storage and release obsolete prompt/block references. Add request-local counters for predictor calls, proposed tokens, and accepted auxiliary proposals, excluding corrective/bonus tokens.\n\n9. Validate unchanged target weights and module identities, including reference execution on the same model object. Check captured prefill/scalar features and verifier rows against native target execution. Exercise actual trained proposals and separate forced cases for all three acceptance lengths, consecutive blocks, transitions among auxiliary/suffix/scalar paths, small budgets, capacity growth, unequal capacity bounds, cached eligibility failures, and fresh requests. Compare emitted tokens and retained KV with singleton reference execution. Isolate legacy verifier fixtures from auxiliary activation and require separate active-path checks. Have the orchestrator perform authoritative exact-token evaluation and both benchmark confirmations against the current best. Keep only exact output with at least 1.03x improvement in each confirmation, without benchmark-based retraining or policy tuning.",
+    "reason": "No fundamental flaw was found. Review clarifies training labels, feature ownership, unchanged target forward shapes, eligibility, timing, and auxiliary costs. Independent in-memory checks using current drafting helpers and installed cache logic passed 320 acceptance/KV cases, 351 simulated decodes, and 248 training-alignment cases. These establish bookkeeping only; native BF16 parity, trained acceptance, and throughput remain for evaluation."
+  },
+  "implementation": {
+    "outcome": "implemented",
+    "summary": "Implemented residual-head drafting, aligned feature retention, exact-verifier rollback, fixed training/export pipeline, and separate active-path checks. Only candidate/ changed; syntax and diff checks pass. MLX cannot initialize Metal locally, so no trained artifact was produced. Run `python -m candidate.residual_heads` on a model-capable host before authoritative evaluation."
+  },
+  "eval": {
+    "correct": true,
+    "cases": [
+      {
+        "prompt": "Explain why the sky is blue.",
+        "correct": true
+      },
+      {
+        "prompt": "Write a short Python function that reverses a list.",
+        "correct": true
+      },
+      {
+        "prompt": "What are the main causes of inflation?",
+        "correct": true
+      },
+      {
+        "prompt": "Describe how photosynthesis works.",
+        "correct": true
+      },
+      {
+        "prompt": "Continue this story: The door opened and nobody was there.",
+        "correct": true
+      },
+      {
+        "prompt": "<benchmark>",
+        "correct": true
+      }
+    ]
+  },
+  "confirmations": [
+    {
+      "baseline_relative_decode_speed": 2.6174412756228715,
+      "candidate_relative_decode_speed": 2.624533367409091,
+      "gain": 1.0027095514433393
+    },
+    {
+      "baseline_relative_decode_speed": 2.62859665059524,
+      "candidate_relative_decode_speed": 2.627886812155227,
+      "gain": 0.9997299553585551
+    }
+  ],
+  "confirmed_gain": 0.9997299553585551,
+  "reason": "decode gain was not >= 1.03x twice"
+}
