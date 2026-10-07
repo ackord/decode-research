@@ -1,0 +1,94 @@
+{
+  "round": "0025",
+  "parent_commit": "333c611fd1dc6cff38e529d5ffa3004ea55550dc",
+  "models": {
+    "research": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "review": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "implementation": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    }
+  },
+  "status": "rejected",
+  "research": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Four-bit auxiliary drafting with shared KV storage",
+      "idea": "When suffix lookup supplies fewer than two tokens, generate up to four proposals using a separate four-bit approximation of the target. Reuse the exact committed KV prefix, append temporary draft KV, then rewind and overwrite those entries through the unchanged exact verifier. Preserve existing longer suffix drafts.",
+      "cost_removed": "Successful proposals replace several sequential BF16 target traversals with one grouped verification plus inexpensive auxiliary passes. The checkpoint\u2019s 211 projection matrices occupy 268,959,744 BF16 bytes; four-bit affine copies with BF16 scale/bias per 64 weights occupy 75,644,928 bytes. This reduces each auxiliary weight sweep by 71.875%. Shared KV avoids a separate draft prefill, persistent draft cache, and catch-up computation. Target verification arithmetic remains, and auxiliary passes add work; net savings depend on acceptance and weight reuse.",
+      "source_evidence": "candidate/inference.py:_draft caps proposals by matched-context length, while _bulk_start excludes blocks shorter than three positions. Thus weak suffix matches cannot use the efficient grouped verifier. _decode already passes token tensors into _verify and jointly materializes predictions. Inspection of the pinned safetensors header confirms the matrix sizes above. Installed KVCache.update_and_fetch writes only the appended interval, and trim changes the offset, supporting temporary-tail reuse. [ML-SpecQD](https://arxiv.org/abs/2503.13565) motivates quantized auxiliary drafting; [SubSpec \u00a74.1](https://arxiv.org/html/2509.18344v1) describes sharing target KV and overwriting draft entries during verification. Their performance results do not establish a gain here.",
+      "generalization": "Quantized auxiliary drafting can supply continuations absent from request history without training or changing the target. Reduced auxiliary weight traffic matters increasingly for large, bandwidth-bound decoders. The mechanism uses ordinary quantization, autoregression, cache append/rewind, and exact verification; it requires no custom kernels or particular hardware.",
+      "risk": "Four additional full-depth draft passes may outweigh verification savings, especially for this small target. Quantization may yield poor acceptance. Additional weights consume about 75.6 MB. Incorrect asynchronous ordering or incomplete overwrite could contaminate retained KV; every emitted token must still pass the existing exact verifier.",
+      "history_relation": "No prior round tested a neural auxiliary drafter. Round 0002 used quantization for vocabulary certification, a different mechanism. Rounds 0015 and 0024 tested count-based gating and continuation retrieval, respectively. Preserve the accepted multi-token suffix policy and all verifier improvements; test neural drafting only where suffix lookup provides fewer than two proposals."
+    },
+    "plan": "1. Implement only inside candidate/. Prepare separate four-bit affine projection weights during prefill, with group size 64 and BF16 scales/biases. Preserve the target\u2019s modules, weights, prompt forward, and first token. The auxiliary forward uses original embedding lookups, normalization and RoPE, with separate quantized linear projections and output head. Perform no drafting before decode.\n2. Freeze the maximum auxiliary draft length at four. At an existing drained boundary, retain ordinary drafts of length at least two. Otherwise let C be the common offset, R the remaining output allowance, and A the minimum KV capacity. Set k=min(4,R-1,A-C-1). Require k>=2 and existing grouped-verifier eligibility; otherwise retain current behavior.\n3. Generate k auxiliary proposals sequentially using device-resident token tensors. Append approximate KV only at positions C onward, without changing committed history or the prefix below C. After constructing all proposals, restore offsets to C. Gate subsequent cache writes on completion of the final auxiliary prediction, using explicit consumed dependencies; introduce no per-token host reads.\n4. Invoke the unchanged _verify on [pending,*drafts]. Its exact bulk append must overwrite the entire approximate interval before target attention reads it. Materialize auxiliary IDs and target predictions together at the existing verification boundary. Accept consecutive equal tokens, emit the corrective or bonus prediction, and trim k-a entries, leaving offset C+a+1.\n5. Add counters for auxiliary passes, proposed tokens and accepted drafts. Validate unchanged target parameters, prefix preservation, completion dependencies, every acceptance boundary, unequal capacities, poisoned tails, short budgets, scalar transitions and independent requests. Compare emitted tokens and retained KV against singleton reference execution on independent inputs; auxiliary logits themselves need not match.\n6. Have the orchestrator run native validation, authoritative exact-token evaluation and both throughput confirmations against the current best. Record activation and acceptance separately. Freeze the policy before evaluation and retain only the required clear improvement.",
+    "reason": "This tests an unresolved mechanism with substantial potential weight-traffic savings while retaining exact target verification. In-memory checks using the installed KVCache logic with NumPy passed 432 temporary-tail/rollback configurations and 1,800 causal-prefix checks. Native correctness, acceptance quality and throughput remain unmeasured."
+  },
+  "review": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Four-bit auxiliary drafting with shared KV storage",
+      "idea": "At an existing drained decoding boundary, preserve suffix drafts containing at least two tokens. Otherwise, generate two to four proposals using separate four-bit projection weights and the exact committed KV prefix. Rewind the temporary draft tail and overwrite it through the unchanged exact verifier before accepting any proposals.",
+      "cost_removed": "For k proposals and a accepted drafts, pay k auxiliary forwards plus one k+1-position target verification to emit a+1 tokens. The potential saving is reduced auxiliary weight traffic and amortized target weight reads. The 210 layer matrices plus tied output matrix occupy 268,959,744 BF16 bytes; four-bit packing with BF16 scale/bias per 64 weights occupies 75,644,928 bytes, or 28.125% of that payload. These are storage sizes, not measured traffic or latency. Auxiliary attention, KV traffic, full-depth computation, verification and synchronization remain. Shared KV avoids a persistent second cache and draft catch-up; avoiding draft prefill provides no scored benefit.",
+      "source_evidence": "Verified that candidate/inference.py:_draft caps proposals by matched-context length, _bulk_start requires at least three positions and sufficient existing capacity, and _verify accepts device-resident token tensors. The pinned checkpoint header confirms the matrix counts and sizes. Installed mlx-lm 0.32.0 KVCache updates the appended interval when capacity suffices; trim changes only the offset. harness/bench.py synchronizes before timing and after decode, and alternates implementations using the same model object. Quantized auxiliary drafting is supported by [ML-SpecQD](https://arxiv.org/abs/2503.13565), which uses a different quantization format. Target-prefix sharing followed by replacement of draft KV is described in [SubSpec \u00a74.1](https://arxiv.org/html/2509.18344v1#S4.SS1), whose results concern offloaded models. Neither establishes acceptance or speed here.",
+      "generalization": "Compressed auxiliary weights can supply continuations absent from request history and reduce weight traffic in large bandwidth-bound decoders. The mechanism uses ordinary quantization, autoregression, causal verification and reversible caches. It requires no custom kernel or particular hardware, but adds substantial weight storage and does not reduce attention costs.",
+      "risk": "Full-depth drafting, poor acceptance, temporary buffer lifetimes and additional KV traffic may outweigh verification savings. The auxiliary model uses a hybrid history of exact prefix KV and approximate appended KV, so standalone quantized-model quality does not establish acceptance. Offset rollback alone does not ensure completion of asynchronous cache reads. Every retained KV entry must come from exact verification, whose native parity must also hold for the new draft sequences.",
+      "history_relation": "No supplied round tested a neural auxiliary drafter. Round 0002 used quantization for vocabulary certification; rounds 0015 and 0024 tested different drafting policies. Those results do not resolve this mechanism. Round 0001's exactness failure reinforces preserving the accepted verifier arithmetic. Retain all existing multi-token suffix drafts and accepted verification optimizations."
+    },
+    "plan": "1. Implement only inside candidate/. Freeze affine four-bit quantization, group size 64, BF16 scales/biases and maximum auxiliary draft length four. During prefill, prepare and evaluate a separate request-owned sidecar containing quantized copies of the 211 matrices. Quantize original BF16 arrays directly and use packed quantized matrix multiplication during auxiliary inference. Keep original embedding lookups, normalization and RoPE read-only. Do not quantize the target in place or replace modules through a shallow copy. Preserve the prompt forward and first-token selection; perform no auxiliary forward or generated-token-dependent preparation before decode.\n\n2. At an existing boundary with no unread scalar outputs, obtain the unchanged ordinary draft first. Preserve it immediately when its length is at least two. Otherwise require history H, common offset C, len(H)=C+1, and exact cache contents for H[:C], with H[C] pending. Let R be remaining output slots and A the minimum capacity across every key and value buffer. Set k=min(4,R-1,A-C-1). Require k>=2, _bulk_start(cache,k+1)==C, and the verifier's actual batched/grouped eligibility, including cached flags, BF16 dtype and cache layout. Preserve independent rotary, attention and head fallbacks. Failed eligibility retains ordinary behavior, including one-token drafts. Preserve the existing scalar pipeline and its draining policy.\n\n3. Perform exactly k auxiliary singleton forwards, consuming pending,d0,...,d(k-2) to produce d0,...,d(k-1). Chain and submit predictions as device tensors without token host reads. Capture each pass's RoPE offsets and causal endpoints when constructing it. Append approximate BF16 KV only in [C,C+k), reading bounded causal prefixes and leaving positions below C unchanged. Do not process the final proposal through an additional auxiliary pass. Do not update committed history or its suffix index.\n\n4. After constructing the proposals, each cache offset must be C+k. Rewind every offset to C. Gate the verifier's consumed token inputs on completion of the final auxiliary prediction, using the returned dependency-wrapped arrays; this must transitively precede every target cache write. A discarded dependency operation or Python offset reset is insufficient. Invoke unchanged _verify on [pending,*drafts]. Each layer must overwrite [C,C+k+1) with exact KV before its attention reads that interval. Decide normal fallbacks before auxiliary mutation; never continue exact decoding from a partially constructed auxiliary round.\n\n5. Materialize all k auxiliary IDs and k+1 target predictions together at one verification boundary. Let a be the longest consecutive matching prefix. Commit drafts[:a] followed by prediction[a], retain that prediction tensor as pending, and trim k-a entries from every cache. The resulting offset is C+a+1 and the retained prefix must equal the new committed history excluding its final token. Release temporary graph references after completion. Preserve fixed-length generation, including continuation after EOS. All drafting, verification, dependencies, transfers, bookkeeping and generated-state cleanup belong inside decode.\n\n6. Add request-local counters for auxiliary blocks, forwards, proposed tokens and accepted draft tokens, excluding corrective/bonus tokens. Validate that target parameters and module identities remain unchanged, including reference execution on the same model object. On independent inputs, exercise k=2,3,4 and every acceptance length using forced proposals as well as the real auxiliary path. Compare exact verifier logits, emitted tokens and retained KV against singleton target execution. Check prefix preservation immediately after drafting, poisoned tails, independently bounded unequal capacities, insufficient capacity, short budgets, consecutive rounds, attention-boundary crossings and transitions among auxiliary, suffix and scalar execution. Test scalar allocation growth with normal matching key/value capacities. Keep legacy verifier-only fixtures isolated from new drafting, and add separate active-path tests.\n\n7. Confirm fresh request state and zero auxiliary forwards during prefill or zero/one-token decode. Have the orchestrator run native validation, authoritative exact-token evaluation and both throughput confirmations against the current best. Freeze the policy before evaluation; do not tune it using benchmark prompts or results. Record activation, acceptance, correctness and performance separately. Retain only a gain of at least 1.03x in both confirmations.",
+    "reason": "No fundamental flaw was found. Independent NumPy checks using the installed cache logic passed 576 acceptance/rollback cases, 888 scalar continuation steps and 2,880 budget/capacity cases. These establish bookkeeping only. Native MLX validation was blocked by unavailable Metal access; exact BF16 parity, acceptance and throughput remain for authoritative evaluation."
+  },
+  "implementation": {
+    "outcome": "implemented",
+    "summary": "Implemented request-owned four-bit drafting with shared KV, dependency-gated exact verification, suffix-draft preservation, cleanup and counters. Added separate native active-path checks. Syntax and diff checks passed; native validation was unavailable because MLX could not initialize Metal. Only candidate/ changed; no commits made."
+  },
+  "eval": {
+    "correct": true,
+    "cases": [
+      {
+        "prompt": "Explain why the sky is blue.",
+        "correct": true
+      },
+      {
+        "prompt": "Write a short Python function that reverses a list.",
+        "correct": true
+      },
+      {
+        "prompt": "What are the main causes of inflation?",
+        "correct": true
+      },
+      {
+        "prompt": "Describe how photosynthesis works.",
+        "correct": true
+      },
+      {
+        "prompt": "Continue this story: The door opened and nobody was there.",
+        "correct": true
+      },
+      {
+        "prompt": "<benchmark>",
+        "correct": true
+      }
+    ]
+  },
+  "confirmations": [
+    {
+      "baseline_relative_decode_speed": 2.6099563787012636,
+      "candidate_relative_decode_speed": 2.626213159466745,
+      "gain": 1.0062287557363587
+    },
+    {
+      "baseline_relative_decode_speed": 2.6190105755017634,
+      "candidate_relative_decode_speed": 2.612191152411718,
+      "gain": 0.9973961834465908
+    }
+  ],
+  "confirmed_gain": 0.9973961834465908,
+  "reason": "decode gain was not >= 1.03x twice"
+}

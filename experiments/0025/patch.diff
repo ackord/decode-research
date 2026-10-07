@@ -1,0 +1,365 @@
+diff --git a/candidate/checks.py b/candidate/checks.py
+index 487774a..cba62f8 100644
+--- a/candidate/checks.py
++++ b/candidate/checks.py
+@@ -742,3 +742,165 @@ def check_grouped(model):
+     assert second.index is not base.index and second.history is not base.history
+     _prefixes(base, second, "independent request")
+     print("Native panel heads, causal attention, grouped rotary/projections, logits, KV and transitions passed.")
++
++
++def check_auxiliary(model):
++    """Separate active-path suite; legacy clones intentionally have no sidecar."""
++    from mlx.utils import tree_flatten
++
++    parameters = [(name, array, mx.asarray(array, copy=True))
++                  for name, array in tree_flatten(model.parameters())]
++    modules = [(name, id(module)) for name, module in model.named_modules()]
++    mx.eval(*[saved for _, _, saved in parameters])
++    prompt = [1] + [53 + i * 19 for i in range(23)]
++    pending, base = ci.prefill(model, prompt)
++    sidecar = base.auxiliary
++    assert sidecar is not None and len(sidecar.layers) == 30
++    assert base.stats["auxiliary_forwards"] == 0
++    for weights in [*sidecar.layers, (sidecar.head,)]:
++        for packed, scales, biases in weights:
++            assert packed.dtype == mx.uint32
++            assert scales.dtype == biases.dtype == mx.bfloat16
++
++    oracle_cache = _clone(model, base)
++    token, oracle = pending, [pending.item()]
++    for _ in range(15):
++        logits = model(token.reshape(1, 1), cache=oracle_cache)
++        token = mx.argmax(logits[:, -1, :], axis=-1)
++        oracle.append(token.item())
++
++    for k in (2, 3, 4):
++        cache = _clone(model, base)
++        cache.append_token(pending.item())
++        cache.auxiliary = sidecar
++        saved = _clone(model, cache)
++        mx.eval(*[a for kv in saved for a in (kv.keys, kv.values)])
++        history, index = list(cache.history), dict(cache.index)
++        proposals = ci._auxiliary_draft(model, cache, pending, k)
++        mx.eval(*proposals)
++        _prefixes(cache, saved, "prefix immediately after drafting")
++        assert cache.history == history and cache.index == index
++
++    cache = _clone(model, base)
++    cache.auxiliary = sidecar
++    with patch.object(ci, "_draft", return_value=oracle[1:3]):
++        assert ci.decode(model, pending, cache, 4) == oracle[:4]
++    assert cache.stats["auxiliary_forwards"] == 0, "preserve multi-token suffix drafts"
++
++    # Exercise the production commit/trim path at every acceptance length.
++    for k in (2, 3, 4):
++        for accepted in range(k + 1):
++            cache = _clone(model, base, base[0].offset + k + 1)
++            cache.auxiliary = sidecar
++            forced = oracle[1:k + 1]
++            if accepted < k:
++                forced[accepted] = (forced[accepted] + 1) % 49152
++            calls = []
++            forward = ci._Auxiliary.forward
++
++            def forced_forward(self, target, state, value):
++                prediction = forward(self, target, state, value)
++                proposal = mx.array([forced[len(calls)]], dtype=prediction.dtype)
++                calls.append(True)
++                return mx.depends(proposal, [prediction])
++
++            choose = ci._auxiliary_count
++
++            def one_block(target, state, remaining):
++                return choose(target, state, remaining) if not calls else 0
++
++            with patch.object(ci, "_draft", return_value=[]), \
++                 patch.object(ci, "_auxiliary_count", one_block), \
++                 patch.object(ci._Auxiliary, "forward", forced_forward):
++                output = ci.decode(model, pending, cache, len(oracle))
++            assert output == oracle, (k, accepted)
++            assert len(calls) == cache.stats["auxiliary_forwards"] == k
++            assert cache.stats["auxiliary_blocks"] == 1
++            assert cache.stats["auxiliary_proposed_tokens"] == k
++            assert cache.stats["auxiliary_accepted_tokens"] == accepted
++            assert cache.auxiliary is None
++            _prefixes(cache, oracle_cache, f"auxiliary decode/k{k}/a{accepted}")
++
++    # Real lazy draft -> rewind -> verifier: compare complete exact logits/KV.
++    # Unequal capacities and poisoned tails exercise independently bounded reads.
++    for length in (24, 1021, 1023, 1024):
++        bp, bc = (pending, base) if length == 24 else ci.prefill(
++            model, [1] + [71 + i % 317 for i in range(length - 1)])
++        for k in (2, 3, 4):
++            start = bc[0].offset
++            draft_cache = _clone(model, bc, (start + k + 8, start + k + 1))
++            draft_cache.append_token(bp.item())
++            draft_cache.auxiliary = bc.auxiliary
++            for kv in draft_cache:
++                kv.keys[..., start:, :] = 1e20
++                kv.values[..., start:, :] = -1e20
++            saved = _clone(model, draft_cache)
++            mx.eval(*[array for kv in saved for array in (kv.keys, kv.values)])
++            assert ci._auxiliary_count(model, draft_cache, k + 1) == k
++            proposals = ci._auxiliary_draft(model, draft_cache, bp, k)
++            assert all(kv.offset == start for kv in draft_cache)
++            # Do not synchronize proposals before the verifier: its barrier
++            # must protect outstanding reads in the normal asynchronous path.
++            inputs = mx.depends([bp.reshape(1, 1)] + [p.reshape(1, 1) for p in proposals],
++                                [proposals[-1]])
++            trace = []
++            predictions = ci._verify(model, draft_cache, inputs, _trace=trace)
++            ids = mx.stack([*proposals, *predictions]).tolist()
++            tokens = [bp.reshape(1, 1)] + [mx.array([[r[0]]]) for r in ids[:k]]
++            reference = _clone(model, bc)
++            logits = [model(t, cache=reference) for t in tokens]
++            for i, (actual, expected) in enumerate(zip(dict(trace)["logits"], logits)):
++                _equal(actual, expected, f"auxiliary verifier/C{start}/k{k}/row{i}")
++            _prefixes(draft_cache, reference, "exact replacement of approximate tail")
++            for kv, original in zip(draft_cache, saved):
++                for name in ("keys", "values"):
++                    _equal(getattr(kv, name)[..., :start, :],
++                           getattr(original, name)[..., :start, :], "committed prefix preserved")
++
++    # Capacity, budget and cached eligibility failures cause no mutation.
++    cache = _clone(model, base, (base[0].offset + 8, base[0].offset + 2))
++    cache.auxiliary = sidecar
++    cache.append_token(pending.item())
++    assert ci._auxiliary_count(model, cache, 20) == 0
++    cache = _clone(model, base)
++    cache.auxiliary = sidecar
++    cache.append_token(pending.item())
++    for remaining in (0, 1, 2):
++        assert ci._auxiliary_count(model, cache, remaining) == 0
++    for flag in ("batch_rows_eligible", "grouped_eligible"):
++        with patch.object(cache, flag, False):
++            assert ci._auxiliary_count(model, cache, 20) == 0
++
++    for flag in ("rotary_eligible", "attention_eligible", "head_eligible"):
++        cache = _clone(model, base)
++        cache.auxiliary = sidecar
++        setattr(cache, flag, False)
++        with patch.object(ci, "_draft", return_value=[]):
++            assert ci.decode(model, pending, cache, 6) == oracle[:6]
++        assert cache.stats["auxiliary_blocks"] > 0, flag
++        reference = _clone(model, base)
++        for value in oracle[:5]:
++            mx.eval(model(mx.array([[value]]), cache=reference))
++        _prefixes(cache, reference, f"auxiliary with independent {flag} fallback")
++
++    # Real consecutive rounds and transitions to suffix/scalar behavior.
++    cache = _clone(model, base)
++    cache.auxiliary = sidecar
++    assert ci.decode(model, pending, cache, len(oracle)) == oracle
++    _prefixes(cache, oracle_cache, "real auxiliary/suffix/scalar transitions")
++    assert cache.stats["auxiliary_blocks"] > 0
++    for limit in (0, 1, 2):
++        cache = _clone(model, base)
++        cache.auxiliary = sidecar
++        assert ci.decode(model, pending, cache, limit) == oracle[:limit]
++        assert cache.stats["auxiliary_forwards"] == 0
++    fresh_pending, fresh = ci.prefill(model, prompt)
++    _equal(fresh_pending, pending, "fresh request first token")
++    assert fresh.auxiliary is not sidecar and fresh.history is not base.history
++    assert fresh.stats["auxiliary_forwards"] == fresh.stats["auxiliary_blocks"] == 0
++    assert modules == [(name, id(module)) for name, module in model.named_modules()]
++    current = dict(tree_flatten(model.parameters()))
++    for name, original, saved in parameters:
++        assert current[name] is original, name
++        _equal(original, saved, f"unmodified target/{name}")
++    print("Active auxiliary drafting, exact replacement, acceptance, KV and request checks passed.")
+diff --git a/candidate/inference.py b/candidate/inference.py
+index 0d57b7c..fd9eaca 100644
+--- a/candidate/inference.py
++++ b/candidate/inference.py
+@@ -7,6 +7,7 @@ from mlx_lm.models import llama
+ 
+ MAX_CONTEXT = 16
+ MAX_DRAFTS = 16
++AUX_MAX_DRAFTS = 4
+ INDEX_CONTEXT = MAX_CONTEXT + MAX_DRAFTS - 1
+ HEAD_PANEL_ROWS = 4096
+ _HEAD_RUNTIME = version("mlx") == "0.32.3"
+@@ -41,6 +42,7 @@ class RequestCache(list):
+         self.attention_eligible = None
+         self.head_eligible = None
+         self.head_panels = None
++        self.auxiliary = None
+         self.stats = {
+             "scalar_steps": 0,
+             "verifications": 0,
+@@ -64,6 +66,10 @@ class RequestCache(list):
+             "draft_lengths": [0] * (MAX_DRAFTS + 1),
+             "accepted_lengths": [0] * (MAX_DRAFTS + 1),
+             "rejected_positions": 0,
++            "auxiliary_blocks": 0,
++            "auxiliary_forwards": 0,
++            "auxiliary_proposed_tokens": 0,
++            "auxiliary_accepted_tokens": 0,
+         }
+         for token in token_ids:
+             self.append_token(int(token))
+@@ -93,7 +99,104 @@ def prefill(model, token_ids):
+     logits = model(tokens, cache=cache)
+     token = mx.argmax(logits[:, -1, :], axis=-1)
+     mx.eval(token)
+-    return token, RequestCache(cache, token_ids)
++    state = RequestCache(cache, token_ids)
++    if _grouped_supported(model, state):
++        state.auxiliary = _Auxiliary(model)
++    return token, state
++
++
++class _Auxiliary:
++    """Request-owned packed weights; never replace or mutate target modules."""
++
++    def __init__(self, model):
++        def pack(weight):
++            packed, scales, biases = mx.quantize(
++                weight, group_size=64, bits=4, mode="affine")
++            return packed, scales.astype(mx.bfloat16), biases.astype(mx.bfloat16)
++
++        self.layers = []
++        for layer in model.layers:
++            a, f = layer.self_attn, layer.mlp
++            self.layers.append(tuple(pack(p.weight) for p in (
++                a.q_proj, a.k_proj, a.v_proj, a.o_proj,
++                f.gate_proj, f.up_proj, f.down_proj)))
++        self.head = pack(model.model.embed_tokens.weight)
++        mx.eval(*[array for weights in [*self.layers, (self.head,)]
++                  for projection in weights for array in projection])
++
++    @staticmethod
++    def project(weights, x):
++        w, scales, biases = weights
++        return mx.quantized_matmul(x, w, scales=scales, biases=biases,
++                                   transpose=True, group_size=64, bits=4,
++                                   mode="affine").astype(mx.bfloat16)
++
++    def forward(self, model, cache, token):
++        x = model.model.embed_tokens(token.reshape(1, 1))
++        for layer, kv, weights in zip(model.layers, cache, self.layers):
++            a = layer.self_attn
++            # Capture Python offsets/endpoints while constructing this pass.
++            start, end = kv.offset, kv.offset + 1
++            norm = layer.input_layernorm(x)
++            q, k, v = [self.project(w, norm) for w in weights[:3]]
++            q = q.reshape(1, 1, a.n_heads, -1).transpose(0, 2, 1, 3)
++            k = k.reshape(1, 1, a.n_kv_heads, -1).transpose(0, 2, 1, 3)
++            v = v.reshape(1, 1, a.n_kv_heads, -1).transpose(0, 2, 1, 3)
++            q, k = a.rope(q, offset=start), a.rope(k, offset=start)
++            kv.update_and_fetch(k, v)
++            attention = llama.scaled_dot_product_attention(
++                mx.depends(q, [kv.keys, kv.values]),
++                kv.keys[..., :end, :], kv.values[..., :end, :],
++                cache=kv, scale=a.scale, mask=None)
++            attention = attention.transpose(0, 2, 1, 3).reshape(1, 1, -1)
++            h = x + self.project(weights[3], attention)
++            norm = layer.post_attention_layernorm(h)
++            gate, up = [self.project(w, norm) for w in weights[4:6]]
++            x = h + self.project(weights[6], llama.swiglu(gate, up))
++        logits = self.project(self.head, model.model.norm(x))
++        cache.stats["auxiliary_forwards"] += 1
++        return mx.argmax(logits[:, -1, :], axis=-1)
++
++
++def _auxiliary_count(model, cache, remaining):
++    """Decide every fallback before touching shared exact KV storage."""
++    if cache.auxiliary is None or remaining < 3:
++        return 0
++    if cache.batch_rows_eligible is None:
++        cache.batch_rows_eligible = _batch_supported(model, cache)
++    if cache.grouped_eligible is None:
++        cache.grouped_eligible = _grouped_supported(model, cache)
++    if not cache.batch_rows_eligible or not cache.grouped_eligible:
++        return 0
++    if any(kv.keys is None or kv.values is None for kv in cache):
++        return 0
++    # Mirror the actual verifier's dtype and grouped layout gates, including
++    # cached False flags. Rotary, attention and head keep independent fallbacks.
++    for kv in cache:
++        if any(a.dtype != mx.bfloat16 or a.ndim != 4
++               or a.shape[:2] != (1, 3) or a.shape[3] != 64
++               for a in (kv.keys, kv.values)):
++            return 0
++    start = cache[0].offset
++    capacity = min(min(kv.keys.shape[2], kv.values.shape[2]) for kv in cache)
++    count = min(AUX_MAX_DRAFTS, remaining - 1, capacity - start - 1)
++    return count if count >= 2 and _bulk_start(cache, count + 1) == start else 0
++
++
++def _auxiliary_draft(model, cache, token, count):
++    start = cache[0].offset
++    proposals = []
++    for _ in range(count):
++        token = cache.auxiliary.forward(model, cache, token)
++        mx.async_eval(token)
++        proposals.append(token)
++    if any(kv.offset != start + count for kv in cache):
++        raise RuntimeError("Auxiliary draft did not append exactly its proposed tail")
++    for kv in cache:
++        kv.offset = start
++    cache.stats["auxiliary_blocks"] += 1
++    cache.stats["auxiliary_proposed_tokens"] += count
++    return proposals
+ 
+ 
+ def _supported(model, cache):
+@@ -568,6 +671,7 @@ def decode(model, first_token, cache, max_new_tokens):
+     finally:
+         if isinstance(cache, RequestCache):
+             cache.head_panels = None
++            cache.auxiliary = None
+ 
+ 
+ def _decode(model, first_token, cache, max_new_tokens):
+@@ -593,13 +697,27 @@ def _decode(model, first_token, cache, max_new_tokens):
+         # Recompute speculative lookup and capacity decisions after draining.
+         if supported and not pending:
+             drafts = _draft(state, max_new_tokens - len(output))
++            auxiliary = []
++            if len(drafts) < 2:
++                count = _auxiliary_count(model, state, max_new_tokens - len(output))
++                if count:
++                    auxiliary = _auxiliary_draft(model, state, token, count)
+             if drafts:
+                 inputs = [token.reshape(1, 1)] + [
+                     mx.array([[d]], dtype=token.dtype) for d in drafts
+                 ]
++            if auxiliary:
++                # Consume the returned barriers: every target write must wait
++                # for all temporary auxiliary cache reads, transitively.
++                inputs = mx.depends([token.reshape(1, 1)] + [
++                    d.reshape(1, 1) for d in auxiliary], [auxiliary[-1]])
++            if drafts or auxiliary:
+                 predictions = _verify(model, cache, inputs)
+-                mx.async_eval(*predictions)
+-                ids = mx.stack(predictions).tolist()
++                mx.async_eval(*auxiliary, *predictions)
++                materialized = mx.stack([*auxiliary, *predictions]).tolist()
++                if auxiliary:
++                    drafts = [row[0] for row in materialized[:len(auxiliary)]]
++                ids = materialized[len(auxiliary):]
+                 accepted = 0
+                 while accepted < len(drafts) and drafts[accepted] == ids[accepted][0]:
+                     accepted += 1
+@@ -616,6 +734,9 @@ def _decode(model, first_token, cache, max_new_tokens):
+                 stats["draft_lengths"][len(drafts)] += 1
+                 stats["accepted_lengths"][accepted] += 1
+                 stats["rejected_positions"] += rejected
++                if auxiliary:
++                    stats["auxiliary_accepted_tokens"] += accepted
++                del auxiliary, materialized
+                 continue
+ 
+         logits = model(token.reshape(1, 1), cache=cache)
+@@ -650,3 +771,9 @@ def check_grouped(model):
+     """
+     from .checks import check_grouped as run_checks
+     return run_checks(model)
++
++
++def check_auxiliary(model):
++    """Optional active-drafter native checks on independent synthetic inputs."""
++    from .checks import check_auxiliary as run_checks
++    return run_checks(model)
