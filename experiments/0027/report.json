@@ -1,0 +1,94 @@
+{
+  "round": "0027",
+  "parent_commit": "ade35da5579f43d3c4d537d152962c2e6f40cfda",
+  "models": {
+    "research": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "review": {
+      "model": "gpt-6-astra",
+      "effort": "max"
+    },
+    "implementation": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    }
+  },
+  "status": "rejected",
+  "research": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Batch sibling singleton projections using matrix banks",
+      "idea": "In eligible speculative verification, execute K/V together and gate/up together as batches of independent singleton products. Preserve each matrix\u2019s original dimensions and reduction arithmetic. Arrange outputs by projection, then position, so both resulting activation blocks are contiguous views.",
+      "cost_removed": "Reduce body projection invocations from seven to five per layer: 210 to 150 across 30 layers. Including the existing twelve vocabulary panels, each eligible block drops from 222 to 162 projection invocations, removing 60 submissions and 60 separate projection-output allocations. Projection FLOPs, weight payload read, and total output payload remain unchanged. Separate immutable matrix banks add 119,439,360 BF16 bytes.",
+      "source_evidence": "The grouped branch in [candidate/inference.py](candidate/inference.py:397) separately projects K and V from the same normalized block; lines 492\u2013493 similarly separate gate and up. Their respective weight shapes are [192,576] and [1536,576]. The existing _grouped_project already uses indexed singleton products. Inspection of [MLX dispatch](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/matmul.cpp) shows that the proposed M=1, sorted_indices=False path retains the existing gathered-GEMV reduction geometry for both widths. The [gather implementation](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/kernels/gemv.h) selects matrix and vector addresses before invoking the same per-product arithmetic. This supports numerical eligibility; native parity remains to be checked.",
+      "generalization": "Batching independent projections removes scheduling and allocation work without changing the target. It can apply to speculative verifiers, tensor-parallel shards, and expert projections in larger decoders. Portable grouped interfaces such as [oneMKL gemv_batch](https://www.intel.com/content/www/us/en/docs/onemkl/developer-reference-dpcpp/2024-0/gemv-batch.html) support multiple matrices and vectors; pointer-based implementations need not duplicate weights. Benefits diminish when weight bandwidth dominates. No custom kernel or compiler change is required.",
+      "risk": "Larger simultaneous working sets, indexing overhead, and additional weight storage may outweigh fewer invocations. Nonzero matrix indices and output views must preserve exact addressing, reduction geometry, and downstream layouts. Grouping removes the existing dependency between independent sibling projections, so locality may change even though arithmetic does not.",
+      "history_relation": "Round 0005 tested wider row-concatenated projections during scalar decoding and lost performance. This tests unchanged-width products grouped across both projections and speculative positions, with contiguous output views. Round 0017 established a benefit from grouping singleton products; this extends that mechanism. Round 0026 remains unresolved: its report says no trained artifact was produced, and its loader disabled the predictor when artifacts were absent, so its timing does not establish the performance of active learned drafting."
+    },
+    "plan": "1. Modify only candidate/. During prefill, prepare and materialize separate immutable BF16 banks stack([K,V]) shaped [2,192,576] and stack([gate,up]) shaped [2,1536,576] for each layer. Keep target modules, parameters, prompt execution, and first-token selection unchanged. These banks depend only on weights; perform no generated-token computation. Keep them request-owned and release them inside decode cleanup.\n\n2. Add an independent eligibility gate restricted to the current audited native grouped path, matching bank layouts and runtime arithmetic. Activate only for existing eligible blocks of 3\u201317 positions. A failed gate preserves the current verifier and its other optimizations. Leave scalar execution and drafting policy unchanged.\n\n3. Implement a paired projection helper. For X=[1,m,576], use contiguous X reshaped to [m,1,576], gated on preceding-phase dependencies. Transpose the contiguous bank to [2,576,N] as a view. Call gather_mm with uint32 lhs_indices=[0,...,m-1,0,...,m-1], rhs_indices=[0]*m+[1]*m, and sorted_indices=False. Reuse these indices throughout the block. Reshape the output to [2,m,N] and return slices [0:1] and [1:2], each contiguous [1,m,N]. Do not duplicate activations, materialize the transposed bank, widen individual matrices, or substitute ordinary GEMM.\n\n4. Keep Q as its current grouped call. The paired K/V call consumes normalized inputs gated on Q completion; both outputs must complete before rotary processing and KV insertion. Replace gate/up with one paired call after the existing post-attention normalization. Feed its contiguous views into unchanged SwiGLU. Preserve output/down projections, residual rounding, rotary, attention, vocabulary panels, acceptance, rollback, and scalar pipelining.\n\n5. Count actual paired invocations and active blocks. Update projection-count checks to expect 162 calls with panel heads or 151 with the complete grouped head when both pairs are active in all layers. Charge generated-token indexing, dependencies, view handling, verification, and cleanup to decode. Do not claim reduced weight traffic or arithmetic.\n\n6. Compare both paired outputs bitwise with existing grouped calls and native singleton projections for every m=3\u201317, both matrix banks, independent synthetic inputs, and target-derived activations. Check matrix selection, shared storage, output contiguity, and completion dependencies. Exercise complete verifier logits and retained KV, every acceptance length, consecutive blocks, scalar continuation, capacity boundaries, independent gate failures, and fresh requests. Ensure fixtures actually activate pairing.\n\n7. Have the orchestrator perform authoritative native validation, exact-token evaluation, and both benchmark confirmations against the current best. Record activation separately from correctness and throughput. Keep only an exact result with at least 1.03x gain in both confirmations; freeze the pairing scheme before evaluation.",
+    "reason": "This removes 60 real projection invocations per eligible block through a small dependency and layout transformation. In-memory checks passed 60 layout/addressing cases; they do not establish native BF16 parity or speed. The mechanism is sound enough to test, and its incremental performance remains uncertain."
+  },
+  "review": {
+    "decision": "experiment",
+    "proposal": {
+      "name": "Batch sibling singleton projections using matrix banks",
+      "idea": "Within eligible speculative verification, batch K/V together and gate/up together as independent singleton matrix-vector products. Preserve each matrix\u2019s dimensions and reduction arithmetic, and arrange outputs by projection then position so both activation blocks are contiguous views.",
+      "cost_removed": "Reduce body projection calls from seven to five per layer: 210 to 150 across 30 layers. With twelve vocabulary panels, calls fall from 222 to 162 per eligible block. This removes 60 projection submissions and 60 separate projection-output buffer allocations, before accounting for added indexing and view operations. Projection arithmetic and logical weight operands remain unchanged; physical memory traffic and peak activation memory are not guaranteed unchanged. Immutable banks add 119,439,360 BF16 bytes, approximately 113.91 MiB.",
+      "source_evidence": "Verified the separate sibling calls and indexed singleton helper in [candidate/inference.py](candidate/inference.py:244), installed runtime versions, and all 120 relevant checkpoint tensors. K/V weights are [192,576]; gate/up weights are [1536,576]. The [MLX 0.32.3 dispatch](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/matmul.cpp) retains the same gathered-GEMV configuration for these M=1 products when the output batch increases from m to 2m. The [gather implementation](https://raw.githubusercontent.com/ml-explore/mlx/v0.32.3/mlx/backend/metal/kernels/gemv.h) selects operand addresses before invoking the same reduction and BF16 conversion. This supports numerical eligibility but does not replace native validation.",
+      "generalization": "Batching independent projections can reduce invocation and allocation overhead across inference runtimes. Pointer-based grouped interfaces such as [oneMKL gemv_batch](https://www.intel.com/content/www/us/en/docs/onemkl/developer-reference-dpcpp/2024-0/gemv-batch.html) demonstrate that the operation need not require duplicated weights. Larger decoders, tensor-parallel shards, and expert workloads may benefit when scheduling overhead remains exposed. Gains may be small when bandwidth dominates or an engine already combines these operations; each runtime requires its own numerical audit.",
+      "risk": "Nonzero matrix indices, transposed-bank strides, output ordering, and shared output storage require validation. Pairing changes scheduling and allocation lifetimes, and the extra weight representation may worsen locality or memory pressure. Fewer projection calls do not establish fewer total operations or faster decode.",
+      "history_relation": "Round 0005 tested wider row-concatenated projections during scalar decoding and failed the performance threshold. Its result is relevant caution, but does not resolve unchanged-width products grouped across both siblings and speculative positions. Round 0017 established a benefit from grouping singleton products. Round 0026\u2019s report confirms that no trained artifact was produced, and its loader returned no predictor when artifacts were absent; its timing therefore does not resolve active learned drafting."
+    },
+    "plan": "1. Modify only candidate/. Preserve target parameters, module bindings, prompt execution, and first-token selection; harness.bench shares a model instance between implementations. During prefill, create contiguous immutable banks stack([K,V])=[2,192,576] and stack([gate,up])=[2,1536,576] for every layer, and materialize them before returning. Preparation must depend only on weights and metadata, with no generated-token forwarding or decode warmup. Store banks in fresh request state and release their references in decode\u2019s finally cleanup, including zero- and one-token requests.\n\n2. Add a separate pairing eligibility gate. Require the existing eligible grouped verifier, 3<=m<=17, audited BF16 bias-free model geometry, valid prepared banks, and the audited MLX 0.32.3 GPU execution path. Validate bank shapes, dtypes, and layouts during preparation without synchronizing generated activations. Preflight all layers before verifier cache mutation; use both pairs throughout an eligible block. Keep this gate independent of vocabulary-panel, rotary, and attention gates. Failure or missing banks selects the existing unpaired verifier, preserving its other optimizations.\n\n3. Implement one paired helper. For X=[1,m,576], gate mx.contiguous(X) on preceding-phase dependencies and reshape to [m,1,576]. View each bank with transpose(0,2,1), yielding [2,576,N] with element strides [N*576,1,576]. Call gather_mm with explicit one-dimensional uint32 lhs_indices=[0,...,m-1,0,...,m-1], rhs_indices=[0]*m+[1]*m, and sorted_indices=False. Construct and reuse these indices within decode. Reshape the contiguous [2m,1,N] result to [2,m,N]; return [0:1] and [1:2], each [1,m,N], with the second starting m*N elements into the shared output. Do not replicate activations, materialize the transposed bank, widen individual products, or substitute ordinary GEMM.\n\n4. Keep Q unchanged. Gate the K/V pair\u2019s consumed input on complete Q output, and gate subsequent rotary inputs and KV insertion on completion of the entire paired result. After the unchanged output projection, residual, and post-attention normalization, run the gate/up pair and pass its views to unchanged SwiGLU. Preserve all remaining projections, rounding boundaries, attention schedules, vocabulary panels, drafting, acceptance, rollback, and scalar pipelining. Add no host synchronization between projection phases.\n\n5. Count actual pairing activation and invocations, separately for K/V and gate/up. Make grouped_projection_calls include each paired call once. If B is grouped blocks, H is panel-head blocks, and P is paired calls, assert total projection calls = 211*B + 11*H - P. Fully active blocks have P=60 and totals 162 with panels or 151 with the complete head. Do not globally replace baseline expectations: pairing fallback must retain 222 or 211 calls. Charge generated-token indexing, dependencies, layout handling, and cleanup to decode. Report bank storage and preparation separately; claim no guaranteed bandwidth reduction.\n\n6. Extend native differential checks using independent synthetic inputs and non-benchmark target activations. For every m=3..17 and both bank widths, compare each paired output bitwise against separate existing grouped calls and native singleton projections. Include distinct sibling weights, cancellation, BF16 rounding boundaries, varied magnitudes, and nonzero activation offsets. Verify unchanged bank contents, correct matrix selection, shared but nonoverlapping output views, contiguity, absence of transpose copies, and consumption of dependency-gated inputs. Update _clone or test initialization to supply prepared banks when testing pairing; require activation counters so absent banks cannot silently turn these into fallback tests.\n\n7. Compare complete traced and untraced verifier logits, intermediate activations, and retained KV against both the current verifier with only pairing disabled and native scalar execution. Exercise every acceptance length, consecutive speculative blocks, scalar continuation, capacity boundaries, small output budgets, fresh requests, and independent gate failures. With start c and a accepted drafts, retained KV must end at c+1+a. Confirm pairing remains active when only head panels, rotary grouping, or attention chunking are disabled, and that pairing failure leaves those existing mechanisms intact. Check cleanup and shared-model isolation.\n\n8. Freeze the pairing scheme before authoritative evaluation. The orchestrator must run native validation, exact-token evaluation, and both benchmark confirmations against the current best using the existing synchronized timing boundary. Record activation separately from correctness and speed. Keep only an exact result achieving at least 1.03x gain in both confirmations. An unavailable native device or an inactive pairing path is not a performance result.",
+    "reason": "No fundamental flaw was found. Independent in-memory checks passed 90 layout cases, 1,800 operand-selection checks, and 180 output-view checks; these establish addressing and layout only. Native BF16 validation remains pending because this sandbox cannot access Metal. The reviewed mechanism removes substantial invocation work, while its incremental throughput remains a question for benchmarking. No files were edited."
+  },
+  "implementation": {
+    "outcome": "implemented",
+    "summary": "Implemented paired K/V and gate/up singleton projections, request-local banks, independent eligibility gates, counters, cleanup, and native differential checks. Only candidate/ changed. Syntax and diff checks pass. Native validation could not run because no Metal device is accessible; correctness and benchmarking remain with the orchestrator."
+  },
+  "eval": {
+    "correct": true,
+    "cases": [
+      {
+        "prompt": "Explain why the sky is blue.",
+        "correct": true
+      },
+      {
+        "prompt": "Write a short Python function that reverses a list.",
+        "correct": true
+      },
+      {
+        "prompt": "What are the main causes of inflation?",
+        "correct": true
+      },
+      {
+        "prompt": "Describe how photosynthesis works.",
+        "correct": true
+      },
+      {
+        "prompt": "Continue this story: The door opened and nobody was there.",
+        "correct": true
+      },
+      {
+        "prompt": "<benchmark>",
+        "correct": true
+      }
+    ]
+  },
+  "confirmations": [
+    {
+      "baseline_relative_decode_speed": 2.5761251804036944,
+      "candidate_relative_decode_speed": 2.6520710651004737,
+      "gain": 1.0294806654872564
+    },
+    {
+      "baseline_relative_decode_speed": 2.621440790955992,
+      "candidate_relative_decode_speed": 2.639090954247999,
+      "gain": 1.0067330009332656
+    }
+  ],
+  "confirmed_gain": 1.0067330009332656,
+  "reason": "decode gain was not >= 1.03x twice"
+}
